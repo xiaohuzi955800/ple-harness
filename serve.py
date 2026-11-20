@@ -12,14 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tool-calling harness for any OpenAI-compatible model endpoint.
+"""Plan-work-verify harness for any OpenAI-compatible model endpoint.
 
-Connects to `MODEL_BASE_URL` using `MODEL_API_KEY` and `MODEL_NAME`. The model
-works in the task container through four built-in tools (`bash`, `read_file`,
-`write_file`, `edit_file`) plus the task's own MCP tools, and finishes when it
-provides a complete answer without calling a tool. That answer becomes the final
-message. Calls go to the Chat Completions API, or to the Responses API for
-OpenAI's GPT-6 models (`RESPONSES_MODELS`).
+Connects to `MODEL_BASE_URL` using `MODEL_API_KEY` and `MODEL_NAME`. Each task
+runs in phases: a read-only planner inspects the files and writes a plan, a
+worker executes it through four built-in tools (`bash`, `read_file`,
+`write_file`, `edit_file`) plus the task's own MCP tools, and a fresh
+read-only verifier checks the deliverables and sends gaps back for fix rounds.
+The worker's summary becomes the final message. Calls go to the Chat
+Completions API, or to the Responses API for OpenAI's GPT-6 models
+(`RESPONSES_MODELS`). Short tasks skip planning and verification and run the
+worker directly, like the single-loop baseline this harness builds on.
 
 Optional environment variables: `MAX_OUTPUT_TOKENS` (default `32000`),
 `COMPACT_AT_TOKENS` (default `150000`), and `REASONING_EFFORT` (default `max`
@@ -34,6 +37,7 @@ import os
 import posixpath
 import re
 import sys
+import time
 import types
 from typing import Any
 
@@ -66,6 +70,12 @@ DIRECT_MCP_CHARS = 40_000
 MAX_TOOLS = 128
 KEEP_RECENT_RESULTS = 12
 FINISH_MARGIN_SEC = 180
+# Plan-work-verify phase budgets.
+PLAN_SHARE = 0.10  # the planner wraps up after this share of the task time
+CHECK_SHARE = 0.25  # time kept for verification and fix rounds
+MIN_PLAN_SEC = 1800  # plan only when the task allows at least this long
+MIN_VERIFY_SEC = 900  # verify only when at least this long is left
+MAX_FIX_ROUNDS = 2
 RETRY_WAITS = (5, 15, 30, 60, 120)
 # How endpoints word an error saying the conversation no longer fits (xAI's:
 # "maximum prompt length is N but the request contains M tokens"). OpenAI's
@@ -159,6 +169,32 @@ to run it.
 SUMMARY_PROMPT = """The conversation is getting long, so the earlier turns will be removed. Write notes that let you \
 continue without them: what the task requires, what you found in the files, every file you created or changed (with \
 its path and state), the numbers and decisions so far, and what remains to do. Be specific."""
+
+EVIDENCE = """
+Evidence and checking:
+- Keep working notes at /tmp/evidence.md (never under a deliverable path): every key number with its source file \
+and line, every decision with its reason. Never invent a number; if a value is missing, say so and use a clearly \
+labelled assumption.
+- Hard constraints (safety, feasibility, code limits) come before optimisation: never trade one for a better \
+objective value. Check each constraint explicitly before you finish.
+- Recompute key numbers a second way (independent code) and check units before you write them into a deliverable.
+"""
+
+WORKER = SYSTEM.replace(
+    "\nWhen the work is done,", EVIDENCE + "\nWhen the work is done,"
+)
+
+PLANNER = """You plan an engineering task that another engineer will carry out in a Linux container with no internet \
+access. Inspect the task's files with your tools (bash starts in {workdir}), but do not create or change any file. \
+Then reply with the plan: each deliverable with its exact path and format, what it must contain, the data and method \
+to use, and how to check it. You have about {minutes} minutes for this planning step."""
+
+VERIFIER = """You check an engineer's work on a task in a Linux container. You get the task, the plan, and the \
+engineer's summary of what was delivered. Open every deliverable with your tools (bash starts in {workdir}) and \
+check it against the task: the path, the format, every part the task asks for, and the key numbers, recomputed. Do \
+not create or change any file. If everything holds, reply with the single word PASS and nothing else. Otherwise \
+reply with a numbered list of the gaps, each specific enough to fix. You have about {minutes} minutes for this \
+checking step."""
 
 
 def tool(
@@ -800,9 +836,29 @@ class StreamCut(openai.OpenAIError):  # pylint: disable=g-bad-exception-name
 class Agent:
   """Manages the conversation, tool execution, and context compaction loop."""
 
-  def __init__(self, session: taskbridge.Session):
+  def __init__(
+      self,
+      session: taskbridge.Session,
+      role: str = "worker",
+      plan: str = "",
+      context: str = "",
+      phase_seconds: float | None = None,
+  ):
     self.session = session
-    self.tools = list(TOOLS)
+    self.role = role
+    self.plan = plan
+    self.context = context
+    self.phase_deadline = (
+        time.monotonic() + phase_seconds if phase_seconds else None
+    )
+    if role in ("planner", "verifier"):
+      self.tools = [
+          t
+          for t in TOOLS
+          if t["function"]["name"] in ("bash", "read_file")
+      ]
+    else:
+      self.tools = list(TOOLS)
     self.mcp: dict[str, tuple[MCPServer, dict[str, Any]]] = {}
     self.messages: list[dict[str, Any]] = []
     self.prompt_tokens = 0
@@ -820,36 +876,92 @@ class Agent:
     self.responses = MODEL.lower().startswith(RESPONSES_MODELS)
     self.finish_margin = FINISH_MARGIN_SEC
 
+  def time_left(self) -> float | None:
+    """Remaining seconds for this phase: the task's or the phase's, sooner."""
+    left = self.session.time_left()
+    if self.phase_deadline is None:
+      return left
+    phase = self.phase_deadline - time.monotonic()
+    return phase if left is None else min(left, phase)
+
+  def system_prompt(self, mcp: str) -> str:
+    """Formats this role's system prompt."""
+    left = self.time_left()
+    minutes = int(left / 60) if left else "unlimited"
+    template = {"planner": PLANNER, "verifier": VERIFIER}.get(
+        self.role, WORKER
+    )
+    return template.format(
+        workdir=self.session.workdir, mcp=mcp, minutes=minutes
+    )
+
+  def initial_user_message(self) -> str:
+    """Builds this role's first user message."""
+    if self.role == "verifier":
+      return (
+          "Task:\n"
+          f"{self.session.instruction}\n\nPlan:\n{self.plan or '(none)'}\n\n"
+          "Engineer's summary of what was delivered:\n"
+          f"{self.context or '(none)'}"
+      )
+    return self.session.instruction
+
   async def run(self) -> str:
-    """Runs the agent tool-calling loop until the task is complete.
+    """Sets up this role's conversation and runs its tool-calling loop.
 
     Returns:
       The final summary message produced by the agent.
     """
-    mcp = await self.connect_mcp()
-    left = self.session.time_left()
+    mcp = await self.connect_mcp() if self.role == "worker" else ""
+    left = self.time_left()
     # time kept for the final summary: FINISH_MARGIN_SEC, or a quarter of a
-    # short task's time
+    # short task's (or phase's) time
     self.finish_margin = (
         FINISH_MARGIN_SEC
         if left is None
         else min(FINISH_MARGIN_SEC, max(left, 0) / 4)
     )
     self.messages = [
-        {
-            "role": "system",
-            "content": SYSTEM.format(
-                workdir=self.session.workdir,
-                mcp=mcp,
-                minutes=int(left / 60) if left else "unlimited",
-            ),
-        },
-        {"role": "user", "content": self.session.instruction},
+        {"role": "system", "content": self.system_prompt(mcp)},
+        {"role": "user", "content": self.initial_user_message()},
     ]
+    if self.role == "worker" and self.plan:
+      self.messages.append({
+          "role": "user",
+          "content": (
+              "A plan for this task, from a planning pass over its files."
+              " Use it, and correct it where the files show it is wrong:\n"
+              + self.plan
+          ),
+      })
+    return await self.loop()
+
+  async def resume(self, feedback: str) -> str:
+    """Continues this agent's loop with new user feedback (a fix round).
+
+    Fix rounds run to the task deadline: the work phase's deadline no longer
+    applies once verification has started.
+
+    Args:
+      feedback: User message describing what to fix.
+
+    Returns:
+      The final summary message produced by the agent.
+    """
+    self.phase_deadline = None
+    self.messages.append({"role": "user", "content": feedback})
+    return await self.loop()
+
+  async def loop(self) -> str:
+    """Runs the tool-calling loop until the task is complete.
+
+    Returns:
+      The final summary message produced by the agent.
+    """
     # head: the text of an answer cut off at the output limit
     nudges, head = 0, ""
     while True:
-      left = self.session.time_left()
+      left = self.time_left()
       if left is not None and left < self.finish_margin:
         return await self.finish("Time is almost up.")
       try:
@@ -910,7 +1022,7 @@ class Agent:
         self.messages.append(
             {"role": "tool", "tool_call_id": call["id"], "content": result}
         )
-      left = self.session.time_left()
+      left = self.time_left()
       if left is not None:
         self.messages[-1]["content"] += f"\n[{int(left // 60)} minutes left]"
       if self.prompt_tokens > self.compact_at():
@@ -932,7 +1044,7 @@ class Agent:
             "summary: what you delivered, where, and the key results."
         ),
     })
-    left = self.session.time_left()
+    left = self.time_left()
     # the summary call gets taskbridge.time_share(left, 30) seconds, and at
     # least 5
     reserve = (
@@ -1103,7 +1215,7 @@ class Agent:
       wait = next(waits, None)
       if wait is None:
         raise failure
-      left = self.session.time_left()
+      left = self.time_left()
       if left is not None and left - wait < reserve:
         await self.session.log(
             f"model call failed ({str(failure)[:300]}); no time left to wait"
@@ -1334,7 +1446,7 @@ class Agent:
       CutOff: If the stream times out at `left - reserve`.
       asyncio.CancelledError: If the task is cancelled during streaming.
     """
-    left = self.session.time_left()
+    left = self.time_left()
     self.max_output = self.output_limit()
     reply = Reply()
 
@@ -1569,7 +1681,7 @@ class Agent:
       Formatted exit code and command output string.
     """
     cap = int(self.session.limits.get("exec_timeout_sec") or 600)
-    left = self.session.time_left()
+    left = self.time_left()
     if left is not None:
       cap = min(cap, max(1, int(left - self.finish_margin)))
     result = await self.session.exec(
@@ -1779,21 +1891,116 @@ class Agent:
     return True
 
 
+async def _run_phase(
+    session: taskbridge.Session, label: str, agent: Agent
+) -> str:
+  """Runs one agent phase, logging (not raising) its failure.
+
+  A failed planner or verifier must not fail the task: the worker still runs
+  (without a plan) and its summary still stands (unverified). Cancellation
+  still propagates so the evaluator's cancel is honoured.
+
+  Args:
+    session: Active task session.
+    label: Phase name for the log.
+    agent: The configured `Agent` for the phase.
+
+  Returns:
+    The phase's answer text, or "" when the phase failed.
+  """
+  try:
+    return await agent.run()
+  except taskbridge.Cancelled:
+    raise
+  except asyncio.CancelledError:
+    raise
+  except Exception as exc:  # pylint: disable=broad-exception-caught
+    await session.log(f"{label} phase failed: {type(exc).__name__}: {exc}")
+    return ""
+
+
+def _verdict(text: str) -> tuple[bool, str]:
+  """Parses a verifier reply into (passed, gaps).
+
+  Args:
+    text: The verifier's reply text.
+
+  Returns:
+    `(True, "")` when the reply starts with PASS, else `(False, text)`.
+  """
+  if re.match(r"\s*PASS\b", text, re.I):
+    return True, ""
+  return False, text.strip()
+
+
 async def solve(session: taskbridge.Session) -> str:
-  """Runs `Agent` on `session` and returns the final answer.
+  """Runs plan, work, verify, and fix phases and returns the final answer.
+
+  Short tasks skip planning and verification and run the worker directly, so
+  smoke and MCP checks behave like the single-loop baseline.
 
   Args:
     session: Active task session.
 
   Returns:
-    The final summary string returned by the agent.
+    The final summary string (the worker's summary, plus a verification note
+    when a verifier passed it).
   """
   print(
       f"task: workdir {session.workdir}, model {MODEL},"
       f" {len(session.mcp_servers)} MCP server(s)",
       file=sys.stderr,
   )
-  return await Agent(session).run()
+  total = session.time_left()
+  plan = ""
+  if total is None or total >= MIN_PLAN_SEC:
+    budget = total * PLAN_SHARE if total is not None else MIN_PLAN_SEC
+    await session.log(f"plan phase: up to {budget:.0f}s")
+    plan = await _run_phase(
+        session, "plan", Agent(session, role="planner", phase_seconds=budget)
+    )
+    session.final_message = ""  # a plan is not a deliverable
+  left = session.time_left()
+  worker_budget = (
+      None
+      if left is None or left < MIN_VERIFY_SEC / CHECK_SHARE
+      else left * (1 - CHECK_SHARE)
+  )
+  worker = Agent(session, role="worker", plan=plan, phase_seconds=worker_budget)
+  summary = await worker.run()
+  if not summary:
+    return session.final_message
+  verified = False
+  for round_no in range(MAX_FIX_ROUNDS + 1):
+    left = session.time_left()
+    if left is not None and left < MIN_VERIFY_SEC:
+      break
+    await session.log(f"verify phase: round {round_no + 1}")
+    reply = await _run_phase(
+        session,
+        "verify",
+        Agent(session, role="verifier", plan=plan, context=summary),
+    )
+    session.final_message = summary  # the verifier's text is not the summary
+    passed, gaps = _verdict(reply)
+    if passed:
+      verified = True
+      break
+    if not gaps or round_no >= MAX_FIX_ROUNDS:
+      break
+    left = session.time_left()
+    if left is not None and left < MIN_VERIFY_SEC:
+      break
+    await session.log(f"fix round {round_no + 1}: {len(gaps)} chars of gaps")
+    summary = await worker.resume(
+        "An independent check of your deliverables found these gaps. Fix each"
+        f" one, then answer with your updated summary:\n{gaps}"
+    )
+    if not summary:
+      summary = session.final_message
+  if verified:
+    summary += "\n\nIndependent verification: PASS."
+  return summary
 
 
 if __name__ == "__main__":
