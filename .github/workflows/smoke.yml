@@ -55,9 +55,9 @@ jobs:
 
       - name: Write env file from secrets (never logged)
         run: |
-          printf 'GEMINI_API_KEY=%s\n' '${{ secrets.GEMINI_API_KEY }}' > ../local.env
-          printf 'HF_TOKEN=%s\n' '${{ secrets.HF_TOKEN }}' >> ../local.env
-          chmod 600 ../local.env
+          printf 'GEMINI_API_KEY=%s\n' '${{ secrets.GEMINI_API_KEY }}' > "$RUNNER_TEMP/local.env"
+          printf 'HF_TOKEN=%s\n' '${{ secrets.HF_TOKEN }}' >> "$RUNNER_TEMP/local.env"
+          chmod 600 "$RUNNER_TEMP/local.env"
 
       - name: kit check (build + smoke-test the harness)
         # With a local gemini/ model_api this never reports "ready to
@@ -66,14 +66,14 @@ jobs:
         continue-on-error: true
         run: |
           cd kit
-          "$HOME/.local/bin/uv" run python -m kit check ../ --env-file ../local.env
+          "$HOME/.local/bin/uv" run python -m kit check ../ --env-file "$RUNNER_TEMP/local.env"
 
       - name: Run one dev task
         run: |
           cd kit
           "$HOME/.local/bin/uv" run python eval/run.py ../ \
             --tasks '${{ inputs.task }}' \
-            --env-file ../local.env --trials 1 --out runs/smoke
+            --env-file "$RUNNER_TEMP/local.env" --trials 1 --out runs/smoke
 
       - name: Restore submission.yaml
         if: always()
