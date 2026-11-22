@@ -423,9 +423,11 @@ async def test_conn_gate_blocks_pass_then_fix():
       },
       bash_outputs=[
           "exit code 0\nIFC_GATE: SKIP (no .ifc files under output/)",
+          "exit code 0\nSEP_GATE: SKIP (no .ifc files under output/)",
           "exit code 0\nCONN tray: 1 segment(s), 23000 mm total\n"
           "CONN FAIL: tray: only 1 segment (23000 mm)\nCONN_GATE: FAIL",
           "exit code 0\nIFC_GATE: SKIP (no .ifc files under output/)",
+          "exit code 0\nSEP_GATE: SKIP (no .ifc files under output/)",
           "exit code 0\nCONN tray: 5 segment(s)\nCONN_GATE: PASS",
       ],
   )
@@ -453,11 +455,17 @@ def test_routing_prompts():
   check("busway class rule", "never IfcElectricDistributionBoard" in prompt)
   check("routing.json contract", "output/routing.json" in prompt)
   check("PNG reader present", "def read_png" in prompt)
+  check("butt-joint rule", "butt joints" in prompt)
+  check("profile orientation rule", "150 mm" in prompt)
+  check("drops go down", "goes down to the CRAH top" in prompt)
+  check("tier rule", "separate tiers" in prompt)
   verifier = serve.Agent(session, role="verifier")
   vprompt = verifier.system_prompt("")
   check("verifier connectivity checklist",
         "recompute the route geometry" in vprompt)
   check("verifier quotes numbers", "a PASS that does not quote them" in vprompt)
+  check("verifier distrusts empty clash checks",
+        "did not actually measure anything" in vprompt)
   check("verifier gets the IFC snippet",
         "ifcopenshell.validate.validate(model, _log, express_rules=True)"
         in vprompt)
@@ -475,7 +483,8 @@ def _build_test_ifc(path, segments):
   """Builds a minimal IFC4 file with the given route segments.
 
   segments: list of (cls, name, w, d, h, x, y, z) boxes in the agent's
-  style (long profile, short extrusion, unrotated placement).
+  style (long profile, short extrusion, unrotated placement), with an
+  optional 8th element (objecttype) for the entity's ObjectType.
   """
   import ifcopenshell
 
@@ -495,7 +504,9 @@ def _build_test_ifc(path, segments):
       'IfcGeometricRepresentationContext', ContextIdentifier='Model',
       ContextType='Model', CoordinateSpaceDimension=3, Precision=0.01,
       WorldCoordinateSystem=axis_world)
-  for cls, name, w, d, h, x, y, z in segments:
+  for seg in segments:
+    cls, name, w, d, h, x, y, z = seg[:8]
+    objecttype = seg[8] if len(seg) > 8 else None
     half_w, half_d = w / 2.0, d / 2.0
     pt = model.create_entity('IfcCartesianPoint', Coordinates=[float(x), float(y), float(z)])
     placement = model.create_entity(
@@ -522,6 +533,7 @@ def _build_test_ifc(path, segments):
         RepresentationIdentifier='Body', RepresentationType='SweptSolid', Items=[solid])
     product = model.create_entity(
         cls, GlobalId=ifcopenshell.guid.new(), Name=name,
+        ObjectType=objecttype,
         ObjectPlacement=placement,
         Representation=model.create_entity('IfcProductDefinitionShape', Representations=[shape]))
     model.create_entity(
@@ -597,6 +609,178 @@ def test_conn_gate_real_ifc():
     check("disconnected route fails", "CONN_GATE: FAIL" in out, out)
     check("disconnected route caught", "2 disconnected components" in out, out)
 
+    # Butt joints: boxes touch end to end (0 mm overlap), so the centrelines
+    # are a half-width apart at each corner — the gate must still see one
+    # connected component per service (it measures the solids, not the
+    # centrelines). The old endpoint-based gate called this 5 components.
+    outdir = os.path.join(tmp, "butt", "output")
+    os.makedirs(outdir)
+    _build_test_ifc(os.path.join(outdir, "model.ifc"), [
+        ('IfcCableCarrierSegment', 'CableTray-1', 1800, 600, 300, 1100, 3360, 2600),
+        ('IfcCableCarrierSegment', 'CableTray-2', 600, 1340, 300, 2000, 4330, 2600),
+        ('IfcCableCarrierSegment', 'CableTray-3', 22700, 600, 300, 13650, 5000, 2600),
+        ('IfcCableCarrierSegment', 'Busway-1', 2400, 600, 300, 1400, 3960, 3000),
+        ('IfcCableCarrierSegment', 'Busway-2', 600, 1340, 300, 2600, 4930, 3000),
+        ('IfcCableCarrierSegment', 'Busway-3', 22100, 600, 300, 13950, 5600, 3000),
+        ('IfcPipeSegment', 'CHW-1', 3000, 600, 300, 1700, 2760, 3400),
+        ('IfcPipeSegment', 'CHW-2', 600, 1340, 300, 3200, 3730, 3400),
+        ('IfcPipeSegment', 'CHW-3', 21500, 600, 300, 14250, 4400, 3400),
+        ('IfcPipeSegment', 'CHW-Drop-1', 300, 300, 2400, 3200, 4400, 1000),
+    ])
+    json.dump({
+        'entry': [200, 3360, 0],
+        'rows': [{'name': 'A', 'start': [2000, 5000, 0], 'end': [25000, 5000, 0]}],
+        'crahs': [[3200, 4400, 0]],
+    }, open(os.path.join(outdir, "routing.json"), "w"))
+    out = run_gate(os.path.join(tmp, "butt"))
+    check("butt-joint route passes", "CONN_GATE: PASS" in out, out)
+    check("butt joints are one component per service",
+          "1 connected component(s)" in out, out)
+
+    # ObjectType fallback: segments with no Name are classified from
+    # ObjectType, and a legitimate PDU is not mistaken for a route element.
+    outdir = os.path.join(tmp, "objtype", "output")
+    os.makedirs(outdir)
+    _build_test_ifc(os.path.join(outdir, "model.ifc"), [
+        ('IfcCableCarrierSegment', None, 1800, 600, 300, 1100, 3360, 2600, 'CableTray'),
+        ('IfcCableCarrierSegment', None, 600, 1640, 300, 2000, 4180, 2600, 'CableTray'),
+        ('IfcCableCarrierSegment', None, 1800, 600, 300, 1100, 3960, 2600, 'Busway'),
+        ('IfcCableCarrierSegment', None, 600, 1640, 300, 2000, 4780, 2600, 'Busway'),
+        ('IfcPipeSegment', None, 1800, 600, 300, 1100, 2760, 2600, 'CHW-Supply'),
+        ('IfcPipeSegment', None, 600, 2240, 300, 2000, 3880, 2600, 'CHW-Supply'),
+        ('IfcPipeSegment', None, 300, 300, 1600, 2000, 5000, 1000, 'CHW-Supply'),
+        ('IfcElectricDistributionBoard', 'PDU-1', 600, 400, 300, 5000, 5000, 2600),
+    ])
+    json.dump({
+        'entry': [200, 3360, 0],
+        'rows': [{'name': 'A', 'start': [1100, 3360, 0], 'end': [2000, 3360, 0]}],
+        'crahs': [[2000, 5000, 0]],
+    }, open(os.path.join(outdir, "routing.json"), "w"))
+    out = run_gate(os.path.join(tmp, "objtype"))
+    check("unnamed segments classified by ObjectType",
+          "CONN_GATE: PASS" in out, out)
+    check("PDU is not an unclassified route element",
+          "without a recognisable name" not in out, out)
+
+    # No CHW segments: the gate must not print a 1e18 mm CRAH distance.
+    outdir = os.path.join(tmp, "nochw", "output")
+    os.makedirs(outdir)
+    _build_test_ifc(os.path.join(outdir, "model.ifc"), [
+        ('IfcCableCarrierSegment', 'CableTray-1', 1800, 600, 300, 1100, 3360, 2600),
+        ('IfcCableCarrierSegment', 'Busway-1', 1800, 600, 300, 1100, 3960, 2600),
+    ])
+    json.dump({
+        'entry': [200, 3360, 0],
+        'rows': [{'name': 'A', 'start': [1100, 3360, 0], 'end': [2000, 3360, 0]}],
+        'crahs': [[2000, 5000, 0]],
+    }, open(os.path.join(outdir, "routing.json"), "w"))
+    out = run_gate(os.path.join(tmp, "nochw"))
+    check("no CHW fails", "CONN_GATE: FAIL" in out, out)
+    check("no 1e18 sentinel in the output",
+          "1000000000000000000" not in out, out)
+
+
+def _run_sep_gate(workdir):
+  import subprocess
+  script = os.path.join(workdir, "sep_gate.py")
+  with open(script, "w") as f:
+    f.write(serve.SEP_GATE_SCRIPT)
+  r = subprocess.run([sys.executable, script], cwd=workdir,
+                     capture_output=True, text=True)
+  return r.stdout + r.stderr
+
+
+async def test_sep_gate():
+  print("separation gate parsing")
+  session = FakeSession(21600)
+  session.instruction = "Route the cable tray, busway and chilled water."
+  worker = FakeAgent(session, role="worker")
+  FakeAgent.reset(bash_outputs=[
+      "exit code 0\nSEP_GATE: SKIP (no .ifc files under output/)",
+      "exit code 0\nSEP collisions: 0\nSEP_GATE: PASS",
+      "exit code 0\nSEP collisions: 75\n"
+      "SEP FAIL: 75 clashes (boxes overlapping > 2 mm on all axes)\nSEP_GATE: FAIL",
+      "exit code 127\npython3: command not found",
+  ])
+  check("skip, no files", await serve._separation_gate(worker) == "")
+  check("pass", await serve._separation_gate(worker) == "")
+  gaps = await serve._separation_gate(worker)
+  check("clashes returned", "75 clashes" in gaps, gaps)
+  check("tool error is inconclusive",
+        await serve._separation_gate(worker) == "")
+
+  session2 = FakeSession(21600)  # default instruction: not a routing task
+  worker2 = FakeAgent(session2, role="worker")
+  FakeAgent.reset(bash_outputs=["exit code 0\nSEP_GATE: FAIL"])
+  check("non-routing task skips the gate",
+        await serve._separation_gate(worker2) == "")
+  check("gate did not run a bash call",
+        FakeAgent.bash_outputs == ["exit code 0\nSEP_GATE: FAIL"])
+  check("gate script compiles",
+        compile(serve.SEP_GATE_SCRIPT, "<sep-gate>", "exec") is not None)
+  check("gate command is a heredoc",
+        serve.SEP_GATE_COMMAND.startswith("python3 - <<'PYEOF'\n"))
+
+
+def test_sep_gate_real_ifc():
+  print("separation gate on real IFC files")
+  try:
+    import ifcopenshell  # noqa: F401
+  except ImportError:
+    print("  skipped: ifcopenshell not installed")
+    return
+  import json
+  import shutil
+  import tempfile
+
+  with tempfile.TemporaryDirectory() as tmp:
+    # The butt-joint good case from the connectivity test: 0 clashes.
+    outdir = os.path.join(tmp, "butt", "output")
+    os.makedirs(outdir)
+    _build_test_ifc(os.path.join(outdir, "model.ifc"), [
+        ('IfcCableCarrierSegment', 'CableTray-1', 1800, 600, 300, 1100, 3360, 2600),
+        ('IfcCableCarrierSegment', 'CableTray-2', 600, 1340, 300, 2000, 4330, 2600),
+        ('IfcCableCarrierSegment', 'CableTray-3', 22700, 600, 300, 13650, 5000, 2600),
+        ('IfcCableCarrierSegment', 'Busway-1', 2400, 600, 300, 1400, 3960, 3000),
+        ('IfcCableCarrierSegment', 'Busway-2', 600, 1340, 300, 2600, 4930, 3000),
+        ('IfcCableCarrierSegment', 'Busway-3', 22100, 600, 300, 13950, 5600, 3000),
+        ('IfcPipeSegment', 'CHW-1', 3000, 600, 300, 1700, 2760, 3400),
+        ('IfcPipeSegment', 'CHW-2', 600, 1340, 300, 3200, 3730, 3400),
+        ('IfcPipeSegment', 'CHW-3', 21500, 600, 300, 14250, 4400, 3400),
+        ('IfcPipeSegment', 'CHW-Drop-1', 300, 300, 2400, 3200, 4400, 1000),
+    ])
+    out = _run_sep_gate(os.path.join(tmp, "butt"))
+    check("butt-joint route has no clashes", "SEP collisions: 0" in out, out)
+    check("butt-joint route passes", "SEP_GATE: PASS" in out, out)
+
+    # Run-6 replica: three separate boxes, no overlap.
+    outdir = os.path.join(tmp, "run6", "output")
+    os.makedirs(outdir)
+    _build_test_ifc(os.path.join(outdir, "model.ifc"), [
+        ('IfcCableCarrierSegment', 'CableTray', 23000, 600, 300, 13500, 10100, 2600),
+        ('IfcElectricDistributionBoard', 'Busway', 23000, 400, 300, 13500, 10700, 2600),
+        ('IfcPipeSegment', 'CHWPipe', 23000, 300, 300, 13500, 7000, 2800),
+    ])
+    out = _run_sep_gate(os.path.join(tmp, "run6"))
+    check("run-6 replica has no clashes", "SEP collisions: 0" in out, out)
+    check("run-6 replica passes", "SEP_GATE: PASS" in out, out)
+
+    # The real run-7 model: the gate must reproduce the grader's 75
+    # clashes exactly, and catch the profile-orientation and drop bugs.
+    fixture = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "fixtures", "run7-model")
+    workdir = os.path.join(tmp, "run7")
+    shutil.copytree(fixture, workdir)
+    out = _run_sep_gate(workdir)
+    check("run-7 model reports 75 clashes", "SEP collisions: 75" in out, out)
+    check("run-7 model fails", "SEP_GATE: FAIL" in out, out)
+    check("run-7 profile orientation caught",
+          "profile is oriented wrong" in out, out)
+    check("run-7 upward drop caught", "does not hang from the header" in out, out)
+    check("run-7 sprinkler clearance caught",
+          "below the sprinklers" in out, out)
+
 
 async def main():
   await test_long_task_pass_first_try()
@@ -616,6 +800,8 @@ async def main():
   await test_conn_gate_blocks_pass_then_fix()
   test_routing_prompts()
   test_conn_gate_real_ifc()
+  await test_sep_gate()
+  test_sep_gate_real_ifc()
   print("ALL TESTS PASSED")
 
 

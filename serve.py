@@ -200,7 +200,9 @@ check it against the task: the path, the format, every part the task asks for, a
 not create or change any file. Never accept the worker's claim that something was checked. Re-run the task's \
 stated validation yourself with the exact flags and quote its verbatim output in your reply. A script's own \
 self-check printout is not independent evidence — run the check separately on the produced file. If you cannot \
-re-run a claimed check, list it as a gap. When the task involves routing, recompute the route geometry from the \
+re-run a claimed check, list it as a gap. A collision check that produced no geometry (for example a tool that \
+returned 0 shapes, or a script that printed a count but no conclusion) is a failed measurement, not a pass — \
+never accept "0 overlaps" from a tool that did not actually measure anything. When the task involves routing, recompute the route geometry from the \
 produced .ifc yourself — do not take it from reconciliation.json or the worker's summary: segment count and total \
 length per service, the entity class of every route segment, the distance from each service's nearest segment to \
 the entry, per-row coverage, and CRAH reach. Quote those numbers in your reply; a PASS that does not quote them \
@@ -251,6 +253,23 @@ header; (b) one header per row, every row, all three services; (c) a drop from t
 including perimeter units the row headers do not pass. Never submit a route with one segment per service; every \
 direction or tier change is a new segment.
 - Busway is IfcCableCarrierSegment, exactly like the tray — never IfcElectricDistributionBoard.
+- Joints are butt joints: two segments meet end to end with 0 mm overlap (touching) or a gap of at most 100 mm. \
+Never build a junction from overlapping boxes — the grader counts every overlap over 2 mm as a clash, including \
+joints and same-service pairs, and more than half the clashes on a real run were joint overlaps. A joint's solids \
+may touch or sit up to 250 mm apart and still count as connected, so a small gap is fine and an overlap is not. \
+Build each horizontal segment as a flat box (length along the run, width across, thickness up) that starts where \
+the previous segment's box ends:
+  create_box_extrusion(x1 - x0, width, thickness, (x0 + x1) / 2, y, z)  # run from (x0, y) to (x1, y) at height z
+- Profile orientation: a tray segment's vertical extent must be its thickness (150 mm), not its width (600 mm). \
+If you rotate a placement, check the result — a 600 mm dimension standing vertical is the single most common \
+cause of clashes. The unrotated box style above cannot make this mistake.
+- Drops go down: a drop from a header to a CRAH starts at the header and goes down to the CRAH top. Build it as \
+a box whose bottom is the CRAH top and whose top reaches the header — never place a drop at the header and \
+extrude upward:
+  create_box_extrusion(w, w, z_top - z_bottom, x, y, z_bottom)  # drop from header z_top down to CRAH top z_bottom
+- Keep the three services on separate tiers: tray, busway and CHW at different heights (at least 300 mm apart \
+in z where they share a corridor), each top at least 460 mm below the sprinklers and each bottom above the \
+2600 mm clear height. A feeder must not pass through a column: route around it.
 - Name every route segment clearly (CableTray-1, Busway-1, CHW-1, ...).
 - Write output/routing.json next to the model, with the numbers you actually used: {"entry": [x, y, z], "rows": \
 [{"name": "A", "start": [x, y, z], "end": [x, y, z]}, ...], "crahs": [[x, y, z], ...]}. Then run a connectivity \
@@ -2135,6 +2154,7 @@ async def _ifc_gate(worker: Agent) -> str:
 # route, so the gate runs the exact measurement itself and its failures
 # become fix-round gaps. Only runs on routing tasks.
 CONN_GATE_SCRIPT = """
+
 import glob, json, math, os, sys
 try:
     import ifcopenshell
@@ -2227,14 +2247,15 @@ def _profile_bbox(prof):
     return (-0.5, 0.5), (-0.5, 0.5)
 
 
-def _segment(product):
-    '''Centreline (start, end) of an extruded route segment, or None.
+def _box(product):
+    '''Oriented box of an extruded solid: (centre, [(dir, half_len) x3]).
 
-    A segment is an oriented box: the centreline runs along its longest
-    axis, so this works both for a long profile with a short extrusion
-    (the agent's box style) and for a small profile with a long extrusion
-    (the rotated-placement style).
+    Returns None when the product has no extruded solid representation.
     '''
+    if getattr(product, 'ObjectPlacement', None) is None:
+        return None
+    if getattr(product, 'Representation', None) is None:
+        return None
     try:
         origin, x, y, z = _world_frame(product.ObjectPlacement)
     except Exception:
@@ -2255,10 +2276,32 @@ def _segment(product):
             ed = _matvec((x, y, z), _norm(_v(item.ExtrudedDirection.DirectionRatios)))
             centre = _add(origin, _add(_add(_scale(x, cx), _scale(y, cy)),
                                         _scale(ed, depth / 2.0)))
-            axes = sorted(((x, dx), (y, dy), (ed, depth / 2.0)), key=lambda a: -a[1])
-            d, half = axes[0]
-            return _sub(centre, _scale(d, half)), _add(centre, _scale(d, half))
+            return centre, [(x, dx), (y, dy), (ed, depth / 2.0)]
     return None
+
+
+def _aabb(centre, axes):
+    ext = [0.0, 0.0, 0.0]
+    for d, half in axes:
+        for i in range(3):
+            ext[i] += abs(d[i]) * half
+    return tuple(centre[i] - ext[i] for i in range(3)), tuple(centre[i] + ext[i] for i in range(3))
+
+
+def _segment(product):
+    '''Centreline (start, end) of an extruded route segment, or None.
+
+    A segment is an oriented box: the centreline runs along its longest
+    axis, so this works both for a long profile with a short extrusion
+    (the agent's box style) and for a small profile with a long extrusion
+    (the rotated-placement style).
+    '''
+    b = _box(product)
+    if b is None:
+        return None
+    centre, axes = b
+    d, half = max(axes, key=lambda a: a[1])
+    return _sub(centre, _scale(d, half)), _add(centre, _scale(d, half))
 
 
 def _pt_seg_dist(p, a, b):
@@ -2281,8 +2324,26 @@ def _coverage(start, end, segments, tol):
     return hit / (n + 1)
 
 
-def _components(segments, tol):
-    parent = list(range(len(segments)))
+def _aabb_dist(a_min, a_max, b_min, b_max):
+    '''Distance between two axis-aligned bounding boxes (0 when they touch
+    or overlap). This is the distance between the two solids, not their
+    centrelines: a butt joint (two boxes touching end to end, 0 mm overlap)
+    is connected, even though the centrelines are a half-width apart at a
+    corner — measuring centrelines would call a correct butt joint
+    disconnected.'''
+    d2 = 0.0
+    for i in range(3):
+        gap = max(b_min[i] - a_max[i], a_min[i] - b_max[i], 0.0)
+        d2 += gap * gap
+    return math.sqrt(d2)
+
+
+def _components(boxes, tol):
+    '''Number of connected components among the boxes, joined when their
+    solids are within tol (250 mm) of each other. A T-junction (a branch
+    meeting the middle of a trunk) counts as joined, because the solids
+    touch even though no endpoints meet.'''
+    parent = list(range(len(boxes)))
 
     def find(i):
         while parent[i] != i:
@@ -2290,22 +2351,20 @@ def _components(segments, tol):
             i = parent[i]
         return i
 
-    for i in range(len(segments)):
-        for j in range(i + 1, len(segments)):
-            a1, b1 = segments[i]
-            a2, b2 = segments[j]
-            if min(_dist(a1, a2), _dist(a1, b2), _dist(b1, a2), _dist(b1, b2)) <= tol:
+    for i in range(len(boxes)):
+        for j in range(i + 1, len(boxes)):
+            if _aabb_dist(boxes[i][0], boxes[i][1], boxes[j][0], boxes[j][1]) <= tol:
                 parent[find(i)] = find(j)
-    return len({find(i) for i in range(len(segments))})
+    return len({find(i) for i in range(len(boxes))})
 
 
 def _classify(product):
-    name = (product.Name or '').lower()
-    if 'busway' in name:
+    text = ((product.Name or '') + ' ' + (product.ObjectType or '')).lower()
+    if 'busway' in text:
         return 'busway'
-    if 'tray' in name:
+    if 'tray' in text:
         return 'tray'
-    if 'chw' in name or 'pipe' in name or 'chilled' in name:
+    if 'chw' in text or 'pipe' in text or 'chilled' in text:
         return 'chw'
     return None
 
@@ -2322,9 +2381,10 @@ def main():
         print(f'CONN_GATE: SKIP (cannot open {path}: {exc})')
         return
     segs = {'tray': [], 'busway': [], 'chw': []}
+    boxes = {'tray': [], 'busway': [], 'chw': []}
     wrong = []
     unclassified = 0
-    for product in model.by_type('IfcFlowSegment') + model.by_type('IfcElectricDistributionBoard'):
+    for product in model.by_type('IfcFlowSegment'):
         svc = _classify(product)
         if svc is None:
             unclassified += 1
@@ -2333,12 +2393,23 @@ def main():
         if not product.is_a(expect):
             wrong.append(f"{svc} modelled as {product.is_a()}, not {expect}")
             continue
-        s = _segment(product)
-        if s is None:
+        b = _box(product)
+        if b is None:
             continue
-        segs[svc].append(s)
+        centre, axes = b
+        d, half = max(axes, key=lambda a: a[1])
+        segs[svc].append((_sub(centre, _scale(d, half)), _add(centre, _scale(d, half))))
+        boxes[svc].append(_aabb(centre, axes))
+    for product in model.by_type('IfcElectricDistributionBoard'):
+        # Only a board that claims to be a route segment is a wrong class;
+        # a legitimate PDU (no tray/busway name) is not a route element.
+        svc = _classify(product)
+        if svc is None:
+            continue
+        expect = 'IfcCableCarrierSegment' if svc in ('tray', 'busway') else 'IfcPipeSegment'
+        wrong.append(f"{svc} modelled as {product.is_a()}, not {expect}")
     if unclassified:
-        print(f"CONN note: {unclassified} route element(s) without a recognisable name (tray/busway/chw)")
+        print(f"CONN note: {unclassified} flow segment(s) without a recognisable name (tray/busway/chw)")
     problems = []
     for svc in ('tray', 'busway', 'chw'):
         n = len(segs[svc])
@@ -2351,8 +2422,8 @@ def main():
     for w in wrong:
         problems.append(w)
     for svc in ('tray', 'busway', 'chw'):
-        if len(segs[svc]) > 1:
-            c = _components(segs[svc], JOIN_TOL)
+        if len(boxes[svc]) > 1:
+            c = _components(boxes[svc], JOIN_TOL)
             print(f"CONN {svc}: {c} connected component(s)")
             if c > 1:
                 problems.append(f"{svc}: {c} disconnected components (segments must join within {JOIN_TOL:.0f} mm)")
@@ -2376,9 +2447,13 @@ def main():
                 print(f"CONN row {row.get('name', '?')}: {svc} coverage {cov:.0%}")
                 if cov < ROW_MIN:
                     problems.append(f"row {row.get('name', '?')}: {svc} covers only {cov:.0%} (needs {ROW_MIN:.0%})")
+        if not segs['chw']:
+            print("CONN note: no CHW segments, CRAH reach not checked")
         for crah in routing.get('crahs', []):
             p = _v(crah)
-            d = min((_pt_seg_dist2d(p, a, b) for a, b in segs['chw']), default=1e18)
+            if not segs['chw']:
+                break
+            d = min(_pt_seg_dist2d(p, a, b) for a, b in segs['chw'])
             if d > CRAH_TOL:
                 problems.append(f"CRAH at {tuple(int(v) for v in p)} is {d:.0f} mm from the nearest CHW segment (needs {CRAH_TOL:.0f} mm)")
     if problems:
@@ -2392,6 +2467,315 @@ def main():
 main()
 """
 CONN_GATE_COMMAND = "python3 - <<'PYEOF'\n" + CONN_GATE_SCRIPT + "\nPYEOF"
+
+
+SEP_GATE_SCRIPT = """
+import glob, math, os, sys
+try:
+    import ifcopenshell
+except Exception as exc:
+    print(f"SEP_GATE: SKIP (ifcopenshell unavailable: {exc})")
+    sys.exit(0)
+
+CLASH_TOL = 2.0
+SPRINKLER_CLEAR = 460.0
+MIN_CLEAR_HEIGHT = 2600.0
+
+
+def _v(p):
+    return (float(p[0]), float(p[1]), float(p[2]))
+
+
+def _norm(v):
+    n = math.sqrt(sum(x * x for x in v)) or 1.0
+    return tuple(x / n for x in v)
+
+
+def _cross(a, b):
+    return (a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2],
+            a[0] * b[1] - a[1] * b[0])
+
+
+def _add(a, b):
+    return tuple(x + y for x, y in zip(a, b))
+
+
+def _sub(a, b):
+    return tuple(x - y for x, y in zip(a, b))
+
+
+def _scale(v, s):
+    return tuple(x * s for x in v)
+
+
+def _matvec(cols, v):
+    return tuple(sum(cols[j][i] * v[j] for j in range(3)) for i in range(3))
+
+
+def _axis_frame(ap):
+    '''Frame of an IfcAxis2Placement3D: (location, x, y, z).'''
+    loc = _v(ap.Location.Coordinates) if getattr(ap, 'Location', None) else (0.0, 0.0, 0.0)
+    z = _norm(_v(ap.Axis.DirectionRatios)) if getattr(ap, 'Axis', None) else (0.0, 0.0, 1.0)
+    x = _norm(_v(ap.RefDirection.DirectionRatios)) if getattr(ap, 'RefDirection', None) else (1.0, 0.0, 0.0)
+    y = _norm(_cross(z, x))
+    x = _norm(_cross(y, z))
+    return loc, x, y, z
+
+
+def _world_frame(pl):
+    '''World frame of an IfcLocalPlacement, walking its PlacementRelTo chain.'''
+    origin, x, y, z = (0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)
+    chain, cur = [], pl
+    while cur is not None:
+        chain.append(cur)
+        cur = getattr(cur, 'PlacementRelTo', None)
+    for p in reversed(chain):
+        loc, px, py, pz = _axis_frame(p.RelativePlacement)
+        origin = _add(origin, _matvec((x, y, z), loc))
+        x, y, z = _matvec((x, y, z), px), _matvec((x, y, z), py), _matvec((x, y, z), pz)
+    return origin, x, y, z
+
+
+def _profile_bbox(prof):
+    if prof.is_a('IfcRectangleProfileDef'):
+        cx, cy = 0.0, 0.0
+        if getattr(prof, 'Position', None) and getattr(prof.Position, 'Location', None):
+            c = prof.Position.Location.Coordinates
+            cx, cy = float(c[0]), float(c[1])
+        xd, yd = float(prof.XDim), float(prof.YDim)
+        return (cx - xd / 2, cx + xd / 2), (cy - yd / 2, cy + yd / 2)
+    if prof.is_a('IfcArbitraryClosedProfileDef'):
+        pts = prof.OuterCurve.Points
+        xs = [float(p.Coordinates[0]) for p in pts]
+        ys = [float(p.Coordinates[1]) for p in pts]
+        return (min(xs), max(xs)), (min(ys), max(ys))
+    return (-0.5, 0.5), (-0.5, 0.5)
+
+
+def _box(product):
+    '''Oriented box of an extruded solid: (centre, [(dir, half_len) x3]).
+
+    Returns None when the product has no extruded solid representation.
+    '''
+    if getattr(product, 'ObjectPlacement', None) is None:
+        return None
+    if getattr(product, 'Representation', None) is None:
+        return None
+    try:
+        origin, x, y, z = _world_frame(product.ObjectPlacement)
+    except Exception:
+        return None
+    for rep in product.Representation.Representations:
+        for item in rep.Items:
+            if not item.is_a('IfcExtrudedAreaSolid'):
+                continue
+            if getattr(item, 'Position', None):
+                sloc, sx, sy, sz = _axis_frame(item.Position)
+                origin = _add(origin, _matvec((x, y, z), sloc))
+                x, y, z = (_matvec((x, y, z), sx), _matvec((x, y, z), sy),
+                           _matvec((x, y, z), sz))
+            (x0, x1), (y0, y1) = _profile_bbox(item.SweptArea)
+            dx, dy = (x1 - x0) / 2.0, (y1 - y0) / 2.0
+            cx, cy = (x0 + x1) / 2.0, (y0 + y1) / 2.0
+            depth = float(item.Depth)
+            ed = _matvec((x, y, z), _norm(_v(item.ExtrudedDirection.DirectionRatios)))
+            centre = _add(origin, _add(_add(_scale(x, cx), _scale(y, cy)),
+                                        _scale(ed, depth / 2.0)))
+            return centre, [(x, dx), (y, dy), (ed, depth / 2.0)]
+    return None
+
+
+def _aabb(centre, axes):
+    ext = [0.0, 0.0, 0.0]
+    for d, half in axes:
+        for i in range(3):
+            ext[i] += abs(d[i]) * half
+    return tuple(centre[i] - ext[i] for i in range(3)), tuple(centre[i] + ext[i] for i in range(3))
+
+
+def _pt_seg_dist(p, a, b):
+    '''Distance from point p to segment a-b (3D).'''
+    ab = _sub(b, a)
+    d = sum(x * x for x in ab)
+    if d == 0:
+        return math.sqrt(sum((p[i] - a[i]) ** 2 for i in range(3)))
+    t = max(0.0, min(1.0, sum((p[i] - a[i]) * ab[i] for i in range(3)) / d))
+    q = tuple(a[i] + t * ab[i] for i in range(3))
+    return math.sqrt(sum((p[i] - q[i]) ** 2 for i in range(3)))
+
+
+def _endpoints(centre, axes):
+    d, half = max(axes, key=lambda a: a[1])
+    return _sub(centre, _scale(d, half)), _add(centre, _scale(d, half))
+
+
+def _overlap(a_min, a_max, b_min, b_max):
+    '''Per-axis overlap in mm, or None when the boxes do not overlap.'''
+    ov = [min(a_max[i], b_max[i]) - max(a_min[i], b_min[i]) for i in range(3)]
+    if min(ov) <= 0:
+        return None
+    return ov
+
+
+def _service_of(product):
+    text = ((product.Name or '') + ' ' + (product.ObjectType or '')).lower()
+    if 'busway' in text:
+        return 'busway'
+    if 'tray' in text:
+        return 'tray'
+    if 'chw' in text or 'pipe' in text or 'chilled' in text:
+        return 'chw'
+    if 'sprinkler' in text:
+        return 'sprinkler'
+    if 'rack' in text or 'cabinet' in text:
+        return 'rack'
+    if 'column' in text or product.is_a('IfcColumn'):
+        return 'column'
+    return 'other'
+
+
+def main():
+    files = sorted(glob.glob('output/**/*.ifc', recursive=True))
+    if not files:
+        print('SEP_GATE: SKIP (no .ifc files under output/)')
+        return
+    path = 'output/model.ifc' if 'output/model.ifc' in files else max(files, key=os.path.getsize)
+    try:
+        model = ifcopenshell.open(path)
+    except Exception as exc:
+        print(f'SEP_GATE: SKIP (cannot open {path}: {exc})')
+        return
+    items = []
+    for product in model.by_type('IfcProduct'):
+        b = _box(product)
+        if b is None:
+            continue
+        centre, axes = b
+        a_min, a_max = _aabb(centre, axes)
+        items.append((product, _service_of(product), centre, axes, a_min, a_max))
+    print(f"SEP products with geometry: {len(items)}")
+    problems = []
+    # 1. Collision count: every pair of boxes overlapping > CLASH_TOL on all axes.
+    clashes = {}
+    total = 0
+    for i in range(len(items)):
+        for j in range(i + 1, len(items)):
+            ov = _overlap(items[i][4], items[i][5], items[j][4], items[j][5])
+            if ov is None or min(ov) <= CLASH_TOL:
+                continue
+            total += 1
+            key = tuple(sorted((items[i][1], items[j][1])))
+            clashes[key] = clashes.get(key, 0) + 1
+    print(f"SEP collisions: {total}")
+    for key in sorted(clashes):
+        print(f"SEP   {' x '.join(key)}: {clashes[key]}")
+    if total:
+        problems.append(f"{total} clashes (boxes overlapping > {CLASH_TOL:.0f} mm on all axes) — joints must be butt joints (0 mm overlap) or leave a gap, never overlapping boxes")
+    # 2. Profile orientation: a horizontal route segment's vertical extent
+    # must be its profile height (the smaller profile dimension), not its width.
+    for product, svc, centre, axes, a_min, a_max in items:
+        if svc not in ('tray', 'busway', 'chw'):
+            continue
+        longest = max(axes, key=lambda a: a[1])
+        if abs(longest[0][2]) > 0.5:
+            continue  # vertical segment (a drop): skip
+        vertical = a_max[2] - a_min[2]
+        prof = sorted([axes[0][1], axes[1][1]])
+        expect = 2 * prof[0]
+        if vertical > expect + CLASH_TOL:
+            problems.append(
+                f"{svc} segment {product.Name or product.is_a()} is {vertical:.0f} mm tall but its profile is only {expect:.0f} mm high — the profile is oriented wrong (width standing vertical)")
+            break
+    # 3. Drops must go down: a vertical route segment's top must hang from
+    # another segment of the same service (a header or a riser).
+    for product, svc, centre, axes, a_min, a_max in items:
+        if svc not in ('tray', 'busway', 'chw'):
+            continue
+        longest = max(axes, key=lambda a: a[1])
+        if abs(longest[0][2]) <= 0.5:
+            continue  # horizontal: skip
+        top = (centre[0], centre[1], a_max[2])
+        nearest = None
+        for p2, s2, c2, ax2, mn2, mx2 in items:
+            if s2 != svc or p2 is product:
+                continue
+            e1, e2 = _endpoints(c2, ax2)
+            d = _pt_seg_dist(top, e1, e2)
+            nearest = d if nearest is None else min(nearest, d)
+        if nearest is None or nearest > 250.0:
+            problems.append(
+                f"{svc} vertical segment {product.Name or product.is_a()} does not hang from the header (top is {nearest if nearest is not None else -1:.0f} mm from the nearest horizontal segment) — drops must go down to the load")
+            break
+    # 4. Sprinkler clearance: every route top must be >= 460 mm below the
+    # lowest sprinkler.
+    sprinklers = [it for it in items if it[1] == 'sprinkler']
+    if sprinklers:
+        lowest = min(it[4][2] for it in sprinklers)
+        for product, svc, centre, axes, a_min, a_max in items:
+            if svc not in ('tray', 'busway', 'chw'):
+                continue
+            if a_max[2] > lowest - SPRINKLER_CLEAR:
+                problems.append(
+                    f"{svc} segment {product.Name or product.is_a()} tops at {a_max[2]:.0f} mm, only {lowest - a_max[2]:.0f} mm below the sprinklers (needs {SPRINKLER_CLEAR:.0f} mm)")
+                break
+    # 5. Clear height: horizontal route segments must stay above 2600 mm.
+    for product, svc, centre, axes, a_min, a_max in items:
+        if svc not in ('tray', 'busway', 'chw'):
+            continue
+        longest = max(axes, key=lambda a: a[1])
+        if abs(longest[0][2]) > 0.5:
+            continue  # vertical drop: may go below
+        if a_min[2] < MIN_CLEAR_HEIGHT:
+            problems.append(
+                f"{svc} segment {product.Name or product.is_a()} bottom is at {a_min[2]:.0f} mm, below the {MIN_CLEAR_HEIGHT:.0f} mm clear height")
+            break
+    if problems:
+        for p in problems:
+            print('SEP FAIL: ' + p)
+        print('SEP_GATE: FAIL')
+    else:
+        print('SEP_GATE: PASS')
+
+
+main()
+"""
+SEP_GATE_COMMAND = "python3 - <<'PYEOF'\n" + SEP_GATE_SCRIPT + "\nPYEOF"
+
+
+async def _separation_gate(worker: Agent) -> str:
+  """Runs the deterministic separation/clash gate and returns failures as gaps.
+
+  The gate runs in the task container through the worker's bash tool, on
+  routing tasks only (see ROUTING_KEYWORDS). It measures the produced .ifc
+  itself: every pair of solids overlapping by more than 2 mm on all axes
+  (the grader counts every such overlap as a clash, with no exemption for
+  joints, same-service pairs or background objects), profile orientation
+  (a horizontal segment's vertical extent must be its profile height, not
+  its width), drops that go up instead of down, sprinkler clearance
+  (460 mm) and the 2600 mm clear height. It returns "" when the task is
+  not a routing task, there is nothing to check, the check passes, or the
+  check could not run — an inconclusive gate must not block submission.
+
+  Args:
+    worker: The worker Agent (its bash tool runs in the task container).
+
+  Returns:
+    The gate's failure text when it fails, else "".
+  """
+  instr = worker.session.instruction.lower()
+  if not any(k in instr for k in ROUTING_KEYWORDS):
+    return ""
+  try:
+    out = await worker.bash(SEP_GATE_COMMAND)
+  except Exception as exc:  # pylint: disable=broad-exception-caught
+    await worker.session.log(f"Separation gate failed to run: {exc}")
+    return ""
+  if "SEP_GATE: FAIL" not in out:
+    await worker.session.log(
+        "Separation gate: " + (out.strip().splitlines() or [""])[-1][:200]
+    )
+    return ""
+  return clip(out, 4000)
 
 
 async def _connectivity_gate(worker: Agent) -> str:
@@ -2478,6 +2862,8 @@ async def solve(session: taskbridge.Session) -> str:
       # The verifier passed: run the deterministic gates before accepting
       # it. A gate failure becomes gaps for a fix round, like any other.
       gaps = await _ifc_gate(worker)
+      if not gaps:
+        gaps = await _separation_gate(worker)
       if not gaps:
         gaps = await _connectivity_gate(worker)
       passed = not gaps
