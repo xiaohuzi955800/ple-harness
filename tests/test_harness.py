@@ -80,6 +80,11 @@ class FakeAgent:
     return text
 
   async def bash(self, command, timeout_sec=120):
+    if "prev_output" in command:
+      # The regression guard's snapshot/restore: a deterministic filesystem
+      # operation in the task container, not a gate measurement. Pretend it
+      # worked so it never consumes a canned gate output.
+      return "SNAPSHOT_OK"
     if FakeAgent.bash_outputs:
       return FakeAgent.bash_outputs.pop(0)
     return "exit code 0\nIFC_GATE: SKIP (no .ifc files under output/)"
@@ -309,12 +314,14 @@ async def test_ifc_gate():
   ])
   session = FakeSession(21600)
   worker = FakeAgent(session, role="worker")
-  check("skip, no files", await serve._ifc_gate(worker) == "")
-  check("pass", await serve._ifc_gate(worker) == "")
-  gaps = await serve._ifc_gate(worker)
+  check("skip, no files", (await serve._ifc_gate(worker))[0] == "")
+  check("pass", (await serve._ifc_gate(worker))[0] == "")
+  gaps, scores = await serve._ifc_gate(worker)
   check("violations returned", "3 EXPRESS violations" in gaps, gaps)
+  check("scores count violations",
+        scores == {"ifc_ok": False, "violations": 3}, scores)
   check("tool error is inconclusive",
-        await serve._ifc_gate(worker) == "")
+        (await serve._ifc_gate(worker))[0] == "")
 
   class RaisingWorker:
     def __init__(self, session):
@@ -324,11 +331,114 @@ async def test_ifc_gate():
       raise RuntimeError("boom")
 
   check("bash raising is inconclusive",
-        await serve._ifc_gate(RaisingWorker(session)) == "")
+        (await serve._ifc_gate(RaisingWorker(session)))[0] == "")
   check("gate script compiles",
         compile(serve.IFC_GATE_SCRIPT, "<ifc-gate>", "exec") is not None)
   check("gate command is a heredoc",
         serve.IFC_GATE_COMMAND.startswith("python3 - <<'PYEOF'\n"))
+
+
+async def test_unit_gate():
+  print("unit gate parsing")
+  FakeAgent.reset(bash_outputs=[
+      "exit code 0\nUNIT_GATE: SKIP (no .ifc files under output/)",
+      "exit code 0\nUNIT output/model.ifc: scale x1.000,"
+      " millimetre unit declared: True\n"
+      "UNIT_GATE: PASS (1 file(s), scale x1.0, millimetre units)",
+      "exit code 0\nUNIT output/model.ifc: scale x1000.000,"
+      " millimetre unit declared: False\n"
+      "UNIT FAIL: output/model.ifc reads 1000x too large — the model has no"
+      " millimetre unit declaration\nUNIT_GATE: FAIL",
+      "exit code 127\npython3: command not found",
+  ])
+  session = FakeSession(21600)
+  worker = FakeAgent(session, role="worker")
+  check("skip, no files", (await serve._unit_gate(worker))[0] == "")
+  gaps, scores = await serve._unit_gate(worker)
+  check("pass", gaps == "")
+  check("pass scores",
+        scores == {"unit_ok": True, "scale": 1.0}, scores)
+  gaps, scores = await serve._unit_gate(worker)
+  check("1000x returned", "1000x too large" in gaps, gaps)
+  check("fail scores",
+        scores == {"unit_ok": False, "scale": 1000.0}, scores)
+  check("tool error is inconclusive",
+        (await serve._unit_gate(worker))[0] == "")
+  check("gate script compiles",
+        compile(serve.UNIT_GATE_SCRIPT, "<unit-gate>", "exec") is not None)
+  check("gate command is a heredoc",
+        serve.UNIT_GATE_COMMAND.startswith("python3 - <<'PYEOF'\n"))
+
+
+def _run_unit_gate(workdir):
+  import subprocess
+  script = os.path.join(workdir, "unit_gate.py")
+  with open(script, "w") as f:
+    f.write(serve.UNIT_GATE_SCRIPT)
+  r = subprocess.run([sys.executable, script], cwd=workdir,
+                     capture_output=True, text=True)
+  return r.stdout + r.stderr
+
+
+def test_unit_gate_real_ifc():
+  print("unit gate on real IFC files")
+  try:
+    import ifcopenshell  # noqa: F401
+  except ImportError:
+    print("  skipped: ifcopenshell not installed")
+    return
+  import shutil
+  import tempfile
+
+  base = os.path.join(
+      os.path.dirname(os.path.abspath(__file__)), "fixtures")
+  with tempfile.TemporaryDirectory() as tmp:
+    # Run 9's model has no unit declaration: the grader reads it 1000x
+    # too large. The unit gate must fail it.
+    workdir = os.path.join(tmp, "run9")
+    shutil.copytree(os.path.join(base, "run9-model"), workdir)
+    out = _run_unit_gate(workdir)
+    check("run-9 model scale is 1000x", "scale x1000.000" in out, out)
+    check("run-9 model fails", "UNIT_GATE: FAIL" in out, out)
+    # Run 8's model has the declaration: scale x1.0, passes.
+    workdir = os.path.join(tmp, "run8")
+    shutil.copytree(os.path.join(base, "run8-model"), workdir)
+    out = _run_unit_gate(workdir)
+    check("run-8 model scale is 1x", "scale x1.000" in out, out)
+    check("run-8 model passes", "UNIT_GATE: PASS" in out, out)
+
+
+def test_regression_guard():
+  print("regression guard score comparison")
+  base = {
+      "unit_ok": True, "ifc_ok": True, "frame_ok": True,
+      "clashes": 1, "max_components": 5, "rows_below_80": 0,
+  }
+  check("same scores are not a regression",
+        not serve._is_regression(base, dict(base)))
+  check("clashes up is a regression",
+        serve._is_regression(base, {**base, "clashes": 10}))
+  check("clashes down is not a regression",
+        not serve._is_regression(base, {**base, "clashes": 0}))
+  check("unit flipped to FAIL is a regression",
+        serve._is_regression(base, {**base, "unit_ok": False}))
+  check("frame flipped to FAIL is a regression",
+        serve._is_regression(base, {**base, "frame_ok": False}))
+  check("components up without clash cut is a regression",
+        serve._is_regression(base, {**base, "max_components": 8}))
+  check("components up with clash cut is not a regression",
+        not serve._is_regression(
+            base, {**base, "max_components": 8, "clashes": 0}))
+  check("inconclusive scores give no vector",
+        serve._gate_score_vector({}, {}, {}, {}) is None)
+  check("score vector built",
+        serve._gate_score_vector(
+            {"unit_ok": True, "scale": 1.0},
+            {"ifc_ok": True, "violations": 0},
+            {"clashes": 10, "frame_ok": True, "frame_outside": 0},
+            {"components": {"tray": 5}, "rows_below_80": 2})
+        == {"unit_ok": True, "ifc_ok": True, "frame_ok": True,
+            "clashes": 10, "max_components": 5, "rows_below_80": 2})
 
 
 async def test_gate_blocks_pass_then_fix():
@@ -340,8 +450,17 @@ async def test_gate_blocks_pass_then_fix():
           "verifier": ["PASS", "PASS"],
       },
       bash_outputs=[
+          # Round 1: unit passes, IFC fails (not a routing task, so the
+          # separation and connectivity gates do not run).
+          "exit code 0\nUNIT output/model.ifc: scale x1.000,"
+          " millimetre unit declared: True\n"
+          "UNIT_GATE: PASS (1 file(s), scale x1.0, millimetre units)",
           "exit code 0\nIFC output/model.ifc: 1 EXPRESS violations\n"
           "  bad extrusion\nIFC_GATE: FAIL",
+          # Round 2: both pass.
+          "exit code 0\nUNIT output/model.ifc: scale x1.000,"
+          " millimetre unit declared: True\n"
+          "UNIT_GATE: PASS (1 file(s), scale x1.0, millimetre units)",
           "exit code 0\nIFC output/model.ifc: 0 EXPRESS violations\n"
           "IFC_GATE: PASS (1 file(s), 0 EXPRESS violations)",
       ],
@@ -399,18 +518,20 @@ async def test_conn_gate():
       "CONN FAIL: tray: only 1 segment (23000 mm)\nCONN_GATE: FAIL",
       "exit code 127\npython3: command not found",
   ])
-  check("skip, no files", await serve._connectivity_gate(worker) == "")
-  check("pass", await serve._connectivity_gate(worker) == "")
-  gaps = await serve._connectivity_gate(worker)
+  check("skip, no files", (await serve._connectivity_gate(worker))[0] == "")
+  check("pass", (await serve._connectivity_gate(worker))[0] == "")
+  gaps, scores = await serve._connectivity_gate(worker)
   check("violations returned", "only 1 segment" in gaps, gaps)
+  check("scores carry components and rows",
+        scores == {"components": {}, "rows_below_80": 0}, scores)
   check("tool error is inconclusive",
-        await serve._connectivity_gate(worker) == "")
+        (await serve._connectivity_gate(worker))[0] == "")
 
   session2 = FakeSession(21600)  # default instruction: not a routing task
   worker2 = FakeAgent(session2, role="worker")
   FakeAgent.reset(bash_outputs=["exit code 0\nCONN_GATE: FAIL"])
   check("non-routing task skips the gate",
-        await serve._connectivity_gate(worker2) == "")
+        (await serve._connectivity_gate(worker2))[0] == "")
   check("gate did not run a bash call",
         FakeAgent.bash_outputs == ["exit code 0\nCONN_GATE: FAIL"])
 
@@ -426,10 +547,14 @@ async def test_conn_gate_blocks_pass_then_fix():
           "verifier": ["PASS", "PASS"],
       },
       bash_outputs=[
+          # Round 1: unit, IFC, SEP, CONN — consumed in that order.
+          "exit code 0\nUNIT_GATE: SKIP (no .ifc files under output/)",
           "exit code 0\nIFC_GATE: SKIP (no .ifc files under output/)",
           "exit code 0\nSEP_GATE: SKIP (no .ifc files under output/)",
           "exit code 0\nCONN tray: 1 segment(s), 23000 mm total\n"
           "CONN FAIL: tray: only 1 segment (23000 mm)\nCONN_GATE: FAIL",
+          # Round 2: all pass.
+          "exit code 0\nUNIT_GATE: SKIP (no .ifc files under output/)",
           "exit code 0\nIFC_GATE: SKIP (no .ifc files under output/)",
           "exit code 0\nSEP_GATE: SKIP (no .ifc files under output/)",
           "exit code 0\nCONN tray: 5 segment(s)\nCONN_GATE: PASS",
@@ -460,15 +585,21 @@ async def test_gates_run_in_parallel_and_merge():
           "verifier": ["PASS", "PASS"],
       },
       bash_outputs=[
-          # Round 1: IFC passes, SEP and CONN both fail — consumed in
-          # IFC, SEP, CONN order by asyncio.gather.
+          # Round 1: unit and IFC pass, SEP and CONN both fail — consumed
+          # in unit, IFC, SEP, CONN order by asyncio.gather.
+          "exit code 0\nUNIT output/model.ifc: scale x1.000,"
+          " millimetre unit declared: True\n"
+          "UNIT_GATE: PASS (1 file(s), scale x1.0, millimetre units)",
           "exit code 0\nIFC_GATE: PASS (1 file(s), 0 EXPRESS violations)",
           "exit code 0\nSEP collisions: 75\n"
           "SEP FAIL: 75 clashes (boxes overlapping > 2 mm on all axes)\n"
           "SEP_GATE: FAIL",
           "exit code 0\nCONN tray: 1 segment(s), 23000 mm total\n"
           "CONN FAIL: tray: only 1 segment (23000 mm)\nCONN_GATE: FAIL",
-          # Round 2: all three gates pass.
+          # Round 2: all four gates pass.
+          "exit code 0\nUNIT output/model.ifc: scale x1.000,"
+          " millimetre unit declared: True\n"
+          "UNIT_GATE: PASS (1 file(s), scale x1.0, millimetre units)",
           "exit code 0\nIFC_GATE: PASS (1 file(s), 0 EXPRESS violations)",
           "exit code 0\nSEP collisions: 0\nSEP_GATE: PASS",
           "exit code 0\nCONN tray: 5 segment(s)\nCONN_GATE: PASS",
@@ -509,6 +640,9 @@ async def test_gate_verdict_appended_when_rounds_run_out():
           "verifier": ["PASS", "PASS", "PASS"],
       },
       bash_outputs=[
+          "exit code 0\nUNIT output/model.ifc: scale x1.000,"
+          " millimetre unit declared: True\n"
+          "UNIT_GATE: PASS (1 file(s), scale x1.0, millimetre units)",
           "exit code 0\nIFC_GATE: PASS (1 file(s), 0 EXPRESS violations)",
           "exit code 0\nSEP collisions: 75\n"
           "SEP FAIL: 75 clashes (boxes overlapping > 2 mm on all axes)\n"
@@ -533,6 +667,59 @@ async def test_gate_verdict_appended_when_rounds_run_out():
         "Independent verification: PASS." not in result, repr(result))
 
 
+async def test_regression_guard_restores_worse_fix():
+  print("a fix round that makes clashes worse is rolled back")
+  session = FakeSession(21600)
+  session.instruction = "Route the cable tray, busway and chilled water."
+  unit_pass = (
+      "exit code 0\nUNIT output/model.ifc: scale x1.000,"
+      " millimetre unit declared: True\n"
+      "UNIT_GATE: PASS (1 file(s), scale x1.0, millimetre units)")
+  ifc_pass = "exit code 0\nIFC_GATE: PASS (1 file(s), 0 EXPRESS violations)"
+  conn_pass = "exit code 0\nCONN_GATE: PASS"
+
+  def sep_fail(n):
+    return (
+        f"exit code 0\nSEP collisions: {n}\n"
+        f"SEP FAIL: {n} clashes (boxes overlapping > 2 mm on all axes)\n"
+        "SEP_GATE: FAIL")
+
+  FakeAgent.reset(
+      scripts={
+          "planner": ["p"],
+          "worker": ["worker summary"],
+          "verifier": ["PASS", "PASS", "PASS"],
+      },
+      bash_outputs=[
+          # Round 1: 75 clashes.
+          unit_pass, ifc_pass, sep_fail(75), conn_pass,
+          # Round 2: the fix made it worse (100 clashes) — the guard
+          # restores the snapshot and re-runs the gates (75 again).
+          unit_pass, ifc_pass, sep_fail(100), conn_pass,
+          unit_pass, ifc_pass, sep_fail(75), conn_pass,
+          # Round 3: still 75 clashes, rounds run out.
+          unit_pass, ifc_pass, sep_fail(75), conn_pass,
+      ],
+  )
+  real = serve.Agent
+  serve.Agent = FakeAgent
+  try:
+    result = await serve.solve(session)
+  finally:
+    serve.Agent = real
+  worker = FakeAgent.first("worker")
+  check("two fix rounds used", len(worker.resumes) == 2, worker.resumes)
+  check("regression note given to the worker",
+        "made the model worse" in worker.resumes[1], worker.resumes[1])
+  check("restored gaps given, not the worse ones",
+        "75 clashes" in worker.resumes[1]
+        and "100 clashes" not in worker.resumes[1], worker.resumes[1])
+  check("gate verdict appended",
+        "Deterministic gates:" in result, repr(result))
+  check("not marked verified",
+        "Independent verification: PASS." not in result, repr(result))
+
+
 def test_merge_gate_gaps():
   print("gate gap merging and clipping")
   check("empty merge", serve._merge_gate_gaps("", "", "") == "")
@@ -544,11 +731,13 @@ def test_merge_gate_gaps():
   long = "x" * 5000
   check("total capped near 4000",
         len(serve._merge_gate_gaps(long, long, long)) <= 4100)
-  verdict = serve._gate_verdict_lines("IFC FAIL: 3", "", "", True)
+  verdict = serve._gate_verdict_lines("", "IFC FAIL: 3", "", "", True)
   check("verdict names the failing gate",
         "IFC gate: FAIL" in verdict and "Separation gate: no failures reported"
         in verdict, verdict)
-  verdict = serve._gate_verdict_lines("", "", "", False)
+  check("unit gate reported first",
+        verdict.index("Unit gate:") < verdict.index("IFC gate:"), verdict)
+  verdict = serve._gate_verdict_lines("", "", "", "", False)
   check("non-routing gates not applicable",
         "not applicable" in verdict, verdict)
 
@@ -810,18 +999,21 @@ async def test_sep_gate():
       "SEP FAIL: 75 clashes (boxes overlapping > 2 mm on all axes)\nSEP_GATE: FAIL",
       "exit code 127\npython3: command not found",
   ])
-  check("skip, no files", await serve._separation_gate(worker) == "")
-  check("pass", await serve._separation_gate(worker) == "")
-  gaps = await serve._separation_gate(worker)
+  check("skip, no files", (await serve._separation_gate(worker))[0] == "")
+  check("pass", (await serve._separation_gate(worker))[0] == "")
+  gaps, scores = await serve._separation_gate(worker)
   check("clashes returned", "75 clashes" in gaps, gaps)
+  check("scores count clashes",
+        scores == {"clashes": 75, "frame_ok": True, "frame_outside": 0},
+        scores)
   check("tool error is inconclusive",
-        await serve._separation_gate(worker) == "")
+        (await serve._separation_gate(worker))[0] == "")
 
   session2 = FakeSession(21600)  # default instruction: not a routing task
   worker2 = FakeAgent(session2, role="worker")
   FakeAgent.reset(bash_outputs=["exit code 0\nSEP_GATE: FAIL"])
   check("non-routing task skips the gate",
-        await serve._separation_gate(worker2) == "")
+        (await serve._separation_gate(worker2))[0] == "")
   check("gate did not run a bash call",
         FakeAgent.bash_outputs == ["exit code 0\nSEP_GATE: FAIL"])
   check("gate script compiles",
@@ -888,6 +1080,25 @@ def test_sep_gate_real_ifc():
     check("run-7 upward drop caught", "does not hang from the header" in out, out)
     check("run-7 sprinkler clearance caught",
           "below the sprinklers" in out, out)
+    check("run-7 frame is inside the slab",
+          "SEP frame: 0 route segment(s) outside the slab footprint" in out,
+          out)
+    # The real run-9 model: the double-placement bug builds the route at
+    # 2x, so 34 segments stick out of the slab; the frame check must catch
+    # it, and the drop message must say the gap is vertical.
+    fixture = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "fixtures", "run9-model")
+    workdir = os.path.join(tmp, "run9")
+    shutil.copytree(fixture, workdir)
+    out = _run_sep_gate(workdir)
+    check("run-9 model reports 10 clashes", "SEP collisions: 10" in out, out)
+    check("run-9 frame caught",
+          "SEP frame: 34 route segment(s) outside the slab footprint" in out,
+          out)
+    check("run-9 frame failure named", "FRAME FAIL" in out, out)
+    check("run-9 drop gap is vertical",
+          "400 mm away to the above" in out, out)
 
 
 def test_sep_gate_z_band_and_drop():
@@ -943,6 +1154,9 @@ async def main():
   test_phase_time_left()
   await test_resume_clears_phase_deadline()
   await test_ifc_gate()
+  await test_unit_gate()
+  test_unit_gate_real_ifc()
+  test_regression_guard()
   await test_gate_blocks_pass_then_fix()
   test_prompts()
   await test_conn_gate()
@@ -955,6 +1169,7 @@ async def main():
   test_merge_gate_gaps()
   await test_gates_run_in_parallel_and_merge()
   await test_gate_verdict_appended_when_rounds_run_out()
+  await test_regression_guard_restores_worse_fix()
   print("ALL TESTS PASSED")
 
 

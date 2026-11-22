@@ -243,6 +243,19 @@ logger's error takes *args; placements use IfcLocalPlacement(PlacementRelTo=...,
 RelativePlacement=IfcAxis2Placement3D(...)); open files with ifcopenshell.open; look up schema declarations with \
 ifcopenshell.schema_by_name('IFC4').declaration(...). There is no IfcCableTraySegment in IFC4 — use \
 IfcCableCarrierSegment for trays/busways and IfcPipeSegment for pipes.
+- Units are mandatory: declare millimetres on the project, or the grader reads every coordinate 1000x too \
+large even though validation passes. Copy this block exactly; do not paraphrase it:
+  project = model.create_entity('IfcProject', GlobalId=ifcopenshell.guid.new(), Name='DataHallProject')
+  length_unit = model.create_entity('IfcSIUnit', UnitType='LENGTHUNIT', Prefix='MILLI', Name='METRE')
+  plane_angle_unit = model.create_entity('IfcSIUnit', UnitType='PLANEANGLEUNIT', Name='RADIAN')
+  unit_assignment = model.create_entity('IfcUnitAssignment', Units=[length_unit, plane_angle_unit])
+  project.UnitsInContext = unit_assignment
+- Placement rule: put the coordinates in exactly ONE place. Set the product's ObjectPlacement Location to \
+(x, y, z) and the solid's Position Location to (0, 0, 0) — or the reverse — never both to (x, y, z). IFC \
+composes the two placements, so setting both to the same (x, y, z) builds every box at twice its intended \
+coordinates. The profile is centred at the solid's local origin, so (x, y) is the box CENTRE, not its \
+corner; z is the extrusion base. A box built from create_box_extrusion(w, d, h, cx, cy, z) spans \
+cx-w/2..cx+w/2 in x, cy-d/2..cy+d/2 in y, z..z+h in z.
 """
 
 # Appended to the worker and verifier prompts when the task is a routing
@@ -1132,6 +1145,12 @@ class Agent:
       # what it streamed is the answer if the summary call fails too
       except CutOff:
         return await self.finish("Time is almost up.")
+      except openai.OpenAIError:
+        # A transient endpoint failure (429/503) after the agent already
+        # produced text is not fatal: the summary already produced is the
+        # deliverable. On run 9 a 503 after the summary existed propagated
+        # out of loop() and killed the whole task.
+        return self.session.final_message
       arguments = [parse_arguments(call) for call in reply.calls.values()]
       if reply.text or reply.calls:
         # A turn with neither (its output went to hidden reasoning, or a content
@@ -2134,31 +2153,151 @@ print("IFC_GATE: FAIL" if bad else
 IFC_GATE_COMMAND = "python3 - <<'PYEOF'\n" + IFC_GATE_SCRIPT + "\nPYEOF"
 
 
-async def _ifc_gate(worker: Agent) -> str:
+async def _ifc_gate(worker: Agent) -> tuple[str, dict]:
   """Runs the deterministic IFC gate and returns its failures as gaps.
 
   The gate runs in the task container through the worker's bash tool. It
-  returns "" when there is nothing to check, the check passes, or the check
-  could not run (missing ifcopenshell, no python, a tool error) — an
-  inconclusive gate must not block submission; the verifier still checks.
+  returns ("", scores) when there is nothing to check, the check passes, or
+  the check could not run (missing ifcopenshell, no python, a tool error) —
+  an inconclusive gate must not block submission; the verifier still checks.
 
   Args:
     worker: The worker Agent (its bash tool runs in the task container).
 
   Returns:
-    The gate's violation text when it fails, else "".
+    (gaps, scores): the gate's violation text when it fails, else "";
+    scores is {"ifc_ok": bool, "violations": int} when the gate measured
+    something, else {} (inconclusive).
   """
   try:
     out = await worker.bash(IFC_GATE_COMMAND)
   except Exception as exc:  # pylint: disable=broad-exception-caught
     await worker.session.log(f"IFC gate failed to run: {exc}")
-    return ""
+    return "", {}
   if "IFC_GATE: FAIL" not in out:
     await worker.session.log(
         "IFC gate: " + (out.strip().splitlines() or [""])[-1][:200]
     )
-    return ""
-  return clip(out, 4000)
+    return "", _ifc_gate_scores(out)
+  return clip(out, 4000), _ifc_gate_scores(out)
+
+
+def _ifc_gate_scores(out: str) -> dict:
+  """Parses the IFC gate's output into a score dict for the regression guard.
+
+  Returns {"ifc_ok": bool, "violations": int} when the gate measured
+  something, else {} (inconclusive — the guard must not compare unknowns).
+  """
+  if "IFC_GATE: SKIP" in out:
+    return {}
+  violations = 0
+  for line in out.splitlines():
+    if line.startswith("IFC ") and "EXPRESS violations" in line:
+      try:
+        violations += int(line.split(":")[1].split()[0])
+      except (IndexError, ValueError):
+        pass
+  if "IFC_GATE: PASS" in out:
+    return {"ifc_ok": True, "violations": violations}
+  if "IFC_GATE: FAIL" in out:
+    return {"ifc_ok": False, "violations": violations}
+  return {}
+
+
+# Deterministic unit gate: runs the grader's own unit-scale calculation on
+# every produced .ifc. A model without an IfcUnitAssignment defaults to
+# metres, so the grader reads every coordinate 1000x too large — and
+# validation passes either way, so no other gate can see this bug. A real
+# run scored 0 for exactly this reason (the grader's routed length was
+# 345,900,000 mm, exactly 1000x the 345,900 mm the gates read).
+UNIT_GATE_SCRIPT = """
+import glob, sys
+try:
+    import ifcopenshell
+    import ifcopenshell.util.unit
+except Exception as exc:
+    print(f"UNIT_GATE: SKIP (ifcopenshell unavailable: {exc})")
+    sys.exit(0)
+files = sorted(glob.glob("output/**/*.ifc", recursive=True))
+if not files:
+    print("UNIT_GATE: SKIP (no .ifc files under output/)")
+    sys.exit(0)
+bad = 0
+for f in files:
+    try:
+        model = ifcopenshell.open(f)
+        scale = ifcopenshell.util.unit.calculate_unit_scale(model) * 1000.0
+    except Exception as exc:
+        print(f"UNIT {f}: ERROR {exc}")
+        bad += 1
+        continue
+    has_mm = False
+    for ua in model.by_type('IfcUnitAssignment'):
+        for u in ua.Units or []:
+            if (u.is_a('IfcSIUnit') and u.UnitType == 'LENGTHUNIT'
+                    and u.Prefix == 'MILLI' and u.Name == 'METRE'):
+                has_mm = True
+    print(f"UNIT {f}: scale x{scale:.3f}, millimetre unit declared: {has_mm}")
+    if abs(scale - 1.0) > 0.001 or not has_mm:
+        print(f"UNIT FAIL: {f} reads {scale:.0f}x too large — the model has no millimetre unit declaration; the grader reads every coordinate {scale:.0f}x too large. Add the IfcSIUnit MILLI METRE + IfcUnitAssignment + project.UnitsInContext block from IFC_GUIDE.")
+        bad += 1
+print("UNIT_GATE: FAIL" if bad else
+      f"UNIT_GATE: PASS ({len(files)} file(s), scale x1.0, millimetre units)")
+"""
+UNIT_GATE_COMMAND = "python3 - <<'PYEOF'\n" + UNIT_GATE_SCRIPT + "\nPYEOF"
+
+
+async def _unit_gate(worker: Agent) -> tuple[str, dict]:
+  """Runs the deterministic unit gate and returns failures as gaps.
+
+  The gate runs in the task container through the worker's bash tool. It
+  returns ("", scores) when there is nothing to check, the check passes, or
+  the check could not run (missing ifcopenshell, no python, a tool error) —
+  an inconclusive gate must not block submission; the verifier still checks.
+
+  Args:
+    worker: The worker Agent (its bash tool runs in the task container).
+
+  Returns:
+    (gaps, scores): the gate's violation text when it fails, else "";
+    scores is {"unit_ok": bool, "scale": float} when the gate measured
+    something, else {} (inconclusive).
+  """
+  try:
+    out = await worker.bash(UNIT_GATE_COMMAND)
+  except Exception as exc:  # pylint: disable=broad-exception-caught
+    await worker.session.log(f"Unit gate failed to run: {exc}")
+    return "", {}
+  if "UNIT_GATE: FAIL" not in out:
+    await worker.session.log(
+        "Unit gate: " + (out.strip().splitlines() or [""])[-1][:200]
+    )
+    return "", _unit_gate_scores(out)
+  return clip(out, 4000), _unit_gate_scores(out)
+
+
+def _unit_gate_scores(out: str) -> dict:
+  """Parses the unit gate's output into a score dict for the regression guard.
+
+  Returns {"unit_ok": bool, "scale": float} when the gate measured
+  something, else {} (inconclusive — the guard must not compare unknowns).
+  """
+  if "UNIT_GATE: SKIP" in out:
+    return {}
+  scale = None
+  for line in out.splitlines():
+    if line.startswith("UNIT ") and "scale x" in line:
+      try:
+        scale = float(line.split("scale x")[1].split(",")[0])
+      except (IndexError, ValueError):
+        pass
+  if scale is None:
+    return {}
+  if "UNIT_GATE: PASS" in out:
+    return {"unit_ok": True, "scale": scale}
+  if "UNIT_GATE: FAIL" in out:
+    return {"unit_ok": False, "scale": scale}
+  return {}
 
 
 # Deterministic connectivity gate: measures the route geometry of every
@@ -2372,6 +2511,46 @@ def _components(boxes, tol):
     return len({find(i) for i in range(len(boxes))})
 
 
+def _closest_break(boxes, tol):
+    '''The smallest gap between two boxes in different components.
+
+    Returns (distance, i, j, point_a, point_b): the indices of the two
+    nearest unconnected boxes and the closest points on their surfaces
+    (each box's centre clamped onto the other box's bounds). Returns None
+    when the boxes form one component. Naming the break lets the fix
+    round see where the network is broken instead of only knowing that
+    it is broken.
+    '''
+    n = len(boxes)
+    parent = list(range(n))
+
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    for i in range(n):
+        for j in range(i + 1, n):
+            if _aabb_dist(boxes[i][0], boxes[i][1], boxes[j][0], boxes[j][1]) <= tol:
+                parent[find(i)] = find(j)
+    best = None
+    for i in range(n):
+        for j in range(i + 1, n):
+            if find(i) == find(j):
+                continue
+            d = _aabb_dist(boxes[i][0], boxes[i][1], boxes[j][0], boxes[j][1])
+            if best is None or d < best[0]:
+                a_min, a_max = boxes[i]
+                b_min, b_max = boxes[j]
+                ca = tuple((a_min[k] + a_max[k]) / 2 for k in range(3))
+                cb = tuple((b_min[k] + b_max[k]) / 2 for k in range(3))
+                pa = tuple(max(a_min[k], min(cb[k], a_max[k])) for k in range(3))
+                pb = tuple(max(b_min[k], min(ca[k], b_max[k])) for k in range(3))
+                best = (d, i, j, pa, pb)
+    return best
+
+
 def _classify(product):
     text = ((product.Name or '') + ' ' + (product.ObjectType or '')).lower()
     if 'busway' in text:
@@ -2396,6 +2575,7 @@ def main():
         return
     segs = {'tray': [], 'busway': [], 'chw': []}
     boxes = {'tray': [], 'busway': [], 'chw': []}
+    names = {'tray': [], 'busway': [], 'chw': []}
     wrong = []
     unclassified = 0
     for product in model.by_type('IfcFlowSegment'):
@@ -2414,6 +2594,7 @@ def main():
         d, half = max(axes, key=lambda a: a[1])
         segs[svc].append((_sub(centre, _scale(d, half)), _add(centre, _scale(d, half))))
         boxes[svc].append(_aabb(centre, axes))
+        names[svc].append(product.Name or product.is_a())
     for product in model.by_type('IfcElectricDistributionBoard'):
         # Only a board that claims to be a route segment is a wrong class;
         # a legitimate PDU (no tray/busway name) is not a route element.
@@ -2441,6 +2622,11 @@ def main():
             print(f"CONN {svc}: {c} connected component(s)")
             if c > 1:
                 problems.append(f"{svc}: {c} disconnected components (segments must join within {JOIN_TOL:.0f} mm)")
+                brk = _closest_break(boxes[svc], JOIN_TOL)
+                if brk:
+                    d, i, j, pa, pb = brk
+                    problems.append(
+                        f"{svc} break: nearest unconnected segments are {d:.0f} mm apart — {names[svc][i]} ends near ({pa[0]:.0f},{pa[1]:.0f},{pa[2]:.0f}), {names[svc][j]} starts near ({pb[0]:.0f},{pb[1]:.0f},{pb[2]:.0f}); bridge that gap")
     try:
         routing = json.load(open('output/routing.json'))
     except Exception as exc:
@@ -2494,6 +2680,7 @@ except Exception as exc:
 CLASH_TOL = 2.0
 SPRINKLER_CLEAR = 460.0
 MIN_CLEAR_HEIGHT = 2600.0
+FRAME_TOL = 500.0
 
 
 def _v(p):
@@ -2772,12 +2959,24 @@ def main():
                 closest = _closest_point(top, e1, e2)
                 dx = closest[0] - top[0]
                 dy = closest[1] - top[1]
-                if abs(dx) >= abs(dy):
-                    direction = 'east' if dx > 0 else 'west'
+                dz = closest[2] - top[2]
+                if abs(dz) >= max(abs(dx), abs(dy)):
+                    # The gap is vertical: the closest point is directly
+                    # above/below the drop's top, so the fix is to extend
+                    # the drop up (or rebuild it going down), not to move it
+                    # sideways.
+                    if dz > 0:
+                        gap = f"{nearest:.0f} mm away to the above (drop top z={top[2]:.0f}, nearest segment z={closest[2]:.0f}) — extend the drop {nearest:.0f} mm up to the header"
+                    else:
+                        gap = f"{nearest:.0f} mm away to the below (drop top z={top[2]:.0f}, nearest segment z={closest[2]:.0f}) — the drop goes up instead of down; rebuild it hanging from the header at z={closest[2]:.0f} down to the CRAH top"
                 else:
-                    direction = 'north' if dy > 0 else 'south'
+                    if abs(dx) >= abs(dy):
+                        direction = 'east' if dx > 0 else 'west'
+                    else:
+                        direction = 'north' if dy > 0 else 'south'
+                    gap = f"{nearest:.0f} mm away to the {direction} — build a horizontal branch from that segment to ({top[0]:.0f},{top[1]:.0f}) at the header height, then drop down"
                 problems.append(
-                    f"{svc} vertical segment {product.Name or product.is_a()} at ({top[0]:.0f},{top[1]:.0f}) does not hang from the header: nearest horizontal segment is {nearest_name}, its closest point is ({closest[0]:.0f},{closest[1]:.0f}), {nearest:.0f} mm away to the {direction} — build a horizontal branch from that segment to ({top[0]:.0f},{top[1]:.0f}) at the header height, then drop down")
+                    f"{svc} vertical segment {product.Name or product.is_a()} at ({top[0]:.0f},{top[1]:.0f}) does not hang from the header: nearest horizontal segment is {nearest_name}, its closest point is ({closest[0]:.0f},{closest[1]:.0f},{closest[2]:.0f}), {gap}")
             else:
                 problems.append(
                     f"{svc} vertical segment {product.Name or product.is_a()} does not hang from the header: no horizontal {svc} segment exists — build a header first, then a branch to the drop")
@@ -2805,6 +3004,36 @@ def main():
             problems.append(
                 f"{svc} segment {product.Name or product.is_a()} bottom is at {a_min[2]:.0f} mm, below the {MIN_CLEAR_HEIGHT:.0f} mm clear height")
             break
+    # 7. Frame: every route segment must lie inside the building slab's
+    # plan footprint. This catches the double-placement bug — a model built
+    # with coordinates in both the product placement and the solid position
+    # lands at twice its intended coordinates, so the route sticks out of
+    # the hall on every side while every self-consistent check still passes.
+    # The slab is the anchor because it is a single box: if it is doubled
+    # it only shifts, it does not stretch, so a route built at 2x spills
+    # far beyond it. Skipped when the model has no slab.
+    slabs = [it for it in items if it[0].is_a('IfcSlab')]
+    if slabs:
+        sx0 = min(it[4][0] for it in slabs)
+        sy0 = min(it[4][1] for it in slabs)
+        sx1 = max(it[5][0] for it in slabs)
+        sy1 = max(it[5][1] for it in slabs)
+        outside = 0
+        worst = None
+        for product, svc, centre, axes, a_min, a_max in items:
+            if svc not in ('tray', 'busway', 'chw'):
+                continue
+            if (a_min[0] < sx0 - FRAME_TOL or a_max[0] > sx1 + FRAME_TOL
+                    or a_min[1] < sy0 - FRAME_TOL
+                    or a_max[1] > sy1 + FRAME_TOL):
+                outside += 1
+                if worst is None:
+                    worst = (svc, product.Name or product.is_a(), a_min, a_max)
+        print(f"SEP frame: {outside} route segment(s) outside the slab footprint")
+        if outside:
+            wsvc, wname, wmn, wmx = worst
+            problems.append(
+                f"FRAME FAIL: {outside} route segment(s) lie outside the building slab (slab plan x {sx0:.0f}..{sx1:.0f}, y {sy0:.0f}..{sy1:.0f}); e.g. {wsvc} {wname} spans x {wmn[0]:.0f}..{wmx[0]:.0f}, y {wmn[1]:.0f}..{wmx[1]:.0f} — the model is built at the wrong scale or offset (a box whose coordinates are set in both the product placement and the solid position lands at twice its intended place; set them in exactly one place)")
     if problems:
         for p in problems:
             print('SEP FAIL: ' + p)
@@ -2818,7 +3047,7 @@ main()
 SEP_GATE_COMMAND = "python3 - <<'PYEOF'\n" + SEP_GATE_SCRIPT + "\nPYEOF"
 
 
-async def _separation_gate(worker: Agent) -> str:
+async def _separation_gate(worker: Agent) -> tuple[str, dict]:
   """Runs the deterministic separation/clash gate and returns failures as gaps.
 
   The gate runs in the task container through the worker's bash tool, on
@@ -2828,69 +3057,140 @@ async def _separation_gate(worker: Agent) -> str:
   joints, same-service pairs or background objects), profile orientation
   (a horizontal segment's vertical extent must be its profile height, not
   its width), drops that go up instead of down, sprinkler clearance
-  (460 mm) and the 2600 mm clear height. It returns "" when the task is
-  not a routing task, there is nothing to check, the check passes, or the
-  check could not run — an inconclusive gate must not block submission.
+  (460 mm), the 2600 mm clear height, and the frame check (route segments
+  must lie inside the building slab's footprint). It returns ("", scores)
+  when the task is not a routing task, there is nothing to check, the check
+  passes, or the check could not run — an inconclusive gate must not block
+  submission.
 
   Args:
     worker: The worker Agent (its bash tool runs in the task container).
 
   Returns:
-    The gate's failure text when it fails, else "".
+    (gaps, scores): the gate's failure text when it fails, else "";
+    scores is {"clashes": int, "frame_ok": bool, "frame_outside": int}
+    when the gate measured something, else {} (inconclusive).
   """
   instr = worker.session.instruction.lower()
   if not any(k in instr for k in ROUTING_KEYWORDS):
-    return ""
+    return "", {}
   try:
     out = await worker.bash(SEP_GATE_COMMAND)
   except Exception as exc:  # pylint: disable=broad-exception-caught
     await worker.session.log(f"Separation gate failed to run: {exc}")
-    return ""
+    return "", {}
   if "SEP_GATE: FAIL" not in out:
     await worker.session.log(
         "Separation gate: " + (out.strip().splitlines() or [""])[-1][:200]
     )
-    return ""
-  return clip(out, 4000)
+    return "", _separation_gate_scores(out)
+  return clip(out, 4000), _separation_gate_scores(out)
 
 
-async def _connectivity_gate(worker: Agent) -> str:
+def _separation_gate_scores(out: str) -> dict:
+  """Parses the separation gate's output into a score dict for the regression guard.
+
+  Returns {"clashes": int, "frame_ok": bool, "frame_outside": int} when the
+  gate measured something, else {} (inconclusive — the guard must not
+  compare unknowns).
+  """
+  if "SEP_GATE: SKIP" in out:
+    return {}
+  clashes = None
+  frame_outside = 0
+  for line in out.splitlines():
+    if line.startswith("SEP collisions:"):
+      try:
+        clashes = int(line.split(":")[1].strip())
+      except (IndexError, ValueError):
+        pass
+    if line.startswith("SEP frame:"):
+      try:
+        frame_outside = int(line.split(":")[1].split()[0])
+      except (IndexError, ValueError):
+        pass
+  if clashes is None:
+    return {}
+  return {
+      "clashes": clashes,
+      "frame_ok": "FRAME FAIL" not in out,
+      "frame_outside": frame_outside,
+  }
+
+
+async def _connectivity_gate(worker: Agent) -> tuple[str, dict]:
   """Runs the deterministic connectivity gate and returns failures as gaps.
 
   The gate runs in the task container through the worker's bash tool, on
-  routing tasks only (see ROUTING_KEYWORDS). It returns "" when the task is
-  not a routing task, there is nothing to check, the check passes, or the
-  check could not run — an inconclusive gate must not block submission.
+  routing tasks only (see ROUTING_KEYWORDS). It returns ("", scores) when
+  the task is not a routing task, there is nothing to check, the check
+  passes, or the check could not run — an inconclusive gate must not block
+  submission.
 
   Args:
     worker: The worker Agent (its bash tool runs in the task container).
 
   Returns:
-    The gate's failure text when it fails, else "".
+    (gaps, scores): the gate's failure text when it fails, else "";
+    scores is {"components": {service: count}, "rows_below_80": int}
+    when the gate measured something, else {} (inconclusive).
   """
   instr = worker.session.instruction.lower()
   if not any(k in instr for k in ROUTING_KEYWORDS):
-    return ""
+    return "", {}
   try:
     out = await worker.bash(CONN_GATE_COMMAND)
   except Exception as exc:  # pylint: disable=broad-exception-caught
     await worker.session.log(f"Connectivity gate failed to run: {exc}")
-    return ""
+    return "", {}
   if "CONN_GATE: FAIL" not in out:
     await worker.session.log(
         "Connectivity gate: " + (out.strip().splitlines() or [""])[-1][:200]
     )
-    return ""
-  return clip(out, 4000)
+    return "", _connectivity_gate_scores(out)
+  return clip(out, 4000), _connectivity_gate_scores(out)
+
+
+def _connectivity_gate_scores(out: str) -> dict:
+  """Parses the connectivity gate's output into a score dict for the regression guard.
+
+  Returns {"components": {service: count}, "rows_below_80": int} when the
+  gate measured something, else {} (inconclusive — the guard must not
+  compare unknowns).
+  """
+  if "CONN_GATE: SKIP" in out:
+    return {}
+  components = {}
+  rows_below_80 = 0
+  for line in out.splitlines():
+    if line.startswith("CONN ") and "connected component(s)" in line:
+      try:
+        svc = line.split()[1]
+        components[svc] = int(line.split(":")[1].split()[0])
+      except (IndexError, ValueError):
+        pass
+    if line.startswith("CONN row ") and "coverage" in line:
+      try:
+        pct = float(line.split("coverage")[1].strip().rstrip("%"))
+        if pct < 80.0:
+          rows_below_80 += 1
+      except (IndexError, ValueError):
+        pass
+  # A PASS/FAIL verdict means the gate ran and measured; the component
+  # lines are only printed when a service has more than one segment, so
+  # an empty components map is a real measurement, not an unknown.
+  if "CONN_GATE: PASS" not in out and "CONN_GATE: FAIL" not in out:
+    return {}
+  return {"components": components, "rows_below_80": rows_below_80}
 
 
 def _merge_gate_gaps(*gap_texts: str) -> str:
   """Merges gate failure texts into one fix-round prompt.
 
   Each gate is clipped to ~1500 chars and the total to 4000, so one verbose
-  gate cannot crowd out the others. The order is the priority order: IFC,
-  then separation, then connectivity (then the verifier's own gaps, when
-  the caller merges those in too).
+  gate cannot crowd out the others. The caller passes them in priority
+  order: unit, IFC, separation, connectivity (then the verifier's own
+  gaps, when the caller merges those in too).
 
   Args:
     gap_texts: Failure texts from the gates ("" when a gate passed).
@@ -2905,7 +3205,7 @@ def _merge_gate_gaps(*gap_texts: str) -> str:
 
 
 def _gate_verdict_lines(
-    ifc_gaps: str, sep_gaps: str, conn_gaps: str, is_routing: bool
+    unit_gaps: str, ifc_gaps: str, sep_gaps: str, conn_gaps: str, is_routing: bool
 ) -> str:
   """One summary line per gate, for the verifier's context and the final summary.
 
@@ -2914,6 +3214,7 @@ def _gate_verdict_lines(
   is reported as "no failures reported", never as a pass.
 
   Args:
+    unit_gaps: Unit gate failure text, "" when clean.
     ifc_gaps: IFC gate failure text, "" when clean.
     sep_gaps: Separation gate failure text, "" when clean.
     conn_gaps: Connectivity gate failure text, "" when clean.
@@ -2921,10 +3222,11 @@ def _gate_verdict_lines(
       connectivity gates only run on those).
 
   Returns:
-    Three lines, one per gate.
+    Four lines, one per gate.
   """
   lines = []
   for name, gaps, applicable in (
+      ("Unit", unit_gaps, True),
       ("IFC", ifc_gaps, True),
       ("Separation", sep_gaps, is_routing),
       ("Connectivity", conn_gaps, is_routing),
@@ -2944,6 +3246,72 @@ def _gate_verdict_lines(
     else:
       lines.append(f"{name} gate: no failures reported")
   return "\n".join(lines)
+
+
+def _gate_score_vector(unit: dict, ifc: dict, sep: dict, conn: dict) -> dict | None:
+  """Builds the regression-guard score vector from the gates' score dicts.
+
+  Returns None when any gate was inconclusive (an unknown score must not
+  be compared). The vector is a dict so a new dimension can be added
+  without changing every caller.
+  """
+  if not unit or not ifc or not sep or not conn:
+    return None
+  components = conn.get("components") or {}
+  return {
+      "unit_ok": unit.get("unit_ok", False),
+      "ifc_ok": ifc.get("ifc_ok", False),
+      "frame_ok": sep.get("frame_ok", True),
+      "clashes": sep.get("clashes", 0),
+      "max_components": max(components.values()) if components else 0,
+      "rows_below_80": conn.get("rows_below_80", 0),
+  }
+
+
+def _is_regression(prev: dict, cur: dict) -> bool:
+  """Whether the current gate scores are worse than the previous round's.
+
+  A fix round is a regression when it flips a fatal check to FAIL (units,
+  IFC, frame), raises the clash count, or disconnects the network further
+  without cutting clashes. A clash increase with a component improvement
+  is not a regression — the fix traded a clash for connectivity — but a
+  clash increase alone always is.
+  """
+  if cur["unit_ok"] is False and prev["unit_ok"] is True:
+    return True
+  if cur["ifc_ok"] is False and prev["ifc_ok"] is True:
+    return True
+  if cur["frame_ok"] is False and prev["frame_ok"] is True:
+    return True
+  if cur["clashes"] > prev["clashes"]:
+    return True
+  if (cur["max_components"] > prev["max_components"]
+          and cur["clashes"] >= prev["clashes"]):
+    return True
+  if (cur["rows_below_80"] > prev["rows_below_80"]
+          and cur["clashes"] >= prev["clashes"]):
+    return True
+  return False
+
+
+async def _run_all_gates(
+    worker: Agent, is_routing: bool
+) -> tuple[str, str, dict | None]:
+  """Runs all four deterministic gates in parallel.
+
+  Returns (merged_gaps, verdict_lines, score_vector): the merged failure
+  text, one summary line per gate, and the score vector for the regression
+  guard (None when any gate was inconclusive).
+  """
+  (unit_gaps, unit_scores), (ifc_gaps, ifc_scores), (
+      sep_gaps, sep_scores), (conn_gaps, conn_scores) = await asyncio.gather(
+          _unit_gate(worker), _ifc_gate(worker), _separation_gate(worker),
+          _connectivity_gate(worker))
+  gaps = _merge_gate_gaps(unit_gaps, ifc_gaps, sep_gaps, conn_gaps)
+  verdict = _gate_verdict_lines(
+      unit_gaps, ifc_gaps, sep_gaps, conn_gaps, is_routing)
+  scores = _gate_score_vector(unit_scores, ifc_scores, sep_scores, conn_scores)
+  return gaps, verdict, scores
 
 
 async def solve(session: taskbridge.Session) -> str:
@@ -2989,67 +3357,127 @@ async def solve(session: taskbridge.Session) -> str:
   )
   last_gate_gaps = ""
   last_gate_verdict = ""
-  for round_no in range(MAX_FIX_ROUNDS + 1):
-    left = session.time_left()
-    if left is not None and left < MIN_VERIFY_SEC:
-      break
-    await session.log(f"verify phase: round {round_no + 1}")
-    # Run all three deterministic gates in parallel FIRST, every round,
-    # whether or not the verifier passes: the verifier judges with their
-    # numbers in hand instead of judging blind. A gate that never runs
-    # cannot teach the agent — on run 8 the connectivity gate ran 0 times
-    # because the separation gate kept failing and the old chain
-    # short-circuited, so the entry was never checked.
-    ifc_gaps, sep_gaps, conn_gaps = await asyncio.gather(
-        _ifc_gate(worker), _separation_gate(worker), _connectivity_gate(worker)
-    )
-    last_gate_gaps = _merge_gate_gaps(ifc_gaps, sep_gaps, conn_gaps)
-    last_gate_verdict = _gate_verdict_lines(
-        ifc_gaps, sep_gaps, conn_gaps, is_routing
-    )
-    reply = await _run_phase(
-        session,
-        "verify",
-        Agent(
-            session,
-            role="verifier",
-            plan=plan,
-            context=summary
-            + "\n\nDeterministic gate results (quote these numbers):\n"
-            + last_gate_verdict,
-        ),
-    )
-    session.final_message = summary  # the verifier's text is not the summary
-    passed, gaps = _verdict(reply)
-    if last_gate_gaps:
-      # The gates' gaps join the verifier's (or replace them when the
-      # verifier passed): a gate failure is a fix round, like any other.
-      gaps = _merge_gate_gaps(gaps, last_gate_gaps) if gaps else last_gate_gaps
-      passed = False
-    if passed:
-      verified = True
-      break
-    if not gaps or round_no >= MAX_FIX_ROUNDS:
-      break
-    left = session.time_left()
-    if left is not None and left < MIN_VERIFY_SEC:
-      break
-    await session.log(f"fix round {round_no + 1}: {len(gaps)} chars of gaps")
-    summary = await worker.resume(
-        "An independent check of your deliverables found these gaps. Fix each"
-        " one, then answer with your updated summary. Your new summary must"
-        " quote the gate numbers below (clash count, separation, entry"
-        " distance, coverage) verbatim and must not claim anything the gates"
-        f" deny:\n{gaps}"
-    )
-    if not summary:
+  prev_scores = None  # score vector from the round before the last fix
+  snapshot_exists = False  # whether /tmp/prev_output holds the pre-fix model
+  needs_final_gate_pass = False  # the last action was a fix round
+  try:
+    for round_no in range(MAX_FIX_ROUNDS + 1):
+      left = session.time_left()
+      if left is not None and left < MIN_VERIFY_SEC:
+        break
+      await session.log(f"verify phase: round {round_no + 1}")
+      # Run all four deterministic gates in parallel FIRST, every round,
+      # whether or not the verifier passes: the verifier judges with their
+      # numbers in hand instead of judging blind. A gate that never runs
+      # cannot teach the agent — on run 8 the connectivity gate ran 0 times
+      # because the separation gate kept failing and the old chain
+      # short-circuited, so the entry was never checked.
+      last_gate_gaps, last_gate_verdict, scores = await _run_all_gates(
+          worker, is_routing)
+      # Regression guard: the fix round just run made the model worse.
+      # Restore the snapshot (the pre-fix model) and re-measure it, so the
+      # submitted model is the best measured, not the last written.
+      regression_note = ""
+      if (scores is not None and prev_scores is not None
+              and snapshot_exists and _is_regression(prev_scores, scores)):
+        await session.log(
+            "fix round made the model worse; restoring the previous model")
+        await worker.bash("rm -rf output && cp -r /tmp/prev_output output")
+        last_gate_gaps, last_gate_verdict, scores = await _run_all_gates(
+            worker, is_routing)
+        prev_scores = scores
+        regression_note = (
+            "Your last fix made the model worse and the previous model has"
+            " been restored. Do not rebuild the same way; change the"
+            " construction, not the layout.\n")
+      needs_final_gate_pass = False  # the gates just measured the current model
+      # The verdict survives even if a later model call raises: attach it
+      # to session.final_message (the deliverable) now, not only to the
+      # return value at the end of solve(). On run 9 solve() raised a 503
+      # after the summary existed and the appendix died with the exception.
+      if last_gate_gaps:
+        session.final_message = (
+            summary + "\n\nDeterministic gates:\n" + last_gate_verdict)
+      reply = await _run_phase(
+          session,
+          "verify",
+          Agent(
+              session,
+              role="verifier",
+              plan=plan,
+              context=summary
+              + "\n\nDeterministic gate results (quote these numbers):\n"
+              + last_gate_verdict,
+          ),
+      )
+      session.final_message = summary  # the verifier's text is not the summary
+      if last_gate_gaps:
+        session.final_message = (
+            summary + "\n\nDeterministic gates:\n" + last_gate_verdict)
+      passed, gaps = _verdict(reply)
+      if last_gate_gaps:
+        # The gates' gaps join the verifier's (or replace them when the
+        # verifier passed): a gate failure is a fix round, like any other.
+        gaps = _merge_gate_gaps(gaps, last_gate_gaps) if gaps else last_gate_gaps
+        passed = False
+      if passed:
+        verified = True
+        break
+      if not gaps or round_no >= MAX_FIX_ROUNDS:
+        break
+      left = session.time_left()
+      if left is not None and left < MIN_VERIFY_SEC:
+        break
+      await session.log(f"fix round {round_no + 1}: {len(gaps)} chars of gaps")
+      # Snapshot the current (best-measured) model before the fix, so a
+      # fix that makes things worse can be rolled back.
+      snap_out = await worker.bash(
+          "if [ -d output ]; then rm -rf /tmp/prev_output"
+          " && cp -r output /tmp/prev_output && echo SNAPSHOT_OK;"
+          " else echo SNAPSHOT_NONE; fi")
+      snapshot_exists = "SNAPSHOT_OK" in snap_out
+      prev_scores = scores
+      needs_final_gate_pass = True
+      summary = await worker.resume(
+          regression_note
+          + "An independent check of your deliverables found these gaps. Fix each"
+          " one, then answer with your updated summary. Your new summary must"
+          " quote the gate numbers below (clash count, separation, entry"
+          " distance, coverage) verbatim and must not claim anything the gates"
+          f" deny:\n{gaps}"
+      )
+      if not summary:
+        summary = session.final_message
+  except openai.OpenAIError as exc:
+    # A transient endpoint failure after the summary exists is not fatal:
+    # the summary (plus the last gate verdict, attached to
+    # session.final_message each round) is the deliverable.
+    await session.log(f"verify phase interrupted by endpoint error: {exc}")
+    if session.final_message:
       summary = session.final_message
+  # After the last fix round there is no round left to measure the final
+  # model, so run the gates once more (no verifier) — the submitted
+  # summary must carry the final model's verdict, not the previous round's.
+  # On run 9 the final model was never gate-checked at all.
+  if needs_final_gate_pass:
+    left = session.time_left()
+    if left is None or left >= MIN_VERIFY_SEC:
+      await session.log("final gate pass on the submitted model")
+      last_gate_gaps, last_gate_verdict, scores = await _run_all_gates(
+          worker, is_routing)
+      if (scores is not None and prev_scores is not None
+              and snapshot_exists and _is_regression(prev_scores, scores)):
+        await session.log(
+            "final model is worse than the previous one; restoring it")
+        await worker.bash("rm -rf output && cp -r /tmp/prev_output output")
+        last_gate_gaps, last_gate_verdict, scores = await _run_all_gates(
+            worker, is_routing)
   if verified:
     summary += "\n\nIndependent verification: PASS."
   # Append the last round's gate verdict so the submitted summary always
   # carries the deterministic checks' conclusion, even when the fix
   # rounds ran out and the final model still fails a gate.
-  if last_gate_gaps:
+  if last_gate_gaps and "Deterministic gates:" not in summary:
     summary += "\n\nDeterministic gates:\n" + last_gate_verdict
   return summary
 
