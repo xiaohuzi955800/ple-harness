@@ -73,7 +73,7 @@ jobs:
           cd kit
           "$HOME/.local/bin/uv" run python eval/run.py ../ \
             --tasks '${{ inputs.task }}' \
-            --env-file "$RUNNER_TEMP/local.env" --trials 1 --out runs/smoke
+            --env-file "$RUNNER_TEMP/local.env" --trials 1 --out "$RUNNER_TEMP/runs/smoke"
 
       - name: Restore submission.yaml
         if: always()
@@ -85,6 +85,6 @@ jobs:
         with:
           name: smoke-${{ inputs.task }}
           path: |
-            kit/runs/smoke
+            ${{ runner.temp }}/runs/smoke
             artifacts/
           retention-days: 30
