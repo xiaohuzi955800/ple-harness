@@ -29,6 +29,13 @@ class FakeSession:
     self.final_message = ""
     self._seconds = seconds
     self.logs = []
+    # In-memory files for read_file/write_file. output/solution.py is a
+    # real (non-stub) submission by default, so the empty-submission
+    # guard stays quiet in tests that are not about it; the guard test
+    # replaces it with the stub.
+    self.files = {
+        "output/solution.py": b"# the agent's solution\nprint('real')\n",
+    }
 
   def time_left(self):
     return self._seconds
@@ -38,6 +45,27 @@ class FakeSession:
 
   async def usage(self, *args, **kwargs):
     pass
+
+  async def read_file(self, path):
+    if path in self.files:
+      data = self.files[path]
+      return data if isinstance(data, bytes) else data.encode()
+    raise FileNotFoundError(path)
+
+  async def write_file(self, path, data, append=False):
+    data = data if isinstance(data, bytes) else data.encode()
+    if append and path in self.files:
+      self.files[path] = self.files[path] + data
+    else:
+      self.files[path] = data
+    return len(self.files[path])
+
+  async def exec(self, command, timeout_sec=120):
+    # Every command "succeeds": draw_tools.py "runs" (exit 0) but writes
+    # no ground_truth.json, so _run_draw_tools returns None unless a test
+    # pre-seeds files["ground_truth.json"].
+    return {"exit_code": 0, "output": "", "truncated": False,
+            "timed_out": False}
 
 
 class FakeAgent:
@@ -55,12 +83,14 @@ class FakeAgent:
       plan="",
       context="",
       phase_seconds=None,
+      max_tool_calls=None,
   ):
     self.session = session
     self.role = role
     self.plan = plan
     self.context = context
     self.phase_seconds = phase_seconds
+    self.max_tool_calls = max_tool_calls
     self.resumes = []
     FakeAgent.instances.append(self)
 
@@ -126,8 +156,11 @@ async def test_long_task_pass_first_try():
     serve.Agent = real
   check("phases", FakeAgent.roles() == ["planner", "worker", "verifier"],
         FakeAgent.roles())
-  check("planner budget", FakeAgent.first("planner").phase_seconds == 2160,
+  check("planner budget", FakeAgent.first("planner").phase_seconds == 600,
         FakeAgent.first("planner").phase_seconds)
+  check("planner tool-call cap",
+        FakeAgent.first("planner").max_tool_calls == 10,
+        FakeAgent.first("planner").max_tool_calls)
   check("worker budget", FakeAgent.first("worker").phase_seconds == 16200,
         FakeAgent.first("worker").phase_seconds)
   check("worker got plan", FakeAgent.first("worker").plan == "the plan")
@@ -751,9 +784,16 @@ def test_routing_prompts():
   check("routing guide present", "one header per row" in prompt)
   check("busway class rule", "never IfcElectricDistributionBoard" in prompt)
   check("routing.json contract", "output/routing.json" in prompt)
-  check("PNG reader present", "def read_png" in prompt)
+  check("ground truth prompt",
+        "Drawing dimensions are in ground_truth.json" in prompt)
+  check("no PNG decoding by the agent",
+        "do not decode the PNGs yourself" in prompt)
+  check("PNG reader deleted", "def read_png" not in prompt)
+  check("west-strip trunk rule", "west strip" in prompt)
+  check("band arithmetic in the tier rule",
+        "742 mm" in prompt and "515 mm" in prompt)
   check("butt-joint rule", "butt joints" in prompt)
-  check("profile orientation rule", "150 mm" in prompt)
+  check("profile orientation rule", "127 mm" in prompt)
   check("drops go down", "goes down to the CRAH top" in prompt)
   check("tier rule", "separate tiers" in prompt)
   verifier = serve.Agent(session, role="verifier")
@@ -772,8 +812,8 @@ def test_routing_prompts():
   worker2 = serve.Agent(session2, role="worker")
   check("no routing guide without routing",
         "one header per row" not in worker2.system_prompt(""))
-  check("no PNG reader without routing",
-        "def read_png" not in worker2.system_prompt(""))
+  check("no ground truth prompt without routing",
+        "ground_truth.json" not in worker2.system_prompt(""))
 
 
 def _build_test_ifc(path, segments):
@@ -1079,7 +1119,7 @@ def test_sep_gate_real_ifc():
           "profile is oriented wrong" in out, out)
     check("run-7 upward drop caught", "does not hang from the header" in out, out)
     check("run-7 sprinkler clearance caught",
-          "below the sprinklers" in out, out)
+          "below the sprinkler deflector plane" in out, out)
     check("run-7 frame is inside the slab",
           "SEP frame: 0 route segment(s) outside the slab footprint" in out,
           out)
@@ -1142,6 +1182,405 @@ def test_sep_gate_z_band_and_drop():
     check("direction given", "to the south" in out, out)
 
 
+def _synthetic_ground_truth():
+  """A small ground truth (2 rows) for the gate and guard tests."""
+  return {
+      "valid": True,
+      "hall": {"width_mm": 27000, "height_mm": 21000,
+               "tiles_x": 45, "tiles_y": 35},
+      "rows": [
+          {"name": "A", "y_centre": 3000, "y_band": [2400, 3600],
+           "x_start": 1800, "x_end": 19200},
+          {"name": "B", "y_centre": 6000, "y_band": [5400, 6600],
+           "x_start": 1800, "x_end": 19800},
+      ],
+      "crahs": [
+          {"x": 4500, "y": 3000, "tag": "CRAH-A01", "type": "in-row",
+           "dn": 50},
+          {"x": 9500, "y": 6000, "tag": "CRAH-B01", "type": "in-row",
+           "dn": 50},
+      ],
+      "entry_drawn": {"xy": [27, 9889], "tile": "A17"},
+      "entry_grader": {"xy": [200, 3360],
+                       "source": "prior grader output"},
+      "entry_discrepancy_mm": 6532,
+      "columns": [],
+      "pdus": [],
+      "sprinklers": {"ceiling": [], "in_aisle": []},
+      "scale_mm_per_px": 38.04,
+      "profiles": {"tray": {"width": 683, "height": 127},
+                   "busway": {"width": 128, "height": 147},
+                   "chw": {"od": 114.3, "od_insulated": 168.3}},
+      "band": {"overhead": [2600, 3115], "underfloor": [-865, 0],
+               "underfloor_top_clearance": 20,
+               "datums": {"soffit": 3600, "deflector": 3574.6,
+                          "clear_height": 2600}},
+      "rules": {"tray_busway_separation": 300,
+                "pdu_dedicated_space": 1800,
+                "sprinkler_standoff": 460},
+      "extraction_method": {},
+      "errors": [],
+  }
+
+
+def test_draw_tools_geometry():
+  print("draw_tools geometry extraction on the real drawings")
+  try:
+    import numpy  # noqa: F401
+  except ImportError:
+    print("  skipped: numpy not installed")
+    return
+  import draw_tools
+  harness_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+  input_dir = os.path.join(
+      harness_dir, "..", "tasks", "data-hall-mep-routing", "environment",
+      "filesystem", "dc_model__hall_seed000_d000__mep_routing", "input")
+  if not os.path.isdir(input_dir):
+    print("  skipped: smoke-task drawings not present")
+    return
+  gt, errors, warnings = draw_tools.extract(input_dir)
+  check("extraction succeeded", gt is not None, errors)
+  check("no errors or warnings", errors == [] and warnings == [],
+        (errors, warnings))
+  check("hall size",
+        gt["hall"]["width_mm"] == 27000
+        and gt["hall"]["height_mm"] == 21000, gt["hall"])
+  check("scale ~38.03 mm/px",
+        abs(gt["scale_mm_per_px"] - 38.03) < 0.1,
+        gt["scale_mm_per_px"])
+  # Row centrelines from the A-601 tile schedule (the authoritative
+  # values): geometry must land within 300 mm of them.
+  expected = {"A": 3000, "B": 6000, "C": 8400,
+              "D": 11400, "E": 13800, "F": 16800}
+  check("6 rows", len(gt["rows"]) == 6, gt["rows"])
+  for row in gt["rows"]:
+    check(f"row {row['name']} centreline within 300 mm",
+          abs(row["y_centre"] - expected[row["name"]]) <= 300,
+          row["y_centre"])
+  check("22 CRAHs", len(gt["crahs"]) == 22, len(gt["crahs"]))
+  check("4 perimeter + 18 in-row CRAHs",
+        sum(1 for c in gt["crahs"] if c["type"] == "perimeter") == 4
+        and sum(1 for c in gt["crahs"] if c["type"] == "in-row") == 18)
+  entry = gt["entry_drawn"]["xy"]
+  check("entry on the west wall", entry[0] < 1000, entry)
+  check("entry near the validated (46, 9887)",
+        abs(entry[0] - 46) <= 300 and abs(entry[1] - 9887) <= 300, entry)
+  check("entry tile A17", gt["entry_drawn"]["tile"] == "A17",
+        gt["entry_drawn"])
+  check("entry discrepancy recorded",
+        abs(gt["entry_discrepancy_mm"] - 6532) < 100,
+        gt["entry_discrepancy_mm"])
+  check("6 columns", len(gt["columns"]) == 6, gt["columns"])
+  check("6 PDUs", len(gt["pdus"]) == 6, gt["pdus"])
+  check("63 ceiling + 16 in-aisle sprinklers",
+        len(gt["sprinklers"]["ceiling"]) == 63
+        and len(gt["sprinklers"]["in_aisle"]) == 16,
+        (len(gt["sprinklers"]["ceiling"]),
+         len(gt["sprinklers"]["in_aisle"])))
+
+
+def test_vision_parse():
+  print("vision reply parsing and ground-truth merge")
+  reply = """{
+    "rows": [
+      {"name": "A", "first_tile": "D05", "last_tile": "AF05"},
+      {"name": "B", "first_tile": "D10", "last_tile": "AG10"}
+    ],
+    "profiles": {"tray": {"width": 683, "height": 127},
+                 "busway": {"width": 128, "height": 147},
+                 "chw": {"od": 114.3, "od_insulated": 168.3}},
+    "band": {"overhead": [2600, 3115], "underfloor": [-865, 0],
+             "underfloor_top_clearance": 20},
+    "rules": {"tray_busway_separation": 300,
+              "pdu_dedicated_space": 1800,
+              "sprinkler_standoff": 460},
+    "datums": {"soffit": 3600, "deflector": 3574.6,
+               "clear_height": 2600}
+  }"""
+  vision = serve._parse_vision_reply(reply)
+  check("rows parsed", len(vision.get("rows", [])) == 2, vision)
+  check("row A tile math",
+        vision["rows"][0] == {"name": "A", "y_centre": 3000,
+                              "y_band": [2400, 3600],
+                              "x_start": 1800, "x_end": 19200},
+        vision["rows"][0])
+  check("row B tile math",
+        vision["rows"][1]["y_centre"] == 6000
+        and vision["rows"][1]["x_end"] == 19800, vision["rows"][1])
+  check("profiles parsed",
+        vision["profiles"]["tray"] == {"width": 683, "height": 127},
+        vision.get("profiles"))
+  check("band parsed", vision["band"]["overhead"] == [2600, 3115],
+        vision.get("band"))
+  check("rules parsed",
+        vision["rules"]["tray_busway_separation"] == 300,
+        vision.get("rules"))
+  check("datums parsed", vision["datums"]["deflector"] == 3574.6,
+        vision.get("datums"))
+  check("tile column AF is 32", serve._tile_column("AF") == 32)
+  check("tile D05 to mm",
+        serve._tile_row_mm("D05") == (1800, 3000, 3600),
+        serve._tile_row_mm("D05"))
+  # Garbage and fenced JSON.
+  check("garbage reply parses to empty",
+        serve._parse_vision_reply("no json here") == {})
+  check("fenced JSON parses",
+        serve._parse_vision_reply("```json\n" + reply + "\n```") == vision)
+  # Merge: tile values replace geometry ones; a >500 mm disagreement
+  # warns and the tile schedule still wins.
+  gt = _synthetic_ground_truth()
+  gt["rows"][0]["y_centre"] = 2986  # geometry value, 14 mm off
+  gt["rows"][1]["y_centre"] = 5200  # geometry value, 800 mm off
+  warnings = serve._merge_vision_ground_truth(gt, vision)
+  check("tile schedule wins for row A",
+        gt["rows"][0]["y_centre"] == 3000, gt["rows"][0])
+  check("tile schedule wins for row B despite the gap",
+        gt["rows"][1]["y_centre"] == 6000, gt["rows"][1])
+  check("disagreement warned",
+        len(warnings) == 1 and "B" in warnings[0], warnings)
+  check("profiles merged", gt["profiles"]["chw"]["od_insulated"] == 168.3)
+  check("band merged with datums",
+        gt["band"]["datums"]["deflector"] == 3574.6, gt["band"])
+
+
+async def test_empty_submission_guard():
+  print("empty-submission guard writes a fallback model")
+  session = FakeSession(21600)
+  session.instruction = "Route the cable tray, busway and chilled water."
+  session.files["output/solution.py"] = (
+      b"# submission stub was never replaced\n")
+  FakeAgent.reset(scripts={"planner": ["p"], "worker": [""]})
+  real = serve.Agent
+  serve.Agent = FakeAgent
+  try:
+    result = await serve.solve(session)
+  finally:
+    serve.Agent = real
+  check("guard logged loudly",
+        any("EMPTY SUBMISSION" in t for t in session.logs), session.logs)
+  check("failure report returned, not an empty string",
+        "failed to produce a model" in result, repr(result))
+  check("final message is the failure report",
+        session.final_message == result, repr(session.final_message))
+  fallback = session.files["output/solution.py"].decode()
+  check("fallback written, not the stub",
+        "submission stub was never replaced" not in fallback, fallback[:200])
+  check("fallback is the harness model",
+        "Last-resort model" in fallback, fallback[:200])
+  check("fallback declares millimetres",
+        "MILLI" in fallback and "IfcUnitAssignment" in fallback)
+
+
+async def test_planner_skipped_with_ground_truth():
+  print("planner skipped when ground truth exists")
+  import json
+  session = FakeSession(21600)
+  session.instruction = "Route the cable tray, busway and chilled water."
+  session.files["ground_truth.json"] = json.dumps(
+      _synthetic_ground_truth()).encode()
+  FakeAgent.reset(scripts={"worker": ["worker summary"],
+                           "verifier": ["PASS"]})
+  real = serve.Agent
+  serve.Agent = FakeAgent
+  try:
+    result = await serve.solve(session)
+  finally:
+    serve.Agent = real
+  check("no planner phase", FakeAgent.roles() == ["worker", "verifier"],
+        FakeAgent.roles())
+  check("worker got the ground-truth summary",
+        "Ground truth measured from the drawings"
+        in FakeAgent.first("worker").plan,
+        FakeAgent.first("worker").plan)
+  check("summary names the rows",
+        "A 3000" in FakeAgent.first("worker").plan
+        and "B 6000" in FakeAgent.first("worker").plan)
+  check("result verified",
+        result.endswith("Independent verification: PASS."), repr(result))
+
+
+def test_conn_gate_ground_truth():
+  print("connectivity gate measures against ground_truth.json")
+  try:
+    import ifcopenshell  # noqa: F401
+  except ImportError:
+    print("  skipped: ifcopenshell not installed")
+    return
+  import json
+  import subprocess
+  import tempfile
+
+  def run_gate(workdir):
+    script = os.path.join(workdir, "conn_gate.py")
+    with open(script, "w") as f:
+      f.write(serve.CONN_GATE_SCRIPT)
+    r = subprocess.run([sys.executable, script], cwd=workdir,
+                       capture_output=True, text=True)
+    return r.stdout + r.stderr
+
+  # A route that is perfect against its own routing.json (entry at
+  # (200, 3360), one row at y=3360) but nowhere near the ground truth
+  # (entry (27, 9889), rows at y=3000/6000 spanning x 1800-19200).
+  segments = [
+      ('IfcCableCarrierSegment', 'CableTray-1', 1800, 600, 300, 1100, 3360, 2600),
+      ('IfcCableCarrierSegment', 'CableTray-2', 600, 1640, 300, 2000, 4180, 2600),
+      ('IfcCableCarrierSegment', 'Busway-1', 1800, 600, 300, 1100, 3960, 2600),
+      ('IfcCableCarrierSegment', 'Busway-2', 600, 1640, 300, 2000, 4780, 2600),
+      ('IfcPipeSegment', 'CHW-1', 1800, 600, 300, 1100, 2760, 2600),
+      ('IfcPipeSegment', 'CHW-2', 600, 2240, 300, 2000, 3880, 2600),
+      ('IfcPipeSegment', 'CHW-Drop-1', 300, 300, 1600, 2000, 5000, 1000),
+  ]
+  routing = {
+      'entry': [200, 3360, 0],
+      'rows': [{'name': 'A', 'start': [1100, 3360, 0],
+                'end': [2000, 3360, 0]}],
+      'crahs': [[2000, 5000, 0]],
+  }
+  with tempfile.TemporaryDirectory() as tmp:
+    outdir = os.path.join(tmp, "gt", "output")
+    os.makedirs(outdir)
+    _build_test_ifc(os.path.join(outdir, "model.ifc"), segments)
+    json.dump(routing, open(os.path.join(outdir, "routing.json"), "w"))
+    json.dump(_synthetic_ground_truth(),
+              open(os.path.join(tmp, "gt", "ground_truth.json"), "w"))
+    out = run_gate(os.path.join(tmp, "gt"))
+    check("gate measures against ground truth",
+          "CONN measuring against ground_truth.json" in out, out)
+    check("self-consistent model fails against ground truth",
+          "CONN_GATE: FAIL" in out, out)
+    check("entry distance measured from the drawn entry",
+          "nothing within 2500 mm of the entry" in out, out)
+    check("row coverage measured from the true rows",
+          "row A: tray covers only 16%" in out, out)
+
+    # Invalid ground truth falls back to routing.json — and the same
+    # model passes against its own declaration.
+    outdir = os.path.join(tmp, "fallback", "output")
+    os.makedirs(outdir)
+    _build_test_ifc(os.path.join(outdir, "model.ifc"), segments)
+    json.dump(routing, open(os.path.join(outdir, "routing.json"), "w"))
+    json.dump({"valid": False},
+              open(os.path.join(tmp, "fallback", "ground_truth.json"), "w"))
+    out = run_gate(os.path.join(tmp, "fallback"))
+    check("invalid ground truth falls back to routing.json",
+          "output/routing.json (fallback: no ground truth)" in out, out)
+    check("same model passes against routing.json",
+          "CONN_GATE: PASS" in out, out)
+
+
+def test_sep_gate_ground_truth():
+  print("separation gate reads the band and deflector from ground truth")
+  try:
+    import ifcopenshell  # noqa: F401
+  except ImportError:
+    print("  skipped: ifcopenshell not installed")
+    return
+  import json
+  import tempfile
+
+  with tempfile.TemporaryDirectory() as tmp:
+    # One tray segment topping at 3300 mm, no sprinkler entities in the
+    # model: without ground truth the sprinkler check is skipped and the
+    # gate passes; with it the deflector plane (3574.6) catches the
+    # segment — 3300 is only 275 mm below the plane, not 460.
+    outdir = os.path.join(tmp, "high", "output")
+    os.makedirs(outdir)
+    _build_test_ifc(os.path.join(outdir, "model.ifc"), [
+        ('IfcCableCarrierSegment', 'CableTray-1', 10000, 683, 150,
+         5000, 5000, 3150),
+    ])
+    out = _run_sep_gate(os.path.join(tmp, "high"))
+    check("no sprinklers in the model: check skipped, gate passes",
+          "SEP_GATE: PASS" in out, out)
+    json.dump(_synthetic_ground_truth(),
+              open(os.path.join(tmp, "high", "ground_truth.json"), "w"))
+    out = _run_sep_gate(os.path.join(tmp, "high"))
+    check("deflector plane from ground truth catches the high segment",
+          "below the sprinkler deflector plane" in out, out)
+    check("gate fails with ground truth", "SEP_GATE: FAIL" in out, out)
+
+    # Two services sharing a band: the tier message now names the band
+    # height from ground truth instead of the old placeholder tiers.
+    outdir = os.path.join(tmp, "flat", "output")
+    os.makedirs(outdir)
+    _build_test_ifc(os.path.join(outdir, "model.ifc"), [
+        ('IfcCableCarrierSegment', 'CableTray-1', 10000, 600, 150,
+         5000, 5000, 2850),
+        ('IfcCableCarrierSegment', 'Busway-1', 10000, 600, 150,
+         5000, 5000, 2850),
+    ])
+    json.dump(_synthetic_ground_truth(),
+              open(os.path.join(tmp, "flat", "ground_truth.json"), "w"))
+    out = _run_sep_gate(os.path.join(tmp, "flat"))
+    check("tier message names the band height",
+          "overhead band is only 515 mm high" in out, out)
+    check("no placeholder tiers in the message",
+          "tray z=3400" not in out, out)
+
+
+def test_fallback_solution():
+  print("fallback solution runs and passes the gates")
+  try:
+    import ifcopenshell  # noqa: F401
+  except ImportError:
+    print("  skipped: ifcopenshell not installed")
+    return
+  import json
+  import subprocess
+  import tempfile
+
+  def run_script(script_text, workdir, name):
+    script = os.path.join(workdir, name)
+    with open(script, "w") as f:
+      f.write(script_text)
+    r = subprocess.run([sys.executable, script], cwd=workdir,
+                       capture_output=True, text=True)
+    return r.stdout + r.stderr
+
+  with tempfile.TemporaryDirectory() as tmp:
+    gt = _synthetic_ground_truth()
+    source = serve._fallback_solution(gt)
+    check("fallback source is not the stub",
+          "submission stub was never replaced" not in source)
+    check("fallback carries the unit block",
+          "IfcUnitAssignment" in source and "MILLI" in source)
+    os.makedirs(os.path.join(tmp, "output"))
+    json.dump(gt, open(os.path.join(tmp, "ground_truth.json"), "w"))
+    with open(os.path.join(tmp, "output", "solution.py"), "w") as f:
+      f.write(source)
+    r = subprocess.run([sys.executable, "output/solution.py"], cwd=tmp,
+                       capture_output=True, text=True)
+    check("fallback solution runs", r.returncode == 0, r.stdout + r.stderr)
+    check("fallback writes model.ifc",
+          os.path.exists(os.path.join(tmp, "output", "model.ifc")))
+    out = run_script(serve.UNIT_GATE_SCRIPT, tmp, "unit_gate.py")
+    check("fallback units pass", "UNIT_GATE: PASS" in out, out)
+    try:
+      import pytest  # noqa: F401
+    except ImportError:
+      # ifcopenshell's express-rules engine imports _pytest; the task
+      # container has pytest, this env may not. Run the suite with
+      # --with pytest to exercise this check.
+      print("  skipped: IFC express validation needs pytest")
+    else:
+      out = run_script(serve.IFC_GATE_SCRIPT, tmp, "ifc_gate.py")
+      check("fallback IFC validates", "IFC_GATE: PASS" in out, out)
+    out = _run_sep_gate(tmp)
+    check("fallback has no clashes", "SEP collisions: 0" in out, out)
+    check("fallback separation passes", "SEP_GATE: PASS" in out, out)
+    out = run_script(serve.CONN_GATE_SCRIPT, tmp, "conn_gate.py")
+    check("fallback connectivity passes", "CONN_GATE: PASS" in out, out)
+
+    # No ground truth at all: still a runnable model, not a stub.
+    source = serve._fallback_solution(None)
+    with open(os.path.join(tmp, "output", "solution.py"), "w") as f:
+      f.write(source)
+    r = subprocess.run([sys.executable, "output/solution.py"], cwd=tmp,
+                       capture_output=True, text=True)
+    check("no-ground-truth fallback runs", r.returncode == 0,
+          r.stdout + r.stderr)
+
+
 async def main():
   await test_long_task_pass_first_try()
   await test_gaps_then_fix_then_pass()
@@ -1170,6 +1609,13 @@ async def main():
   await test_gates_run_in_parallel_and_merge()
   await test_gate_verdict_appended_when_rounds_run_out()
   await test_regression_guard_restores_worse_fix()
+  test_draw_tools_geometry()
+  test_vision_parse()
+  await test_empty_submission_guard()
+  await test_planner_skipped_with_ground_truth()
+  test_conn_gate_ground_truth()
+  test_sep_gate_ground_truth()
+  test_fallback_solution()
   print("ALL TESTS PASSED")
 
 
