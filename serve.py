@@ -178,6 +178,11 @@ labelled assumption.
 - Hard constraints (safety, feasibility, code limits) come before optimisation: never trade one for a better \
 objective value. Check each constraint explicitly before you finish.
 - Recompute key numbers a second way (independent code) and check units before you write them into a deliverable.
+- If the task names a check (a validator, a test command, a format), run that exact check with the exact flags on \
+the final deliverable before finishing, and paste its verbatim output in your summary. A check you did not run is \
+a check you failed. Never report 'verified' from a weaker check.
+- The container has no internet access: do not try pip install. List installed packages first (pip list) and work \
+with what is there.
 """
 
 WORKER = SYSTEM.replace(
@@ -192,9 +197,39 @@ to use, and how to check it. You have about {minutes} minutes for this planning 
 VERIFIER = """You check an engineer's work on a task in a Linux container. You get the task, the plan, and the \
 engineer's summary of what was delivered. Open every deliverable with your tools (bash starts in {workdir}) and \
 check it against the task: the path, the format, every part the task asks for, and the key numbers, recomputed. Do \
-not create or change any file. If everything holds, reply with the single word PASS and nothing else. Otherwise \
-reply with a numbered list of the gaps, each specific enough to fix. You have about {minutes} minutes for this \
-checking step."""
+not create or change any file. Never accept the worker's claim that something was checked. Re-run the task's \
+stated validation yourself with the exact flags and quote its verbatim output in your reply. A script's own \
+self-check printout is not independent evidence — run the check separately on the produced file. If you cannot \
+re-run a claimed check, list it as a gap. If everything holds, reply with the single word PASS and nothing else. \
+Otherwise reply with a numbered list of the gaps, each specific enough to fix. You have about {minutes} minutes \
+for this checking step."""
+
+# Appended to the worker prompt when the task mentions IFC. The exact
+# validation snippet and the extrusion rule below are the two things an
+# agent got wrong on a real task (schema-only validation reported as
+# express-rules validation; horizontal extrusions rejected by the grader).
+IFC_GUIDE = """
+Working with IFC files (ifcopenshell):
+- Validate the produced .ifc with the full check before finishing, using this exact code (the logger argument is \
+required, and express_rules must be True — a schema-only check cannot catch geometry-rule violations):
+  import ifcopenshell, ifcopenshell.validate
+  class _L:
+      def __init__(self): self.errors = []
+      def error(self, *a, **k): self.errors.append((a, k))
+  _log = _L()
+  ifcopenshell.validate.validate(model, _log, express_rules=True)
+  assert not _log.errors, _log.errors[:5]
+- IFC4 rule WR1 for IfcExtrudedAreaSolid: the extrusion direction must have a non-zero component along the profile \
+normal (the profile lies in its local XY plane, normal (0,0,1)). Never extrude a horizontal run by setting \
+ExtrudedDirection to a horizontal vector — that makes the solid degenerate and the file invalid. Instead keep \
+ExtrudedDirection=(0,0,1) in the solid's local frame and rotate the solid's Position (Axis/RefDirection) so local \
+Z points along the run direction.
+- API notes: ifcopenshell.validate has no .run; validate(model, logger, express_rules=True) needs a logger; a \
+logger's error takes *args; placements use IfcLocalPlacement(PlacementRelTo=..., \
+RelativePlacement=IfcAxis2Placement3D(...)); open files with ifcopenshell.open; look up schema declarations with \
+ifcopenshell.schema_by_name('IFC4').declaration(...). There is no IfcCableTraySegment in IFC4 — use \
+IfcCableCarrierSegment for trays/busways and IfcPipeSegment for pipes.
+"""
 
 
 def tool(
@@ -891,9 +926,12 @@ class Agent:
     template = {"planner": PLANNER, "verifier": VERIFIER}.get(
         self.role, WORKER
     )
-    return template.format(
+    prompt = template.format(
         workdir=self.session.workdir, mcp=mcp, minutes=minutes
     )
+    if self.role == "worker" and "ifc" in self.session.instruction.lower():
+      prompt += IFC_GUIDE
+    return prompt
 
   def initial_user_message(self) -> str:
     """Builds this role's first user message."""
@@ -1933,6 +1971,75 @@ def _verdict(text: str) -> tuple[bool, str]:
   return False, text.strip()
 
 
+# Deterministic IFC gate: validates every produced .ifc under output/ with
+# the full EXPRESS rules, in the task container (no model call). A schema-only
+# check cannot catch geometry-rule violations, and an agent that failed to run
+# the full check once will silently substitute the weaker one — so the gate
+# runs the exact check itself and its failures become fix-round gaps.
+IFC_GATE_SCRIPT = """
+import glob, sys
+try:
+    import ifcopenshell
+    import ifcopenshell.validate
+except Exception as exc:
+    print(f"IFC_GATE: SKIP (ifcopenshell unavailable: {exc})")
+    sys.exit(0)
+class _Log:
+    def __init__(self):
+        self.errors = []
+    def error(self, *a, **k):
+        self.errors.append((a, k))
+files = sorted(glob.glob("output/**/*.ifc", recursive=True))
+if not files:
+    print("IFC_GATE: SKIP (no .ifc files under output/)")
+    sys.exit(0)
+bad = 0
+for f in files:
+    log = _Log()
+    try:
+        model = ifcopenshell.open(f)
+        ifcopenshell.validate.validate(model, log, express_rules=True)
+    except Exception as exc:
+        print(f"IFC {f}: ERROR {exc}")
+        bad += 1
+        continue
+    print(f"IFC {f}: {len(log.errors)} EXPRESS violations")
+    for args, _ in log.errors[:10]:
+        print("  " + " ".join(str(a) for a in args)[:500])
+    bad += 1 if log.errors else 0
+print("IFC_GATE: FAIL" if bad else
+      f"IFC_GATE: PASS ({len(files)} file(s), 0 EXPRESS violations)")
+"""
+IFC_GATE_COMMAND = "python3 - <<'PYEOF'\n" + IFC_GATE_SCRIPT + "\nPYEOF"
+
+
+async def _ifc_gate(worker: Agent) -> str:
+  """Runs the deterministic IFC gate and returns its failures as gaps.
+
+  The gate runs in the task container through the worker's bash tool. It
+  returns "" when there is nothing to check, the check passes, or the check
+  could not run (missing ifcopenshell, no python, a tool error) — an
+  inconclusive gate must not block submission; the verifier still checks.
+
+  Args:
+    worker: The worker Agent (its bash tool runs in the task container).
+
+  Returns:
+    The gate's violation text when it fails, else "".
+  """
+  try:
+    out = await worker.bash(IFC_GATE_COMMAND)
+  except Exception as exc:  # pylint: disable=broad-exception-caught
+    await worker.session.log(f"IFC gate failed to run: {exc}")
+    return ""
+  if "IFC_GATE: FAIL" not in out:
+    await worker.session.log(
+        "IFC gate: " + (out.strip().splitlines() or [""])[-1][:200]
+    )
+    return ""
+  return clip(out, 4000)
+
+
 async def solve(session: taskbridge.Session) -> str:
   """Runs plan, work, verify, and fix phases and returns the final answer.
 
@@ -1983,6 +2090,11 @@ async def solve(session: taskbridge.Session) -> str:
     )
     session.final_message = summary  # the verifier's text is not the summary
     passed, gaps = _verdict(reply)
+    if passed:
+      # The verifier passed: run the deterministic IFC gate before accepting
+      # it. A gate failure becomes gaps for a fix round, like any other.
+      gaps = await _ifc_gate(worker)
+      passed = not gaps
     if passed:
       verified = True
       break

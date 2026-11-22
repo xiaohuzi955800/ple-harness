@@ -46,6 +46,7 @@ class FakeAgent:
   instances = []
   scripts = {}
   fail_roles = set()
+  bash_outputs = []
 
   def __init__(
       self,
@@ -78,11 +79,17 @@ class FakeAgent:
     self.session.final_message = text
     return text
 
+  async def bash(self, command, timeout_sec=120):
+    if FakeAgent.bash_outputs:
+      return FakeAgent.bash_outputs.pop(0)
+    return "exit code 0\nIFC_GATE: SKIP (no .ifc files under output/)"
+
   @classmethod
-  def reset(cls, scripts=None, fail_roles=None):
+  def reset(cls, scripts=None, fail_roles=None, bash_outputs=None):
     cls.instances = []
     cls.scripts = dict(scripts or {})
     cls.fail_roles = set(fail_roles or ())
+    cls.bash_outputs = list(bash_outputs or [])
 
   @classmethod
   def roles(cls):
@@ -286,6 +293,96 @@ async def test_resume_clears_phase_deadline():
         agent.messages[-1] == {"role": "user", "content": "fix this"})
 
 
+async def test_ifc_gate():
+  print("IFC gate parsing")
+  FakeAgent.reset(bash_outputs=[
+      "exit code 0\nIFC_GATE: SKIP (no .ifc files under output/)",
+      "exit code 0\nIFC output/model.ifc: 0 EXPRESS violations\n"
+      "IFC_GATE: PASS (1 file(s), 0 EXPRESS violations)",
+      "exit code 0\nIFC output/model.ifc: 3 EXPRESS violations\n"
+      "  IfcDotProduct... != 0.0\nIFC_GATE: FAIL",
+      "exit code 127\npython3: command not found",
+  ])
+  session = FakeSession(21600)
+  worker = FakeAgent(session, role="worker")
+  check("skip, no files", await serve._ifc_gate(worker) == "")
+  check("pass", await serve._ifc_gate(worker) == "")
+  gaps = await serve._ifc_gate(worker)
+  check("violations returned", "3 EXPRESS violations" in gaps, gaps)
+  check("tool error is inconclusive",
+        await serve._ifc_gate(worker) == "")
+
+  class RaisingWorker:
+    def __init__(self, session):
+      self.session = session
+
+    async def bash(self, command, timeout_sec=120):
+      raise RuntimeError("boom")
+
+  check("bash raising is inconclusive",
+        await serve._ifc_gate(RaisingWorker(session)) == "")
+  check("gate script compiles",
+        compile(serve.IFC_GATE_SCRIPT, "<ifc-gate>", "exec") is not None)
+  check("gate command is a heredoc",
+        serve.IFC_GATE_COMMAND.startswith("python3 - <<'PYEOF'\n"))
+
+
+async def test_gate_blocks_pass_then_fix():
+  print("IFC gate turns a verifier PASS into a fix round")
+  FakeAgent.reset(
+      scripts={
+          "planner": ["p"],
+          "worker": ["worker summary"],
+          "verifier": ["PASS", "PASS"],
+      },
+      bash_outputs=[
+          "exit code 0\nIFC output/model.ifc: 1 EXPRESS violations\n"
+          "  bad extrusion\nIFC_GATE: FAIL",
+          "exit code 0\nIFC output/model.ifc: 0 EXPRESS violations\n"
+          "IFC_GATE: PASS (1 file(s), 0 EXPRESS violations)",
+      ],
+  )
+  real = serve.Agent
+  serve.Agent = FakeAgent
+  try:
+    result = await serve.solve(FakeSession(21600))
+  finally:
+    serve.Agent = real
+  worker = FakeAgent.first("worker")
+  check("one gate fix round", len(worker.resumes) == 1, worker.resumes)
+  check("gate text passed to worker",
+        "EXPRESS violations" in worker.resumes[0], worker.resumes[0])
+  check("result verified",
+        result.endswith("Independent verification: PASS."), repr(result))
+
+
+def test_prompts():
+  print("worker/verifier prompt rules and IFC guide")
+  session = FakeSession(21600)
+  session.instruction = "Build an IFC model of the data hall."
+  worker = serve.Agent(session, role="worker")
+  prompt = worker.system_prompt("")
+  check("worker hard rule",
+        "exact check with the exact flags" in prompt)
+  check("no pip install", "do not try pip install" in prompt)
+  check("IFC guide present",
+        "express_rules=True" in prompt and "WR1" in prompt)
+  check("IFC snippet present",
+        "ifcopenshell.validate.validate(model, _log, express_rules=True)"
+        in prompt)
+  session2 = FakeSession(21600)
+  session2.instruction = "Design a steel frame."
+  worker2 = serve.Agent(session2, role="worker")
+  check("no IFC guide without IFC",
+        "express_rules=True" not in worker2.system_prompt(""))
+  verifier = serve.Agent(session, role="verifier")
+  vprompt = verifier.system_prompt("")
+  check("verifier re-run rule",
+        "Re-run the task's stated validation yourself" in vprompt)
+  check("verifier distrusts self-check",
+        "not independent evidence" in vprompt)
+
+
 async def main():
   await test_long_task_pass_first_try()
   await test_gaps_then_fix_then_pass()
@@ -297,6 +394,9 @@ async def main():
   test_agent_roles()
   test_phase_time_left()
   await test_resume_clears_phase_deadline()
+  await test_ifc_gate()
+  await test_gate_blocks_pass_then_fix()
+  test_prompts()
   print("ALL TESTS PASSED")
 
 
