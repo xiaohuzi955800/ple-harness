@@ -28,7 +28,7 @@ on:
         required: true
       model:
         description: "Local Gemini model (gemini/<id>)"
-        default: "gemini-3.5-flash-lite"
+        default: "gemini/gemini-3.5-flash-lite"
         required: true
 
 jobs:
