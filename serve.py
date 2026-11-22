@@ -200,9 +200,18 @@ check it against the task: the path, the format, every part the task asks for, a
 not create or change any file. Never accept the worker's claim that something was checked. Re-run the task's \
 stated validation yourself with the exact flags and quote its verbatim output in your reply. A script's own \
 self-check printout is not independent evidence — run the check separately on the produced file. If you cannot \
-re-run a claimed check, list it as a gap. If everything holds, reply with the single word PASS and nothing else. \
-Otherwise reply with a numbered list of the gaps, each specific enough to fix. You have about {minutes} minutes \
-for this checking step."""
+re-run a claimed check, list it as a gap. When the task involves routing, recompute the route geometry from the \
+produced .ifc yourself — do not take it from reconciliation.json or the worker's summary: segment count and total \
+length per service, the entity class of every route segment, the distance from each service's nearest segment to \
+the entry, per-row coverage, and CRAH reach. Quote those numbers in your reply; a PASS that does not quote them \
+is not a pass. Re-run output/solution.py yourself so the deliverable regenerates. If everything holds, reply with \
+the single word PASS and nothing else. Otherwise reply with a numbered list of the gaps, each specific enough to \
+fix. You have about {minutes} minutes for this checking step."""
+
+# Words in the task instruction that mark a routing task (cable tray /
+# busway / chilled water). Used for the routing prompt guides and for the
+# deterministic connectivity gate.
+ROUTING_KEYWORDS = ("routing", "cable tray", "busway", "crah", "mep routing")
 
 # Appended to the worker prompt when the task mentions IFC. The exact
 # validation snippet and the extrusion rule below are the two things an
@@ -229,6 +238,77 @@ logger's error takes *args; placements use IfcLocalPlacement(PlacementRelTo=...,
 RelativePlacement=IfcAxis2Placement3D(...)); open files with ifcopenshell.open; look up schema declarations with \
 ifcopenshell.schema_by_name('IFC4').declaration(...). There is no IfcCableTraySegment in IFC4 — use \
 IfcCableCarrierSegment for trays/busways and IfcPipeSegment for pipes.
+"""
+
+# Appended to the worker and verifier prompts when the task is a routing
+# task. A real run produced one 23,000 mm box per service, a busway modelled
+# as a distribution board, no feeder from the entry, no per-row headers and
+# no CRAH drops — and the verifier passed it. Every rule below is checkable.
+ROUTING_GUIDE = """
+Routing (cable tray, busway, chilled water):
+- Connect in this order: (a) the service entry first — a feeder from the entry marked on the drawings to your first \
+header; (b) one header per row, every row, all three services; (c) a drop from the CHW header to every CRAH, \
+including perimeter units the row headers do not pass. Never submit a route with one segment per service; every \
+direction or tier change is a new segment.
+- Busway is IfcCableCarrierSegment, exactly like the tray — never IfcElectricDistributionBoard.
+- Name every route segment clearly (CableTray-1, Busway-1, CHW-1, ...).
+- Write output/routing.json next to the model, with the numbers you actually used: {"entry": [x, y, z], "rows": \
+[{"name": "A", "start": [x, y, z], "end": [x, y, z]}, ...], "crahs": [[x, y, z], ...]}. Then run a connectivity \
+self-check from that file (segment count and total length per service, entry distance, per-row coverage, CRAH \
+reach) and paste its output in your summary. A route you did not measure is a route you did not build.
+- If you cannot extract a drawing value after a few tries, record what you could extract and move on with \
+clearly-labelled assumptions — do not keep re-trying the same extraction.
+"""
+
+# Appended to the worker prompt only, on routing tasks. A tested stdlib-only
+# PNG reader (verified against the real 1600x1100 drawing sheets): use it
+# instead of writing your own PNG decoder.
+PNG_GUIDE = r"""
+Reading the drawing sheets (input/*.png): use this tested stdlib-only reader instead of writing your own PNG \
+decoder — it returns (width, height, rows of RGB bytes), colour types 2 (RGB) and 6 (RGBA), 8-bit non-interlaced:
+  import struct, zlib
+  def read_png(path):
+      data = open(path, 'rb').read()
+      assert data[:8] == b'\x89PNG\r\n\x1a\n'
+      pos, w, h, bitdepth, colortype, idat = 8, 0, 0, 0, 0, b''
+      while pos < len(data):
+          ln, typ = struct.unpack('>I4s', data[pos:pos+8])
+          chunk = data[pos+8:pos+8+ln]
+          if typ == b'IHDR': w, h, bitdepth, colortype = struct.unpack('>IIBB', chunk[:10])
+          elif typ == b'IDAT': idat += chunk
+          elif typ == b'IEND': break
+          pos += 12 + ln
+      assert bitdepth == 8 and colortype in (2, 6)
+      raw = zlib.decompress(idat)
+      ch = 3 if colortype == 2 else 4
+      stride = w * ch
+      rows, prev = [], bytearray(stride)
+      i = 0
+      for _y in range(h):
+          f = raw[i]; i += 1
+          line = bytearray(raw[i:i+stride]); i += stride
+          if f == 1:
+              for x in range(ch, stride): line[x] = (line[x] + line[x-ch]) & 255
+          elif f == 2:
+              for x in range(stride): line[x] = (line[x] + prev[x]) & 255
+          elif f == 3:
+              for x in range(stride):
+                  a = line[x-ch] if x >= ch else 0
+                  line[x] = (line[x] + ((a + prev[x]) >> 1)) & 255
+          elif f == 4:
+              for x in range(stride):
+                  a = line[x-ch] if x >= ch else 0
+                  b = prev[x]
+                  c = prev[x-ch] if x >= ch else 0
+                  p = a + b - c
+                  pa, pb, pc = abs(p-a), abs(p-b), abs(p-c)
+                  pr = a if (pa <= pb and pa <= pc) else (b if pb <= pc else c)
+                  line[x] = (line[x] + pr) & 255
+          rows.append(bytes(line)); prev = line
+      return w, h, rows
+  From the pixels, find the drawing's geometry yourself (dark-pixel bounding boxes, long straight runs of dark \
+pixels, the positions of text blocks) and record the scale from the drawing's own dimensions before using any \
+coordinate.
 """
 
 
@@ -929,8 +1009,16 @@ class Agent:
     prompt = template.format(
         workdir=self.session.workdir, mcp=mcp, minutes=minutes
     )
-    if self.role == "worker" and "ifc" in self.session.instruction.lower():
+    instr = self.session.instruction.lower()
+    is_routing = any(k in instr for k in ROUTING_KEYWORDS)
+    if "ifc" in instr or is_routing:
+      # Routing tasks produce IFC models, so they need the validation
+      # snippet even when the instruction never says "IFC".
       prompt += IFC_GUIDE
+    if is_routing:
+      prompt += ROUTING_GUIDE
+      if self.role == "worker":
+        prompt += PNG_GUIDE
     return prompt
 
   def initial_user_message(self) -> str:
@@ -2040,6 +2128,302 @@ async def _ifc_gate(worker: Agent) -> str:
   return clip(out, 4000)
 
 
+# Deterministic connectivity gate: measures the route geometry of every
+# produced .ifc with the same tolerances the grader reports (250 mm joint
+# tolerance, 2,500 mm entry / row / CRAH reach, 80% row coverage). A
+# verifier that never recomputed connectivity passed a one-box-per-service
+# route, so the gate runs the exact measurement itself and its failures
+# become fix-round gaps. Only runs on routing tasks.
+CONN_GATE_SCRIPT = """
+import glob, json, math, os, sys
+try:
+    import ifcopenshell
+except Exception as exc:
+    print(f"CONN_GATE: SKIP (ifcopenshell unavailable: {exc})")
+    sys.exit(0)
+
+ENTRY_TOL = 2500.0
+JOIN_TOL = 250.0
+COVER_TOL = 2500.0
+ROW_MIN = 0.8
+CRAH_TOL = 2500.0
+
+
+def _v(p):
+    return (float(p[0]), float(p[1]), float(p[2]))
+
+
+def _norm(v):
+    n = math.sqrt(sum(x * x for x in v)) or 1.0
+    return tuple(x / n for x in v)
+
+
+def _cross(a, b):
+    return (a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2],
+            a[0] * b[1] - a[1] * b[0])
+
+
+def _add(a, b):
+    return tuple(x + y for x, y in zip(a, b))
+
+
+def _sub(a, b):
+    return tuple(x - y for x, y in zip(a, b))
+
+
+def _scale(v, s):
+    return tuple(x * s for x in v)
+
+
+def _dot(a, b):
+    return sum(x * y for x, y in zip(a, b))
+
+
+def _dist(a, b):
+    return math.sqrt(sum((x - y) ** 2 for x, y in zip(a, b)))
+
+
+def _matvec(cols, v):
+    return tuple(sum(cols[j][i] * v[j] for j in range(3)) for i in range(3))
+
+
+def _axis_frame(ap):
+    '''Frame of an IfcAxis2Placement3D: (location, x, y, z).'''
+    loc = _v(ap.Location.Coordinates) if getattr(ap, 'Location', None) else (0.0, 0.0, 0.0)
+    z = _norm(_v(ap.Axis.DirectionRatios)) if getattr(ap, 'Axis', None) else (0.0, 0.0, 1.0)
+    x = _norm(_v(ap.RefDirection.DirectionRatios)) if getattr(ap, 'RefDirection', None) else (1.0, 0.0, 0.0)
+    y = _norm(_cross(z, x))
+    x = _norm(_cross(y, z))
+    return loc, x, y, z
+
+
+def _world_frame(pl):
+    '''World frame of an IfcLocalPlacement, walking its PlacementRelTo chain.'''
+    origin, x, y, z = (0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)
+    chain, cur = [], pl
+    while cur is not None:
+        chain.append(cur)
+        cur = getattr(cur, 'PlacementRelTo', None)
+    for p in reversed(chain):
+        loc, px, py, pz = _axis_frame(p.RelativePlacement)
+        origin = _add(origin, _matvec((x, y, z), loc))
+        x, y, z = _matvec((x, y, z), px), _matvec((x, y, z), py), _matvec((x, y, z), pz)
+    return origin, x, y, z
+
+
+def _profile_bbox(prof):
+    if prof.is_a('IfcRectangleProfileDef'):
+        cx, cy = 0.0, 0.0
+        if getattr(prof, 'Position', None) and getattr(prof.Position, 'Location', None):
+            c = prof.Position.Location.Coordinates
+            cx, cy = float(c[0]), float(c[1])
+        xd, yd = float(prof.XDim), float(prof.YDim)
+        return (cx - xd / 2, cx + xd / 2), (cy - yd / 2, cy + yd / 2)
+    if prof.is_a('IfcArbitraryClosedProfileDef'):
+        pts = prof.OuterCurve.Points
+        xs = [float(p.Coordinates[0]) for p in pts]
+        ys = [float(p.Coordinates[1]) for p in pts]
+        return (min(xs), max(xs)), (min(ys), max(ys))
+    return (-0.5, 0.5), (-0.5, 0.5)
+
+
+def _segment(product):
+    '''Centreline (start, end) of an extruded route segment, or None.
+
+    A segment is an oriented box: the centreline runs along its longest
+    axis, so this works both for a long profile with a short extrusion
+    (the agent's box style) and for a small profile with a long extrusion
+    (the rotated-placement style).
+    '''
+    try:
+        origin, x, y, z = _world_frame(product.ObjectPlacement)
+    except Exception:
+        return None
+    for rep in product.Representation.Representations:
+        for item in rep.Items:
+            if not item.is_a('IfcExtrudedAreaSolid'):
+                continue
+            if getattr(item, 'Position', None):
+                sloc, sx, sy, sz = _axis_frame(item.Position)
+                origin = _add(origin, _matvec((x, y, z), sloc))
+                x, y, z = (_matvec((x, y, z), sx), _matvec((x, y, z), sy),
+                           _matvec((x, y, z), sz))
+            (x0, x1), (y0, y1) = _profile_bbox(item.SweptArea)
+            dx, dy = (x1 - x0) / 2.0, (y1 - y0) / 2.0
+            cx, cy = (x0 + x1) / 2.0, (y0 + y1) / 2.0
+            depth = float(item.Depth)
+            ed = _matvec((x, y, z), _norm(_v(item.ExtrudedDirection.DirectionRatios)))
+            centre = _add(origin, _add(_add(_scale(x, cx), _scale(y, cy)),
+                                        _scale(ed, depth / 2.0)))
+            axes = sorted(((x, dx), (y, dy), (ed, depth / 2.0)), key=lambda a: -a[1])
+            d, half = axes[0]
+            return _sub(centre, _scale(d, half)), _add(centre, _scale(d, half))
+    return None
+
+
+def _pt_seg_dist(p, a, b):
+    ab = _sub(b, a)
+    t = max(0.0, min(1.0, _dot(_sub(p, a), ab) / max(_dot(ab, ab), 1e-9)))
+    return _dist(p, _add(a, _scale(ab, t)))
+
+
+def _pt_seg_dist2d(p, a, b):
+    return _pt_seg_dist((p[0], p[1], 0.0), (a[0], a[1], 0.0), (b[0], b[1], 0.0))
+
+
+def _coverage(start, end, segments, tol):
+    n, hit = 100, 0
+    for i in range(n + 1):
+        t = i / n
+        p = _add(start, _scale(_sub(end, start), t))
+        if any(_pt_seg_dist2d(p, a, b) <= tol for a, b in segments):
+            hit += 1
+    return hit / (n + 1)
+
+
+def _components(segments, tol):
+    parent = list(range(len(segments)))
+
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    for i in range(len(segments)):
+        for j in range(i + 1, len(segments)):
+            a1, b1 = segments[i]
+            a2, b2 = segments[j]
+            if min(_dist(a1, a2), _dist(a1, b2), _dist(b1, a2), _dist(b1, b2)) <= tol:
+                parent[find(i)] = find(j)
+    return len({find(i) for i in range(len(segments))})
+
+
+def _classify(product):
+    name = (product.Name or '').lower()
+    if 'busway' in name:
+        return 'busway'
+    if 'tray' in name:
+        return 'tray'
+    if 'chw' in name or 'pipe' in name or 'chilled' in name:
+        return 'chw'
+    return None
+
+
+def main():
+    files = sorted(glob.glob('output/**/*.ifc', recursive=True))
+    if not files:
+        print('CONN_GATE: SKIP (no .ifc files under output/)')
+        return
+    path = 'output/model.ifc' if 'output/model.ifc' in files else max(files, key=os.path.getsize)
+    try:
+        model = ifcopenshell.open(path)
+    except Exception as exc:
+        print(f'CONN_GATE: SKIP (cannot open {path}: {exc})')
+        return
+    segs = {'tray': [], 'busway': [], 'chw': []}
+    wrong = []
+    unclassified = 0
+    for product in model.by_type('IfcFlowSegment') + model.by_type('IfcElectricDistributionBoard'):
+        svc = _classify(product)
+        if svc is None:
+            unclassified += 1
+            continue
+        expect = 'IfcCableCarrierSegment' if svc in ('tray', 'busway') else 'IfcPipeSegment'
+        if not product.is_a(expect):
+            wrong.append(f"{svc} modelled as {product.is_a()}, not {expect}")
+            continue
+        s = _segment(product)
+        if s is None:
+            continue
+        segs[svc].append(s)
+    if unclassified:
+        print(f"CONN note: {unclassified} route element(s) without a recognisable name (tray/busway/chw)")
+    problems = []
+    for svc in ('tray', 'busway', 'chw'):
+        n = len(segs[svc])
+        total = sum(_dist(a, b) for a, b in segs[svc])
+        print(f"CONN {svc}: {n} segment(s), {total:.0f} mm total")
+        if n == 0 or total == 0:
+            problems.append(f"{svc}: no route (0 segments / 0 mm)")
+        elif n == 1:
+            problems.append(f"{svc}: only 1 segment ({total:.0f} mm) — a route needs feeders, headers and drops, not one box")
+    for w in wrong:
+        problems.append(w)
+    for svc in ('tray', 'busway', 'chw'):
+        if len(segs[svc]) > 1:
+            c = _components(segs[svc], JOIN_TOL)
+            print(f"CONN {svc}: {c} connected component(s)")
+            if c > 1:
+                problems.append(f"{svc}: {c} disconnected components (segments must join within {JOIN_TOL:.0f} mm)")
+    try:
+        routing = json.load(open('output/routing.json'))
+    except Exception as exc:
+        routing = None
+        print(f"CONN routing.json: not usable ({exc}) — coverage checks skipped")
+    if routing:
+        entry = _v(routing['entry'])
+        for svc in ('tray', 'busway', 'chw'):
+            if segs[svc]:
+                d = min(_pt_seg_dist2d(entry, a, b) for a, b in segs[svc])
+                print(f"CONN {svc}: entry distance {d:.0f} mm")
+                if d > ENTRY_TOL:
+                    problems.append(f"{svc}: nothing within {ENTRY_TOL:.0f} mm of the entry ({d:.0f} mm) — the network is not fed")
+        for row in routing.get('rows', []):
+            rs, re_ = _v(row['start']), _v(row['end'])
+            for svc in ('tray', 'busway', 'chw'):
+                cov = _coverage(rs, re_, segs[svc], COVER_TOL)
+                print(f"CONN row {row.get('name', '?')}: {svc} coverage {cov:.0%}")
+                if cov < ROW_MIN:
+                    problems.append(f"row {row.get('name', '?')}: {svc} covers only {cov:.0%} (needs {ROW_MIN:.0%})")
+        for crah in routing.get('crahs', []):
+            p = _v(crah)
+            d = min((_pt_seg_dist2d(p, a, b) for a, b in segs['chw']), default=1e18)
+            if d > CRAH_TOL:
+                problems.append(f"CRAH at {tuple(int(v) for v in p)} is {d:.0f} mm from the nearest CHW segment (needs {CRAH_TOL:.0f} mm)")
+    if problems:
+        for p in problems:
+            print('CONN FAIL: ' + p)
+        print('CONN_GATE: FAIL')
+    else:
+        print('CONN_GATE: PASS')
+
+
+main()
+"""
+CONN_GATE_COMMAND = "python3 - <<'PYEOF'\n" + CONN_GATE_SCRIPT + "\nPYEOF"
+
+
+async def _connectivity_gate(worker: Agent) -> str:
+  """Runs the deterministic connectivity gate and returns failures as gaps.
+
+  The gate runs in the task container through the worker's bash tool, on
+  routing tasks only (see ROUTING_KEYWORDS). It returns "" when the task is
+  not a routing task, there is nothing to check, the check passes, or the
+  check could not run — an inconclusive gate must not block submission.
+
+  Args:
+    worker: The worker Agent (its bash tool runs in the task container).
+
+  Returns:
+    The gate's failure text when it fails, else "".
+  """
+  instr = worker.session.instruction.lower()
+  if not any(k in instr for k in ROUTING_KEYWORDS):
+    return ""
+  try:
+    out = await worker.bash(CONN_GATE_COMMAND)
+  except Exception as exc:  # pylint: disable=broad-exception-caught
+    await worker.session.log(f"Connectivity gate failed to run: {exc}")
+    return ""
+  if "CONN_GATE: FAIL" not in out:
+    await worker.session.log(
+        "Connectivity gate: " + (out.strip().splitlines() or [""])[-1][:200]
+    )
+    return ""
+  return clip(out, 4000)
+
+
 async def solve(session: taskbridge.Session) -> str:
   """Runs plan, work, verify, and fix phases and returns the final answer.
 
@@ -2091,9 +2475,11 @@ async def solve(session: taskbridge.Session) -> str:
     session.final_message = summary  # the verifier's text is not the summary
     passed, gaps = _verdict(reply)
     if passed:
-      # The verifier passed: run the deterministic IFC gate before accepting
+      # The verifier passed: run the deterministic gates before accepting
       # it. A gate failure becomes gaps for a fix round, like any other.
       gaps = await _ifc_gate(worker)
+      if not gaps:
+        gaps = await _connectivity_gate(worker)
       passed = not gaps
     if passed:
       verified = True

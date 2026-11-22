@@ -2,7 +2,7 @@
 
 Run from the harness directory:
 
-  uv run --with openai==3.26.1 --with websockets==15.0.1 \\
+  uv run --with openai==3.26.1 --with websockets==15.0.1 --with ifcopenshell \\
       python tests/test_harness.py
 """
 
@@ -383,6 +383,221 @@ def test_prompts():
         "not independent evidence" in vprompt)
 
 
+async def test_conn_gate():
+  print("connectivity gate parsing")
+  session = FakeSession(21600)
+  session.instruction = "Route the cable tray, busway and chilled water."
+  worker = FakeAgent(session, role="worker")
+  FakeAgent.reset(bash_outputs=[
+      "exit code 0\nCONN_GATE: SKIP (no .ifc files under output/)",
+      "exit code 0\nCONN tray: 5 segment(s)\nCONN_GATE: PASS",
+      "exit code 0\nCONN tray: 1 segment(s), 23000 mm total\n"
+      "CONN FAIL: tray: only 1 segment (23000 mm)\nCONN_GATE: FAIL",
+      "exit code 127\npython3: command not found",
+  ])
+  check("skip, no files", await serve._connectivity_gate(worker) == "")
+  check("pass", await serve._connectivity_gate(worker) == "")
+  gaps = await serve._connectivity_gate(worker)
+  check("violations returned", "only 1 segment" in gaps, gaps)
+  check("tool error is inconclusive",
+        await serve._connectivity_gate(worker) == "")
+
+  session2 = FakeSession(21600)  # default instruction: not a routing task
+  worker2 = FakeAgent(session2, role="worker")
+  FakeAgent.reset(bash_outputs=["exit code 0\nCONN_GATE: FAIL"])
+  check("non-routing task skips the gate",
+        await serve._connectivity_gate(worker2) == "")
+  check("gate did not run a bash call",
+        FakeAgent.bash_outputs == ["exit code 0\nCONN_GATE: FAIL"])
+
+
+async def test_conn_gate_blocks_pass_then_fix():
+  print("connectivity gate turns a verifier PASS into a fix round")
+  session = FakeSession(21600)
+  session.instruction = "Route the cable tray, busway and chilled water."
+  FakeAgent.reset(
+      scripts={
+          "planner": ["p"],
+          "worker": ["worker summary"],
+          "verifier": ["PASS", "PASS"],
+      },
+      bash_outputs=[
+          "exit code 0\nIFC_GATE: SKIP (no .ifc files under output/)",
+          "exit code 0\nCONN tray: 1 segment(s), 23000 mm total\n"
+          "CONN FAIL: tray: only 1 segment (23000 mm)\nCONN_GATE: FAIL",
+          "exit code 0\nIFC_GATE: SKIP (no .ifc files under output/)",
+          "exit code 0\nCONN tray: 5 segment(s)\nCONN_GATE: PASS",
+      ],
+  )
+  real = serve.Agent
+  serve.Agent = FakeAgent
+  try:
+    result = await serve.solve(session)
+  finally:
+    serve.Agent = real
+  worker = FakeAgent.first("worker")
+  check("one conn gate fix round", len(worker.resumes) == 1, worker.resumes)
+  check("gate text passed to worker",
+        "only 1 segment" in worker.resumes[0], worker.resumes[0])
+  check("result verified",
+        result.endswith("Independent verification: PASS."), repr(result))
+
+
+def test_routing_prompts():
+  print("routing prompt guides and verifier checklist")
+  session = FakeSession(21600)
+  session.instruction = "Route the cable tray, busway and chilled water in the data hall."
+  worker = serve.Agent(session, role="worker")
+  prompt = worker.system_prompt("")
+  check("routing guide present", "one header per row" in prompt)
+  check("busway class rule", "never IfcElectricDistributionBoard" in prompt)
+  check("routing.json contract", "output/routing.json" in prompt)
+  check("PNG reader present", "def read_png" in prompt)
+  verifier = serve.Agent(session, role="verifier")
+  vprompt = verifier.system_prompt("")
+  check("verifier connectivity checklist",
+        "recompute the route geometry" in vprompt)
+  check("verifier quotes numbers", "a PASS that does not quote them" in vprompt)
+  check("verifier gets the IFC snippet",
+        "ifcopenshell.validate.validate(model, _log, express_rules=True)"
+        in vprompt)
+  check("verifier gets the routing guide", "one header per row" in vprompt)
+  session2 = FakeSession(21600)
+  session2.instruction = "Design a steel frame."
+  worker2 = serve.Agent(session2, role="worker")
+  check("no routing guide without routing",
+        "one header per row" not in worker2.system_prompt(""))
+  check("no PNG reader without routing",
+        "def read_png" not in worker2.system_prompt(""))
+
+
+def _build_test_ifc(path, segments):
+  """Builds a minimal IFC4 file with the given route segments.
+
+  segments: list of (cls, name, w, d, h, x, y, z) boxes in the agent's
+  style (long profile, short extrusion, unrotated placement).
+  """
+  import ifcopenshell
+
+  model = ifcopenshell.file(schema="IFC4")
+  units = model.create_entity(
+      'IfcUnitAssignment', Units=[
+          model.create_entity('IfcSIUnit', UnitType='LENGTHUNIT', Prefix='MILLI', Name='METRE'),
+      ])
+  project = model.create_entity('IfcProject', GlobalId=ifcopenshell.guid.new(),
+                                Name='Test', UnitsInContext=units)
+  storey = model.create_entity('IfcBuildingStorey', GlobalId=ifcopenshell.guid.new(),
+                               Name='GF', Elevation=0.0)
+  axis_world = model.create_entity(
+      'IfcAxis2Placement3D',
+      Location=model.create_entity('IfcCartesianPoint', Coordinates=[0.0, 0.0, 0.0]))
+  context = model.create_entity(
+      'IfcGeometricRepresentationContext', ContextIdentifier='Model',
+      ContextType='Model', CoordinateSpaceDimension=3, Precision=0.01,
+      WorldCoordinateSystem=axis_world)
+  for cls, name, w, d, h, x, y, z in segments:
+    half_w, half_d = w / 2.0, d / 2.0
+    pt = model.create_entity('IfcCartesianPoint', Coordinates=[float(x), float(y), float(z)])
+    placement = model.create_entity(
+        'IfcLocalPlacement',
+        RelativePlacement=model.create_entity('IfcAxis2Placement3D', Location=pt))
+    profile = model.create_entity(
+        'IfcArbitraryClosedProfileDef', ProfileType='AREA',
+        OuterCurve=model.create_entity('IfcPolyLine', Points=[
+            model.create_entity('IfcCartesianPoint', Coordinates=[-half_w, -half_d]),
+            model.create_entity('IfcCartesianPoint', Coordinates=[half_w, -half_d]),
+            model.create_entity('IfcCartesianPoint', Coordinates=[half_w, half_d]),
+            model.create_entity('IfcCartesianPoint', Coordinates=[-half_w, half_d]),
+            model.create_entity('IfcCartesianPoint', Coordinates=[-half_w, -half_d]),
+        ]))
+    solid = model.create_entity(
+        'IfcExtrudedAreaSolid', SweptArea=profile,
+        Position=model.create_entity(
+            'IfcAxis2Placement3D',
+            Location=model.create_entity('IfcCartesianPoint', Coordinates=[0.0, 0.0, 0.0])),
+        ExtrudedDirection=model.create_entity('IfcDirection', DirectionRatios=[0.0, 0.0, 1.0]),
+        Depth=float(h))
+    shape = model.create_entity(
+        'IfcShapeRepresentation', ContextOfItems=context,
+        RepresentationIdentifier='Body', RepresentationType='SweptSolid', Items=[solid])
+    product = model.create_entity(
+        cls, GlobalId=ifcopenshell.guid.new(), Name=name,
+        ObjectPlacement=placement,
+        Representation=model.create_entity('IfcProductDefinitionShape', Representations=[shape]))
+    model.create_entity(
+        'IfcRelContainedInSpatialStructure', GlobalId=ifcopenshell.guid.new(),
+        RelatingStructure=storey, RelatedElements=[product])
+  model.write(path)
+
+
+def test_conn_gate_real_ifc():
+  print("connectivity gate on real IFC files")
+  try:
+    import ifcopenshell  # noqa: F401
+  except ImportError:
+    print("  skipped: ifcopenshell not installed")
+    return
+  import json
+  import subprocess
+  import tempfile
+
+  def run_gate(workdir):
+    script = os.path.join(workdir, "conn_gate.py")
+    with open(script, "w") as f:
+      f.write(serve.CONN_GATE_SCRIPT)
+    r = subprocess.run([sys.executable, script], cwd=workdir,
+                       capture_output=True, text=True)
+    return r.stdout + r.stderr
+
+  with tempfile.TemporaryDirectory() as tmp:
+    # Good: a connected route (feeder + header per service, one CHW drop).
+    outdir = os.path.join(tmp, "good", "output")
+    os.makedirs(outdir)
+    _build_test_ifc(os.path.join(outdir, "model.ifc"), [
+        ('IfcCableCarrierSegment', 'CableTray-1', 1800, 600, 300, 1100, 3360, 2600),
+        ('IfcCableCarrierSegment', 'CableTray-2', 600, 1640, 300, 2000, 4180, 2600),
+        ('IfcCableCarrierSegment', 'Busway-1', 1800, 600, 300, 1100, 3960, 2600),
+        ('IfcCableCarrierSegment', 'Busway-2', 600, 1640, 300, 2000, 4780, 2600),
+        ('IfcPipeSegment', 'CHW-1', 1800, 600, 300, 1100, 2760, 2600),
+        ('IfcPipeSegment', 'CHW-2', 600, 2240, 300, 2000, 3880, 2600),
+        ('IfcPipeSegment', 'CHW-Drop-1', 300, 300, 1600, 2000, 5000, 1000),
+    ])
+    json.dump({
+        'entry': [200, 3360, 0],
+        'rows': [{'name': 'A', 'start': [1100, 3360, 0], 'end': [2000, 3360, 0]}],
+        'crahs': [[2000, 5000, 0]],
+    }, open(os.path.join(outdir, "routing.json"), "w"))
+    out = run_gate(os.path.join(tmp, "good"))
+    check("good route passes", "CONN_GATE: PASS" in out, out)
+
+    # Run-6 replica: one box per service, busway as a board.
+    outdir = os.path.join(tmp, "run6", "output")
+    os.makedirs(outdir)
+    _build_test_ifc(os.path.join(outdir, "model.ifc"), [
+        ('IfcCableCarrierSegment', 'CableTray', 23000, 600, 300, 13500, 10100, 2600),
+        ('IfcElectricDistributionBoard', 'Busway', 23000, 400, 300, 13500, 10700, 2600),
+        ('IfcPipeSegment', 'CHWPipe', 23000, 300, 300, 13500, 7000, 2800),
+    ])
+    out = run_gate(os.path.join(tmp, "run6"))
+    check("run-6 replica fails", "CONN_GATE: FAIL" in out, out)
+    check("run-6 replica catches the single box", "only 1 segment" in out, out)
+    check("run-6 replica catches the busway class",
+          "busway modelled as IfcElectricDistributionBoard" in out, out)
+
+    # Disconnected: two tray segments 1000 mm apart.
+    outdir = os.path.join(tmp, "disc", "output")
+    os.makedirs(outdir)
+    _build_test_ifc(os.path.join(outdir, "model.ifc"), [
+        ('IfcCableCarrierSegment', 'CableTray-1', 11800, 600, 300, 6100, 5000, 2600),
+        ('IfcCableCarrierSegment', 'CableTray-2', 12000, 600, 300, 19000, 5000, 2600),
+        ('IfcCableCarrierSegment', 'Busway-1', 24800, 600, 300, 12600, 5000, 2600),
+        ('IfcPipeSegment', 'CHW-1', 24800, 600, 300, 12600, 5000, 2600),
+    ])
+    out = run_gate(os.path.join(tmp, "disc"))
+    check("disconnected route fails", "CONN_GATE: FAIL" in out, out)
+    check("disconnected route caught", "2 disconnected components" in out, out)
+
+
 async def main():
   await test_long_task_pass_first_try()
   await test_gaps_then_fix_then_pass()
@@ -397,6 +612,10 @@ async def main():
   await test_ifc_gate()
   await test_gate_blocks_pass_then_fix()
   test_prompts()
+  await test_conn_gate()
+  await test_conn_gate_blocks_pass_then_fix()
+  test_routing_prompts()
+  test_conn_gate_real_ifc()
   print("ALL TESTS PASSED")
 
 
