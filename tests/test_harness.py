@@ -127,7 +127,11 @@ async def test_long_task_pass_first_try():
         FakeAgent.first("worker").phase_seconds)
   check("worker got plan", FakeAgent.first("worker").plan == "the plan")
   check("verifier got context",
-        FakeAgent.first("verifier").context == "worker summary")
+        FakeAgent.first("verifier").context.startswith("worker summary"))
+  check("verifier got gate verdict",
+        "Deterministic gate results" in FakeAgent.first("verifier").context
+        and "IFC gate: no failures reported"
+        in FakeAgent.first("verifier").context)
   check("result",
         result == "worker summary\n\nIndependent verification: PASS.",
         repr(result))
@@ -443,6 +447,110 @@ async def test_conn_gate_blocks_pass_then_fix():
         "only 1 segment" in worker.resumes[0], worker.resumes[0])
   check("result verified",
         result.endswith("Independent verification: PASS."), repr(result))
+
+
+async def test_gates_run_in_parallel_and_merge():
+  print("SEP and CONN gates both fail in one round, both reach the fix")
+  session = FakeSession(21600)
+  session.instruction = "Route the cable tray, busway and chilled water."
+  FakeAgent.reset(
+      scripts={
+          "planner": ["p"],
+          "worker": ["worker summary"],
+          "verifier": ["PASS", "PASS"],
+      },
+      bash_outputs=[
+          # Round 1: IFC passes, SEP and CONN both fail — consumed in
+          # IFC, SEP, CONN order by asyncio.gather.
+          "exit code 0\nIFC_GATE: PASS (1 file(s), 0 EXPRESS violations)",
+          "exit code 0\nSEP collisions: 75\n"
+          "SEP FAIL: 75 clashes (boxes overlapping > 2 mm on all axes)\n"
+          "SEP_GATE: FAIL",
+          "exit code 0\nCONN tray: 1 segment(s), 23000 mm total\n"
+          "CONN FAIL: tray: only 1 segment (23000 mm)\nCONN_GATE: FAIL",
+          # Round 2: all three gates pass.
+          "exit code 0\nIFC_GATE: PASS (1 file(s), 0 EXPRESS violations)",
+          "exit code 0\nSEP collisions: 0\nSEP_GATE: PASS",
+          "exit code 0\nCONN tray: 5 segment(s)\nCONN_GATE: PASS",
+      ],
+  )
+  real = serve.Agent
+  serve.Agent = FakeAgent
+  try:
+    result = await serve.solve(session)
+  finally:
+    serve.Agent = real
+  worker = FakeAgent.first("worker")
+  check("one merged fix round", len(worker.resumes) == 1, worker.resumes)
+  check("SEP gaps reached the worker",
+        "75 clashes" in worker.resumes[0], worker.resumes[0])
+  check("CONN gaps reached the worker",
+        "only 1 segment" in worker.resumes[0], worker.resumes[0])
+  check("fix prompt demands gate numbers",
+        "quote the gate numbers" in worker.resumes[0], worker.resumes[0])
+  check("verifier saw both gate failures",
+        "Separation gate: FAIL" in FakeAgent.first("verifier").context
+        and "Connectivity gate: FAIL"
+        in FakeAgent.first("verifier").context)
+  check("result verified",
+        result.endswith("Independent verification: PASS."), repr(result))
+  check("no gate verdict appended when clean",
+        "Deterministic gates:" not in result, repr(result))
+
+
+async def test_gate_verdict_appended_when_rounds_run_out():
+  print("gate verdict is appended to the summary when rounds run out")
+  session = FakeSession(21600)
+  session.instruction = "Route the cable tray, busway and chilled water."
+  FakeAgent.reset(
+      scripts={
+          "planner": ["p"],
+          "worker": ["worker summary"],
+          "verifier": ["PASS", "PASS", "PASS"],
+      },
+      bash_outputs=[
+          "exit code 0\nIFC_GATE: PASS (1 file(s), 0 EXPRESS violations)",
+          "exit code 0\nSEP collisions: 75\n"
+          "SEP FAIL: 75 clashes (boxes overlapping > 2 mm on all axes)\n"
+          "SEP_GATE: FAIL",
+          "exit code 0\nCONN_GATE: PASS",
+      ] * 3,
+  )
+  real = serve.Agent
+  serve.Agent = FakeAgent
+  try:
+    result = await serve.solve(session)
+  finally:
+    serve.Agent = real
+  check("two fix rounds used",
+        len(FakeAgent.first("worker").resumes) == 2,
+        FakeAgent.first("worker").resumes)
+  check("gate verdict appended",
+        "Deterministic gates:" in result, repr(result))
+  check("SEP failure named in the summary",
+        "Separation gate: FAIL" in result, repr(result))
+  check("not marked verified",
+        "Independent verification: PASS." not in result, repr(result))
+
+
+def test_merge_gate_gaps():
+  print("gate gap merging and clipping")
+  check("empty merge", serve._merge_gate_gaps("", "", "") == "")
+  check("one gate kept", serve._merge_gate_gaps("", "SEP FAIL: 3", "") == "SEP FAIL: 3")
+  merged = serve._merge_gate_gaps("IFC FAIL: x", "SEP FAIL: y", "CONN FAIL: z")
+  check("all gates kept in order",
+        merged.index("IFC") < merged.index("SEP") < merged.index("CONN"),
+        merged)
+  long = "x" * 5000
+  check("total capped near 4000",
+        len(serve._merge_gate_gaps(long, long, long)) <= 4100)
+  verdict = serve._gate_verdict_lines("IFC FAIL: 3", "", "", True)
+  check("verdict names the failing gate",
+        "IFC gate: FAIL" in verdict and "Separation gate: no failures reported"
+        in verdict, verdict)
+  verdict = serve._gate_verdict_lines("", "", "", False)
+  check("non-routing gates not applicable",
+        "not applicable" in verdict, verdict)
 
 
 def test_routing_prompts():
@@ -782,6 +890,47 @@ def test_sep_gate_real_ifc():
           "below the sprinklers" in out, out)
 
 
+def test_sep_gate_z_band_and_drop():
+  print("separation gate tier overlap and drop branch guidance")
+  try:
+    import ifcopenshell  # noqa: F401
+  except ImportError:
+    print("  skipped: ifcopenshell not installed")
+    return
+  import tempfile
+
+  with tempfile.TemporaryDirectory() as tmp:
+    # Two services on the same tier with the same plan footprint: they
+    # clash, and the gate must name the shared z band as the cause.
+    outdir = os.path.join(tmp, "flat", "output")
+    os.makedirs(outdir)
+    _build_test_ifc(os.path.join(outdir, "model.ifc"), [
+        ('IfcCableCarrierSegment', 'CableTray-1', 10000, 600, 150, 5000, 5000, 2850),
+        ('IfcCableCarrierSegment', 'Busway-1', 10000, 600, 150, 5000, 5000, 2850),
+    ])
+    out = _run_sep_gate(os.path.join(tmp, "flat"))
+    check("flat tiers clash", "SEP collisions: 1" in out, out)
+    check("z band named as the cause",
+          "tray and busway share z 2850-3000" in out, out)
+    check("flat tiers fail", "SEP_GATE: FAIL" in out, out)
+
+    # A drop far from any header: the gate must name the nearest
+    # horizontal segment and tell the fix to build a branch.
+    outdir = os.path.join(tmp, "drop", "output")
+    os.makedirs(outdir)
+    _build_test_ifc(os.path.join(outdir, "model.ifc"), [
+        ('IfcPipeSegment', 'CHW-1', 10000, 600, 150, 5000, 5000, 2800),
+        ('IfcPipeSegment', 'CHW-Drop-1', 300, 300, 2000, 15000, 15000, 800),
+    ])
+    out = _run_sep_gate(os.path.join(tmp, "drop"))
+    check("hanging drop caught", "does not hang from the header" in out, out)
+    check("nearest segment named",
+          "nearest horizontal segment is CHW-1" in out, out)
+    check("branch guidance given",
+          "build a horizontal branch" in out, out)
+    check("direction given", "to the south" in out, out)
+
+
 async def main():
   await test_long_task_pass_first_try()
   await test_gaps_then_fix_then_pass()
@@ -802,6 +951,10 @@ async def main():
   test_conn_gate_real_ifc()
   await test_sep_gate()
   test_sep_gate_real_ifc()
+  test_sep_gate_z_band_and_drop()
+  test_merge_gate_gaps()
+  await test_gates_run_in_parallel_and_merge()
+  await test_gate_verdict_appended_when_rounds_run_out()
   print("ALL TESTS PASSED")
 
 

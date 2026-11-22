@@ -206,7 +206,10 @@ never accept "0 overlaps" from a tool that did not actually measure anything. Wh
 produced .ifc yourself — do not take it from reconciliation.json or the worker's summary: segment count and total \
 length per service, the entity class of every route segment, the distance from each service's nearest segment to \
 the entry, per-row coverage, and CRAH reach. Quote those numbers in your reply; a PASS that does not quote them \
-is not a pass. Re-run output/solution.py yourself so the deliverable regenerates. If everything holds, reply with \
+is not a pass. The deterministic gate results are in your context too — quote their numbers (clash count, \
+separation, entry distance, coverage) in your reply; a PASS that does not mention them is not a pass, and a \
+collision check that printed a count but measured no geometry is a failed measurement, not a pass. Re-run \
+output/solution.py yourself so the deliverable regenerates. If everything holds, reply with \
 the single word PASS and nothing else. Otherwise reply with a numbered list of the gaps, each specific enough to \
 fix. You have about {minutes} minutes for this checking step."""
 
@@ -267,9 +270,20 @@ cause of clashes. The unrotated box style above cannot make this mistake.
 a box whose bottom is the CRAH top and whose top reaches the header — never place a drop at the header and \
 extrude upward:
   create_box_extrusion(w, w, z_top - z_bottom, x, y, z_bottom)  # drop from header z_top down to CRAH top z_bottom
-- Keep the three services on separate tiers: tray, busway and CHW at different heights (at least 300 mm apart \
-in z where they share a corridor), each top at least 460 mm below the sprinklers and each bottom above the \
-2600 mm clear height. A feeder must not pass through a column: route around it.
+- Every CRAH needs a horizontal branch from the nearest header or trunk to the CRAH's (x, y), then a drop down \
+from the branch end. A CRAH directly below a trunk still needs a branch — first measure the trunk's extent; \
+if the CRAH's position is outside it, build a branch. Never skip a branch because the CRAH's x matches the \
+trunk's x: a trunk that ends short of the CRAH's y leaves the drop hanging in mid-air. A drop whose top is \
+not within 250 mm of a horizontal segment of the same service is not connected, even if it happens to touch \
+another segment.
+- Keep the three services on separate tiers at fixed heights: tray at z=3400, busway at z=3100, CHW at \
+z=2800 (each top at least 460 mm below the sprinklers and each bottom above the 2600 mm clear height). These \
+are the heights to use unless a drawing gives you different ones. An X corridor does NOT separate services: \
+it only separates trunks running along Y — headers running along X cross the whole hall on the same row and \
+overlap along their full length unless the services are on different tiers. And centreline spacing is not \
+edge spacing: two 600 mm wide trunks whose centrelines are 400 mm apart overlap by 200 mm. Subtract the box \
+width from the centreline spacing before claiming a separation. A feeder must not pass through a column: \
+route around it.
 - Name every route segment clearly (CableTray-1, Busway-1, CHW-1, ...).
 - Write output/routing.json next to the model, with the numbers you actually used: {"entry": [x, y, z], "rows": \
 [{"name": "A", "start": [x, y, z], "end": [x, y, z]}, ...], "crahs": [[x, y, z], ...]}. Then run a connectivity \
@@ -2604,6 +2618,15 @@ def _pt_seg_dist(p, a, b):
     return math.sqrt(sum((p[i] - q[i]) ** 2 for i in range(3)))
 
 
+def _closest_point(p, a, b):
+    '''Closest point on segment a-b to point p.'''
+    ab = _sub(b, a)
+    denom = sum(x * x for x in ab)
+    t = 0.0 if denom == 0 else max(
+        0.0, min(1.0, sum((p[i] - a[i]) * ab[i] for i in range(3)) / denom))
+    return _add(a, _scale(ab, t))
+
+
 def _endpoints(centre, axes):
     d, half = max(axes, key=lambda a: a[1])
     return _sub(centre, _scale(d, half)), _add(centre, _scale(d, half))
@@ -2671,7 +2694,38 @@ def main():
         print(f"SEP   {' x '.join(key)}: {clashes[key]}")
     if total:
         problems.append(f"{total} clashes (boxes overlapping > {CLASH_TOL:.0f} mm on all axes) — joints must be butt joints (0 mm overlap) or leave a gap, never overlapping boxes")
-    # 2. Profile orientation: a horizontal route segment's vertical extent
+    # 2. Tier separation: when there are clashes, say why — two services
+    # sharing a z band over the same plan area clash along their whole
+    # length. An X corridor does not separate X-running headers; only
+    # different tiers do. This is a root-cause note, not an independent
+    # failure: it only fires when clashes already exist, so a clean model
+    # whose services share a band in different corridors still passes.
+    if total:
+        bands = {}
+        plans = {}
+        for product, svc, centre, axes, a_min, a_max in items:
+            if svc not in ('tray', 'busway', 'chw'):
+                continue
+            z0, z1 = bands.get(svc, (a_min[2], a_max[2]))
+            bands[svc] = (min(z0, a_min[2]), max(z1, a_max[2]))
+            x0, y0, x1, y1 = plans.get(
+                svc, (a_min[0], a_min[1], a_max[0], a_max[1]))
+            plans[svc] = (min(x0, a_min[0]), min(y0, a_min[1]),
+                          max(x1, a_max[0]), max(y1, a_max[1]))
+        for a, b in (('tray', 'busway'), ('tray', 'chw'), ('busway', 'chw')):
+            if a not in bands or b not in bands:
+                continue
+            z_overlap = min(bands[a][1], bands[b][1]) - max(bands[a][0], bands[b][0])
+            if z_overlap <= CLASH_TOL:
+                continue
+            plan_x = min(plans[a][2], plans[b][2]) - max(plans[a][0], plans[b][0])
+            plan_y = min(plans[a][3], plans[b][3]) - max(plans[a][1], plans[b][1])
+            if plan_x <= CLASH_TOL or plan_y <= CLASH_TOL:
+                continue
+            problems.append(
+                f"{a} and {b} share z {max(bands[a][0], bands[b][0]):.0f}-{min(bands[a][1], bands[b][1]):.0f} over the same plan area — separate them into different tiers (tray z=3400, busway z=3100, CHW z=2800)")
+            break
+    # 3. Profile orientation: a horizontal route segment's vertical extent
     # must be its profile height (the smaller profile dimension), not its width.
     for product, svc, centre, axes, a_min, a_max in items:
         if svc not in ('tray', 'busway', 'chw'):
@@ -2686,8 +2740,10 @@ def main():
             problems.append(
                 f"{svc} segment {product.Name or product.is_a()} is {vertical:.0f} mm tall but its profile is only {expect:.0f} mm high — the profile is oriented wrong (width standing vertical)")
             break
-    # 3. Drops must go down: a vertical route segment's top must hang from
-    # another segment of the same service (a header or a riser).
+    # 4. Drops must go down: a vertical route segment's top must hang from
+    # a horizontal segment of the same service (a header or trunk). A drop
+    # that only touches a riser is not hung. Name the nearest horizontal
+    # segment and where to build the branch, so the fix knows what to do.
     for product, svc, centre, axes, a_min, a_max in items:
         if svc not in ('tray', 'busway', 'chw'):
             continue
@@ -2696,17 +2752,37 @@ def main():
             continue  # horizontal: skip
         top = (centre[0], centre[1], a_max[2])
         nearest = None
+        nearest_name = None
+        nearest_ends = None
         for p2, s2, c2, ax2, mn2, mx2 in items:
             if s2 != svc or p2 is product:
                 continue
+            longest2 = max(ax2, key=lambda a: a[1])
+            if abs(longest2[0][2]) > 0.5:
+                continue  # a riser: a drop hangs from a header, not a riser
             e1, e2 = _endpoints(c2, ax2)
             d = _pt_seg_dist(top, e1, e2)
-            nearest = d if nearest is None else min(nearest, d)
+            if nearest is None or d < nearest:
+                nearest = d
+                nearest_name = p2.Name or p2.is_a()
+                nearest_ends = (e1, e2)
         if nearest is None or nearest > 250.0:
-            problems.append(
-                f"{svc} vertical segment {product.Name or product.is_a()} does not hang from the header (top is {nearest if nearest is not None else -1:.0f} mm from the nearest horizontal segment) — drops must go down to the load")
+            if nearest_ends is not None:
+                e1, e2 = nearest_ends
+                closest = _closest_point(top, e1, e2)
+                dx = closest[0] - top[0]
+                dy = closest[1] - top[1]
+                if abs(dx) >= abs(dy):
+                    direction = 'east' if dx > 0 else 'west'
+                else:
+                    direction = 'north' if dy > 0 else 'south'
+                problems.append(
+                    f"{svc} vertical segment {product.Name or product.is_a()} at ({top[0]:.0f},{top[1]:.0f}) does not hang from the header: nearest horizontal segment is {nearest_name}, its closest point is ({closest[0]:.0f},{closest[1]:.0f}), {nearest:.0f} mm away to the {direction} — build a horizontal branch from that segment to ({top[0]:.0f},{top[1]:.0f}) at the header height, then drop down")
+            else:
+                problems.append(
+                    f"{svc} vertical segment {product.Name or product.is_a()} does not hang from the header: no horizontal {svc} segment exists — build a header first, then a branch to the drop")
             break
-    # 4. Sprinkler clearance: every route top must be >= 460 mm below the
+    # 5. Sprinkler clearance: every route top must be >= 460 mm below the
     # lowest sprinkler.
     sprinklers = [it for it in items if it[1] == 'sprinkler']
     if sprinklers:
@@ -2718,7 +2794,7 @@ def main():
                 problems.append(
                     f"{svc} segment {product.Name or product.is_a()} tops at {a_max[2]:.0f} mm, only {lowest - a_max[2]:.0f} mm below the sprinklers (needs {SPRINKLER_CLEAR:.0f} mm)")
                 break
-    # 5. Clear height: horizontal route segments must stay above 2600 mm.
+    # 6. Clear height: horizontal route segments must stay above 2600 mm.
     for product, svc, centre, axes, a_min, a_max in items:
         if svc not in ('tray', 'busway', 'chw'):
             continue
@@ -2808,6 +2884,68 @@ async def _connectivity_gate(worker: Agent) -> str:
   return clip(out, 4000)
 
 
+def _merge_gate_gaps(*gap_texts: str) -> str:
+  """Merges gate failure texts into one fix-round prompt.
+
+  Each gate is clipped to ~1500 chars and the total to 4000, so one verbose
+  gate cannot crowd out the others. The order is the priority order: IFC,
+  then separation, then connectivity (then the verifier's own gaps, when
+  the caller merges those in too).
+
+  Args:
+    gap_texts: Failure texts from the gates ("" when a gate passed).
+
+  Returns:
+    The merged text, or "" when every gate passed.
+  """
+  parts = [clip(g, 1500) for g in gap_texts if g]
+  if not parts:
+    return ""
+  return clip("\n".join(parts), 4000)
+
+
+def _gate_verdict_lines(
+    ifc_gaps: str, sep_gaps: str, conn_gaps: str, is_routing: bool
+) -> str:
+  """One summary line per gate, for the verifier's context and the final summary.
+
+  A gate returns "" when it passes, when the task is not a routing task, or
+  when it could not run — those cases are not distinguished, so a clean gate
+  is reported as "no failures reported", never as a pass.
+
+  Args:
+    ifc_gaps: IFC gate failure text, "" when clean.
+    sep_gaps: Separation gate failure text, "" when clean.
+    conn_gaps: Connectivity gate failure text, "" when clean.
+    is_routing: Whether the task is a routing task (the separation and
+      connectivity gates only run on those).
+
+  Returns:
+    Three lines, one per gate.
+  """
+  lines = []
+  for name, gaps, applicable in (
+      ("IFC", ifc_gaps, True),
+      ("Separation", sep_gaps, is_routing),
+      ("Connectivity", conn_gaps, is_routing),
+  ):
+    if not applicable:
+      lines.append(f"{name} gate: not applicable (not a routing task)")
+    elif gaps:
+      # The most informative failure line: the "FAIL: <detail>" line when
+      # the gate has one, else the first line (the IFC gate's first line
+      # already names the violations; the separation gate's first line is
+      # only a product count).
+      detail = next(
+          (line for line in gaps.strip().splitlines() if "FAIL:" in line),
+          gaps.strip().splitlines()[0],
+      )[:200]
+      lines.append(f"{name} gate: FAIL — {detail}")
+    else:
+      lines.append(f"{name} gate: no failures reported")
+  return "\n".join(lines)
+
+
 async def solve(session: taskbridge.Session) -> str:
   """Runs plan, work, verify, and fix phases and returns the final answer.
 
@@ -2846,27 +2984,48 @@ async def solve(session: taskbridge.Session) -> str:
   if not summary:
     return session.final_message
   verified = False
+  is_routing = any(
+      k in session.instruction.lower() for k in ROUTING_KEYWORDS
+  )
+  last_gate_gaps = ""
+  last_gate_verdict = ""
   for round_no in range(MAX_FIX_ROUNDS + 1):
     left = session.time_left()
     if left is not None and left < MIN_VERIFY_SEC:
       break
     await session.log(f"verify phase: round {round_no + 1}")
+    # Run all three deterministic gates in parallel FIRST, every round,
+    # whether or not the verifier passes: the verifier judges with their
+    # numbers in hand instead of judging blind. A gate that never runs
+    # cannot teach the agent — on run 8 the connectivity gate ran 0 times
+    # because the separation gate kept failing and the old chain
+    # short-circuited, so the entry was never checked.
+    ifc_gaps, sep_gaps, conn_gaps = await asyncio.gather(
+        _ifc_gate(worker), _separation_gate(worker), _connectivity_gate(worker)
+    )
+    last_gate_gaps = _merge_gate_gaps(ifc_gaps, sep_gaps, conn_gaps)
+    last_gate_verdict = _gate_verdict_lines(
+        ifc_gaps, sep_gaps, conn_gaps, is_routing
+    )
     reply = await _run_phase(
         session,
         "verify",
-        Agent(session, role="verifier", plan=plan, context=summary),
+        Agent(
+            session,
+            role="verifier",
+            plan=plan,
+            context=summary
+            + "\n\nDeterministic gate results (quote these numbers):\n"
+            + last_gate_verdict,
+        ),
     )
     session.final_message = summary  # the verifier's text is not the summary
     passed, gaps = _verdict(reply)
-    if passed:
-      # The verifier passed: run the deterministic gates before accepting
-      # it. A gate failure becomes gaps for a fix round, like any other.
-      gaps = await _ifc_gate(worker)
-      if not gaps:
-        gaps = await _separation_gate(worker)
-      if not gaps:
-        gaps = await _connectivity_gate(worker)
-      passed = not gaps
+    if last_gate_gaps:
+      # The gates' gaps join the verifier's (or replace them when the
+      # verifier passed): a gate failure is a fix round, like any other.
+      gaps = _merge_gate_gaps(gaps, last_gate_gaps) if gaps else last_gate_gaps
+      passed = False
     if passed:
       verified = True
       break
@@ -2878,12 +3037,20 @@ async def solve(session: taskbridge.Session) -> str:
     await session.log(f"fix round {round_no + 1}: {len(gaps)} chars of gaps")
     summary = await worker.resume(
         "An independent check of your deliverables found these gaps. Fix each"
-        f" one, then answer with your updated summary:\n{gaps}"
+        " one, then answer with your updated summary. Your new summary must"
+        " quote the gate numbers below (clash count, separation, entry"
+        " distance, coverage) verbatim and must not claim anything the gates"
+        f" deny:\n{gaps}"
     )
     if not summary:
       summary = session.final_message
   if verified:
     summary += "\n\nIndependent verification: PASS."
+  # Append the last round's gate verdict so the submitted summary always
+  # carries the deterministic checks' conclusion, even when the fix
+  # rounds ran out and the final model still fails a gate.
+  if last_gate_gaps:
+    summary += "\n\nDeterministic gates:\n" + last_gate_verdict
   return summary
 
 
