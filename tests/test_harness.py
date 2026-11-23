@@ -75,6 +75,11 @@ class FakeAgent:
   scripts = {}
   fail_roles = set()
   bash_outputs = []
+  # The standalone check's canned result: PASS by default, so existing
+  # solve() tests are unaffected; a test can set it to a failing run
+  # (the run-12 defect: solution.py opens ground_truth.json at runtime).
+  standalone_result = "STANDALONE_EXIT:0\nSTANDALONE_IFC:OK"
+  standalone_tail = "(no log)"
 
   def __init__(
       self,
@@ -115,16 +120,30 @@ class FakeAgent:
       # operation in the task container, not a gate measurement. Pretend it
       # worked so it never consumes a canned gate output.
       return "SNAPSHOT_OK"
+    if "cp output/solution.py" in command and "/tmp/standalone" in command:
+      # The standalone check runs solution.py alone in a clean directory;
+      # the canned result stands in for the run. Never consumes a gate
+      # output.
+      return FakeAgent.standalone_result
+    if "tail -5 /tmp/standalone" in command:
+      # The log tail the standalone check reads when it fails.
+      return FakeAgent.standalone_tail
     if FakeAgent.bash_outputs:
       return FakeAgent.bash_outputs.pop(0)
     return "exit code 0\nIFC_GATE: SKIP (no .ifc files under output/)"
 
   @classmethod
-  def reset(cls, scripts=None, fail_roles=None, bash_outputs=None):
+  def reset(cls, scripts=None, fail_roles=None, bash_outputs=None,
+            standalone_result=None, standalone_tail=None):
     cls.instances = []
     cls.scripts = dict(scripts or {})
     cls.fail_roles = set(fail_roles or ())
     cls.bash_outputs = list(bash_outputs or [])
+    cls.standalone_result = (
+        standalone_result if standalone_result is not None
+        else "STANDALONE_EXIT:0\nSTANDALONE_IFC:OK")
+    cls.standalone_tail = (
+        standalone_tail if standalone_tail is not None else "(no log)")
 
   @classmethod
   def roles(cls):
@@ -446,6 +465,7 @@ def test_regression_guard():
   base = {
       "unit_ok": True, "ifc_ok": True, "frame_ok": True,
       "clashes": 1, "max_components": 5, "rows_below_80": 0,
+      "components": {"tray": 5, "busway": 5, "chw": 5},
   }
   check("same scores are not a regression",
         not serve._is_regression(base, dict(base)))
@@ -458,10 +478,28 @@ def test_regression_guard():
   check("frame flipped to FAIL is a regression",
         serve._is_regression(base, {**base, "frame_ok": False}))
   check("components up without clash cut is a regression",
-        serve._is_regression(base, {**base, "max_components": 8}))
-  check("components up with clash cut is not a regression",
-        not serve._is_regression(
-            base, {**base, "max_components": 8, "clashes": 0}))
+        serve._is_regression(base, {**base, "max_components": 8,
+                                    "components": {"tray": 8, "busway": 5,
+                                                   "chw": 5}}))
+  # Run 12: a fix cut clashes 92 -> 0 by shortening segments short of
+  # their neighbours (tray 1 -> 7, CHW 4 -> 8). The old rule let it
+  # through because the clash cut "paid" for the disconnect; a
+  # disconnected network scores 0 as surely as a clashing one, so any
+  # per-service component rise is a regression now, even with a clash cut.
+  check("components up with clash cut is a regression now",
+        serve._is_regression(base, {**base, "max_components": 8,
+                                    "components": {"tray": 8, "busway": 5,
+                                                   "chw": 5},
+                                    "clashes": 0}))
+  check("one service up is a regression even when others are flat",
+        serve._is_regression(base, {**base,
+                                    "components": {"tray": 5, "busway": 5,
+                                                   "chw": 6}}))
+  check("components down is not a regression",
+        not serve._is_regression(base, {**base, "max_components": 3,
+                                        "components": {"tray": 3,
+                                                       "busway": 3,
+                                                       "chw": 3}}))
   check("inconclusive scores give no vector",
         serve._gate_score_vector({}, {}, {}, {}) is None)
   check("score vector built",
@@ -471,7 +509,8 @@ def test_regression_guard():
             {"clashes": 10, "frame_ok": True, "frame_outside": 0},
             {"components": {"tray": 5}, "rows_below_80": 2})
         == {"unit_ok": True, "ifc_ok": True, "frame_ok": True,
-            "clashes": 10, "max_components": 5, "rows_below_80": 2})
+            "clashes": 10, "max_components": 5,
+            "components": {"tray": 5}, "rows_below_80": 2})
 
 
 async def test_gate_blocks_pass_then_fix():
@@ -1586,6 +1625,368 @@ def test_fallback_solution():
           r.stdout + r.stderr)
 
 
+async def test_standalone_check_blocks_submission():
+  print("standalone check catches a script that opens ground_truth.json")
+  # The run-12 defect: solution.py reads ground_truth.json at runtime and
+  # dies in the grader's empty directory (0.0 in 0.4 s). The gates pass and
+  # the verifier passes, but the standalone check fails every round; the
+  # fix rounds cannot fix it (the canned worker never rewrites the
+  # script), so with the rounds spent the harness replaces it with the
+  # fallback instead of submitting a script that cannot run.
+  session = FakeSession(21600)
+  session.instruction = "Route the cable tray, busway and chilled water."
+  session.files["output/solution.py"] = (
+      b"import json\n"
+      b"gt = json.load(open('ground_truth.json'))\n"
+      b"print('built from', gt['rows'][0]['name'])\n")
+  unit_pass = (
+      "exit code 0\nUNIT output/model.ifc: scale x1.000,"
+      " millimetre unit declared: True\n"
+      "UNIT_GATE: PASS (1 file(s), scale x1.0, millimetre units)")
+  ifc_pass = "exit code 0\nIFC_GATE: PASS (1 file(s), 0 EXPRESS violations)"
+  sep_pass = "exit code 0\nSEP collisions: 0\nSEP_GATE: PASS"
+  conn_pass = "exit code 0\nCONN_GATE: PASS"
+  FakeAgent.reset(
+      scripts={
+          "planner": ["p"],
+          "worker": ["worker summary"],
+          "verifier": ["PASS", "PASS", "PASS"],
+      },
+      bash_outputs=[unit_pass, ifc_pass, sep_pass, conn_pass] * 4,
+      standalone_result="STANDALONE_EXIT:1\nSTANDALONE_IFC:MISSING",
+      standalone_tail=(
+          "FileNotFoundError: [Errno 2] No such file or directory:"
+          " 'ground_truth.json'"),
+  )
+  real = serve.Agent
+  serve.Agent = FakeAgent
+  try:
+    result = await serve.solve(session)
+  finally:
+    serve.Agent = real
+  worker = FakeAgent.first("worker")
+  check("two fix rounds used", len(worker.resumes) == 2, worker.resumes)
+  check("standalone gap reached the worker",
+        any("STANDALONE FAIL" in r for r in worker.resumes),
+        worker.resumes)
+  check("standalone gap names the fix",
+        any("Copy every number" in r for r in worker.resumes),
+        worker.resumes)
+  check("fallback report returned, not a pass",
+        "did not run alone" in result, repr(result))
+  check("not marked verified",
+        "Independent verification: PASS." not in result, repr(result))
+  check("fallback replaced the script",
+        "Last-resort model" in session.files["output/solution.py"].decode(),
+        session.files["output/solution.py"][:200])
+
+
+async def test_standalone_check_passes_clean():
+  print("standalone check does not block a self-contained script")
+  session = FakeSession(21600)
+  session.instruction = "Route the cable tray, busway and chilled water."
+  unit_pass = (
+      "exit code 0\nUNIT output/model.ifc: scale x1.000,"
+      " millimetre unit declared: True\n"
+      "UNIT_GATE: PASS (1 file(s), scale x1.0, millimetre units)")
+  ifc_pass = "exit code 0\nIFC_GATE: PASS (1 file(s), 0 EXPRESS violations)"
+  sep_pass = "exit code 0\nSEP collisions: 0\nSEP_GATE: PASS"
+  conn_pass = "exit code 0\nCONN_GATE: PASS"
+  FakeAgent.reset(
+      scripts={
+          "planner": ["p"],
+          "worker": ["worker summary"],
+          "verifier": ["PASS"],
+      },
+      bash_outputs=[unit_pass, ifc_pass, sep_pass, conn_pass],
+  )
+  real = serve.Agent
+  serve.Agent = FakeAgent
+  try:
+    result = await serve.solve(session)
+  finally:
+    serve.Agent = real
+  check("result verified",
+        result.endswith("Independent verification: PASS."), repr(result))
+  check("no standalone failure in the summary",
+        "STANDALONE FAIL" not in result, repr(result))
+
+
+def test_correct_summary():
+  print("final-message correction quotes the real gate numbers")
+  verdict = ("Unit gate: no failures reported\n"
+             "IFC gate: no failures reported\n"
+             "Separation gate: FAIL — 0 collisions but a drop hangs\n"
+             "Connectivity gate: FAIL — chw: 4 disconnected components")
+  # Run 12's summary: PASS claims about the failing gates.
+  summary = ("Clash count: 0 clashes (PASS)\n"
+             "Separation: PASS\n"
+             "Coverage: PASS\n"
+             "Entry distance: PASS\n"
+             "\nDeterministic gates:\n" + verdict)
+  corrected = serve._correct_summary(summary, verdict)
+  check("correction appended", "\n\nCORRECTION:" in corrected, corrected)
+  check("contradicted clash claim quoted",
+        "Clash count: 0 clashes (PASS)" in corrected, corrected)
+  check("contradicted coverage claim quoted",
+        "Coverage: PASS" in corrected, corrected)
+  check("failing gate lines quoted",
+        "Separation gate: FAIL" in corrected
+        and "Connectivity gate: FAIL" in corrected, corrected)
+  # An honest summary (PASS claims only about passing gates, the
+  # failures named as failures) is left alone.
+  honest = ("Unit gate PASS, IFC gate PASS, but the separation gate still"
+            " fails and CHW has 4 components.\n\nDeterministic gates:\n"
+            + verdict)
+  check("honest summary unchanged",
+        serve._correct_summary(honest, verdict) == honest)
+  # A clean verdict needs no correction even with PASS claims.
+  clean = ("Unit gate: no failures reported\n"
+           "IFC gate: no failures reported\n"
+           "Separation gate: no failures reported\n"
+           "Connectivity gate: no failures reported")
+  check("clean verdict unchanged",
+        serve._correct_summary("All gates PASS", clean) == "All gates PASS")
+  # A summary with no PASS claims is left alone (the verdict is already
+  # appended below it).
+  plain = ("The model still fails the separation gate.\n\n"
+           "Deterministic gates:\n" + verdict)
+  check("no PASS claim, no correction",
+        serve._correct_summary(plain, verdict) == plain)
+
+
+def test_band_validation():
+  print("vision band cross-checked against datums and rules")
+  # Run 12's vision read: overhead [3085, 3600] (the top 515 mm below
+  # the soffit), while the datums+rules give [2600, 3115].
+  gt = {"rows": [], "band": {"overhead": [2600, 3115],
+                             "datums": {"soffit": 3600, "deflector": 3574.6,
+                                        "clear_height": 2600}}}
+  vision = {"band": {"overhead": [3085, 3600]},
+            "datums": {"soffit": 3600, "deflector": 3574.6,
+                       "clear_height": 2600},
+            "rules": {"sprinkler_standoff": 460}}
+  warnings = serve._merge_vision_ground_truth(gt, vision)
+  check("wrong band corrected to datums+rules",
+        abs(gt["band"]["overhead"][0] - 2600) < 1
+        and abs(gt["band"]["overhead"][1] - 3114.6) < 1, gt["band"])
+  check("warning names the disagreement",
+        any("datums+rules win" in w for w in warnings), warnings)
+  # A band that already agrees is left alone.
+  gt2 = {"rows": [], "band": {"overhead": [2600, 3115],
+                              "datums": {"soffit": 3600, "deflector": 3574.6,
+                                         "clear_height": 2600}}}
+  vision2 = {"band": {"overhead": [2600, 3115]},
+             "datums": {"soffit": 3600, "deflector": 3574.6,
+                        "clear_height": 2600},
+             "rules": {"sprinkler_standoff": 460}}
+  warnings2 = serve._merge_vision_ground_truth(gt2, vision2)
+  check("correct band untouched",
+        gt2["band"]["overhead"] == [2600, 3115], gt2["band"])
+  check("no warning for a correct band", warnings2 == [], warnings2)
+
+
+def test_sep_gate_riser():
+  print("separation gate accepts a plenum riser, rejects a hanging drop")
+  try:
+    import ifcopenshell  # noqa: F401
+  except ImportError:
+    print("  skipped: ifcopenshell not installed")
+    return
+  import tempfile
+
+  with tempfile.TemporaryDirectory() as tmp:
+    # CHW in the under-floor plenum: the header runs at z -500..-332 and
+    # the riser stands on it (bottom z=-332, top z=0). Under the old
+    # top-only rule this failed — the top is 416 mm from the header's
+    # centreline — but the bottom touches the header, so it is connected.
+    outdir = os.path.join(tmp, "riser", "output")
+    os.makedirs(outdir)
+    _build_test_ifc(os.path.join(outdir, "model.ifc"), [
+        ('IfcPipeSegment', 'CHW-SouthPerimeter', 10000, 168, 168,
+         5000, 5000, -500),
+        ('IfcPipeSegment', 'CHW-Riser-1', 168, 168, 332,
+         5000, 5000, -332),
+    ])
+    out = _run_sep_gate(os.path.join(tmp, "riser"))
+    check("plenum riser passes", "SEP_GATE: PASS" in out, out)
+    check("riser is not called a failed drop",
+          "does not hang from the header" not in out, out)
+
+    # A truly hanging drop: the CHW header runs at z 2600..2768 along
+    # y=5000 and the vertical segment at (5000, 9000) spans z 1000..2000
+    # — neither end is near a horizontal segment. The message must name
+    # the nearer end (the top) and the direction (south).
+    outdir = os.path.join(tmp, "hang", "output")
+    os.makedirs(outdir)
+    _build_test_ifc(os.path.join(outdir, "model.ifc"), [
+        ('IfcPipeSegment', 'CHW-Header', 10000, 168, 168,
+         5000, 5000, 2600),
+        ('IfcPipeSegment', 'CHW-Drop-1', 168, 168, 1000,
+         5000, 9000, 1000),
+    ])
+    out = _run_sep_gate(os.path.join(tmp, "hang"))
+    check("hanging drop fails", "SEP_GATE: FAIL" in out, out)
+    check("hanging drop message names the top",
+          "does not hang from the header" in out, out)
+    check("hanging drop message gives the direction",
+          "to the south" in out, out)
+
+    # A drop built upward from an overhead header: its bottom touches the
+    # header, but that is not a riser — a riser stands on an under-floor
+    # header. The run-7 model did exactly this and the old top-only rule
+    # caught it; the both-ends rule must still catch it.
+    outdir = os.path.join(tmp, "upward", "output")
+    os.makedirs(outdir)
+    _build_test_ifc(os.path.join(outdir, "model.ifc"), [
+        ('IfcPipeSegment', 'CHW-Header', 10000, 168, 168,
+         5000, 5000, 2600),
+        ('IfcPipeSegment', 'CHW-Drop-1', 168, 168, 1232,
+         5000, 5000, 2768),
+    ])
+    out = _run_sep_gate(os.path.join(tmp, "upward"))
+    check("upward drop fails", "SEP_GATE: FAIL" in out, out)
+    check("upward drop is not passed as a riser",
+          "does not hang from the header" in out, out)
+    check("upward drop message says it goes the wrong way",
+          "goes up instead of down" in out, out)
+
+
+def test_conn_gate_entry_aabb():
+  print("connectivity gate measures entry distance to the box footprint")
+  try:
+    import ifcopenshell  # noqa: F401
+  except ImportError:
+    print("  skipped: ifcopenshell not installed")
+    return
+  import json
+  import subprocess
+  import tempfile
+
+  def run_gate(workdir):
+    script = os.path.join(workdir, "conn_gate.py")
+    with open(script, "w") as f:
+      f.write(serve.CONN_GATE_SCRIPT)
+    r = subprocess.run([sys.executable, script], cwd=workdir,
+                       capture_output=True, text=True)
+    return r.stdout + r.stderr
+
+  with tempfile.TemporaryDirectory() as tmp:
+    # The entry (27, 9889) is inside the feeder's footprint (x -973..1027,
+    # y 9308..9991) but 239 mm from its longest-axis centreline (y=9650):
+    # the old centreline rule reported 239 mm for a feeder whose box
+    # contains the entry point; the footprint rule reports 0.
+    outdir = os.path.join(tmp, "entry", "output")
+    os.makedirs(outdir)
+    _build_test_ifc(os.path.join(outdir, "model.ifc"), [
+        ('IfcCableCarrierSegment', 'CableTray-EntryFeeder', 2000, 683, 127,
+         27, 9650, 2600),
+    ])
+    json.dump(_synthetic_ground_truth(),
+              open(os.path.join(tmp, "entry", "ground_truth.json"), "w"))
+    out = run_gate(os.path.join(tmp, "entry"))
+    check("entry inside the footprint measures 0 mm",
+          "CONN tray: entry distance 0 mm" in out, out)
+
+
+async def test_retry_429_capped():
+  print("429 retries capped at 3 per call, 503 keeps full waits")
+  import openai
+  from types import SimpleNamespace
+  from unittest import mock
+
+  def status_error(status):
+    # APIStatusError needs a response-like object with .request,
+    # .status_code and .headers.get — no real HTTP response required.
+    resp = SimpleNamespace(status_code=status, request=SimpleNamespace(),
+                           headers={})
+    return openai.APIStatusError("endpoint error", response=resp, body=None)
+
+  async def run_with_errors(agent, errors):
+    calls = []
+    waits = []
+
+    async def failing_stream(*args, **kwargs):
+      calls.append(1)
+      raise errors[len(calls) - 1]
+
+    agent.stream = failing_stream
+
+    async def fake_sleep(seconds):
+      waits.append(seconds)
+
+    with mock.patch("asyncio.sleep", new=fake_sleep):
+      try:
+        await agent.complete()
+        return calls, waits, None
+      except openai.APIStatusError as exc:
+        return calls, waits, exc
+
+  session = FakeSession(21600)
+  agent = serve.Agent(session, role="worker")
+  calls, waits, exc = await run_with_errors(
+      agent, [status_error(429)] * 10)
+  check("429 raises after the cap", exc is not None and exc.status_code == 429)
+  check("429 attempts: 1 + 3 retries", len(calls) == 4, calls)
+  check("429 waits are 5/15/30", waits == [5, 15, 30], waits)
+
+  # 503 (server overload, not quota) keeps the full retry schedule.
+  agent2 = serve.Agent(session, role="worker")
+  calls, waits, exc = await run_with_errors(
+      agent2, [status_error(503)] * 10)
+  check("503 raises after the full schedule",
+        exc is not None and exc.status_code == 503)
+  check("503 attempts: 1 + 5 retries", len(calls) == 6, calls)
+  check("503 waits are the full schedule",
+        waits == [5, 15, 30, 60, 120], waits)
+
+  # The global budget: 10 consecutive 429s already seen means the quota
+  # is gone for this phase — the next 429 is not retried at all.
+  agent3 = serve.Agent(session, role="worker")
+  agent3._consec_429 = 10
+  calls, waits, exc = await run_with_errors(
+      agent3, [status_error(429)] * 10)
+  check("budget exhausted: no retry",
+        len(calls) == 1 and waits == [], (calls, waits))
+  check("budget exhausted: 429 raised",
+        exc is not None and exc.status_code == 429)
+
+  # A successful call resets the budget.
+  agent4 = serve.Agent(session, role="worker")
+  agent4._consec_429 = 9
+  agent4.record = lambda reply: asyncio.sleep(0)  # no-op record
+  agent4.stream = lambda *a, **k: asyncio.sleep(
+      0, result=SimpleNamespace(finish="stop"))
+  reply = await agent4.complete()
+  check("success returns the reply", reply.finish == "stop")
+  check("success resets the 429 budget", agent4._consec_429 == 0)
+
+
+def test_routing_fix_guidance():
+  print("routing guide: self-containment and fix-round rules")
+  session = FakeSession(21600)
+  session.instruction = "Route the cable tray, busway and chilled water in the data hall."
+  worker = serve.Agent(session, role="worker")
+  prompt = worker.system_prompt("")
+  check("self-containment: verifier runs solution.py alone",
+        "copies ONLY output/solution.py" in prompt)
+  check("self-containment: no runtime open()",
+        "NEVER call open() on ground_truth.json" in prompt)
+  check("self-containment: numbers as literals",
+        "as literals" in prompt)
+  check("fix must never break a connected joint",
+        "must never break a joint that was connected" in prompt)
+  check("bridge the named break exactly",
+        "bridge exactly that gap" in prompt)
+  check("riser is not a drop", "A riser is not a drop" in prompt)
+  check("do not shift a header off its row",
+        "Do not shift a header off its row" in prompt)
+  check("sprinkler bases from the numbers",
+        "Set tier heights from the sprinkler numbers" in prompt)
+  check("drop direction from the gate",
+        "the gate measured it in 3D" in prompt)
+
+
 async def main():
   await test_long_task_pass_first_try()
   await test_gaps_then_fix_then_pass()
@@ -1621,6 +2022,14 @@ async def main():
   test_conn_gate_ground_truth()
   test_sep_gate_ground_truth()
   test_fallback_solution()
+  await test_standalone_check_blocks_submission()
+  await test_standalone_check_passes_clean()
+  test_correct_summary()
+  test_band_validation()
+  test_sep_gate_riser()
+  test_conn_gate_entry_aabb()
+  await test_retry_429_capped()
+  test_routing_fix_guidance()
   print("ALL TESTS PASSED")
 
 

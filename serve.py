@@ -78,6 +78,19 @@ MIN_PLAN_SEC = 1800  # plan only when the task allows at least this long
 MIN_VERIFY_SEC = 900  # verify only when at least this long is left
 MAX_FIX_ROUNDS = 2
 RETRY_WAITS = (5, 15, 30, 60, 120)
+# 429 (quota) retries are capped at 3 per call (5/15/30 s = 50 s): every
+# 429 on run 12 recovered within 3 waits, and the 60/120 s tails only
+# burned wall clock (run 10: 530 s of backoff = 81% of the run; run 11:
+# 230 s = 95%). 503 (server overload) keeps the full RETRY_WAITS — it is
+# not quota and usually clears on its own.
+RETRY_WAITS_429 = (5, 15, 30)
+# A global 429 budget per agent: 10 consecutive 429s means the quota is
+# gone for this phase, not flickering — stop retrying and let the
+# deterministic path (gates, fallback) carry the run instead of burning
+# the whole phase on backoff. Only a successful call resets it (a 503
+# in between does not prove the quota is back). Do NOT switch models
+# mid-task to dodge the quota.
+MAX_CONSECUTIVE_429 = 10
 # Planner budget cap: on run 10 the planner burned the whole run hand-writing
 # PNG decoders (26 steps, zero dimensions, the worker never started). A
 # planner that cannot plan in 10 tool calls or 600 seconds is stuck, not
@@ -284,6 +297,13 @@ Routing (cable tray, busway, chilled water):
 size, the row centrelines, every CRAH position, the drawn entry, the profile sizes, the elevation band and the \
 separation rules — all measured from the drawings before you started. If ground_truth.json is missing, say so \
 in your summary and fall back to reading the drawings.
+- **Your deliverable must run alone.** The verifier copies ONLY output/solution.py into an empty directory \
+and runs it there: any file it opens at runtime will not exist, and the run fails before scoring. So copy \
+every number the script needs into solution.py as literals (row positions, CRAH positions, profile sizes, \
+heights). NEVER call open() on ground_truth.json, an input file, or routing.json inside solution.py — reading \
+those files while you are *building* the model is fine, but the delivered script must not depend on them. \
+Before you finish, prove it: copy solution.py alone to a clean directory (no ground_truth.json anywhere near \
+it) and run it there; if it crashes, it is not a deliverable.
 - Connect in this order: (a) the service entry first — a feeder from the entry marked on the drawings to your first \
 header; (b) one header per row, every row, all three services; (c) a drop from the CHW header to every CRAH, \
 including perimeter units the row headers do not pass. Never submit a route with one segment per service; every \
@@ -299,20 +319,38 @@ may touch or sit up to 250 mm apart and still count as connected, so a small gap
 Build each horizontal segment as a flat box (length along the run, width across, thickness up) that starts where \
 the previous segment's box ends:
   create_box_extrusion(x1 - x0, width, thickness, (x0 + x1) / 2, y, z)  # run from (x0, y) to (x1, y) at height z
+- **A fix must never break a joint that was connected.** If a service had 1 connected component, keep it at 1. \
+Shorten a segment ONLY to its neighbour's face — end it exactly where the next segment starts (a 0 mm butt \
+joint). Never shorten it short of the neighbour: a gap over 250 mm disconnects the network, and a disconnected \
+network fails the connectivity gate as surely as a clash fails the clash gate. On a real run, shortening three \
+tray connectors by 264 mm each (to kill joint overlaps) turned 1 tray component into 7 and the model scored 0. \
+When the connectivity gate names a break with coordinates ("nearest unconnected segments are N mm apart — A \
+ends near (...), B starts near (...)"), bridge exactly that gap: extend one of the two named segments so its end \
+touches the other's end. Do not guess a new endpoint.
+- **Do not shift a header off its row to dodge a column.** The row's CRAH drops stand on the header's line: a \
+header 600–800 mm off its row centreline leaves every drop hanging. Jog around the column instead — split the \
+header into two segments with a short sideways jog that goes around the column, keeping the header on the row \
+centreline everywhere else.
 - Profile orientation: a tray segment's vertical extent must be its thickness (127 mm), not its width (683 mm); \
 busway is 128 mm wide x 147 mm high; CHW pipe is 114.3 mm OD, 168.3 mm over insulation — coordinate the \
 insulated size. If you rotate a placement, check the result — a wide dimension standing vertical is the single \
 most common cause of clashes. The unrotated box style above cannot make this mistake.
-- Drops go down: a drop from a header to a CRAH starts at the header and goes down to the CRAH top. Build it as \
+- Drops go down: a drop from an overhead header to a CRAH starts at the header and goes down to the CRAH top. Build it as \
 a box whose bottom is the CRAH top and whose top reaches the header — never place a drop at the header and \
 extrude upward:
   create_box_extrusion(w, w, z_top - z_bottom, x, y, z_bottom)  # drop from header z_top down to CRAH top z_bottom
+- **A riser is not a drop.** When a service runs in the under-floor plenum, the vertical segment to a CRAH goes \
+UP: its bottom must touch the under-floor header and its top must reach the CRAH. Either end touching a \
+horizontal segment of the same service counts as connected — but the segment must touch at one end; a vertical \
+segment whose neither end is within 250 mm of a horizontal segment is not connected, even if it happens to \
+touch another segment.
 - Every CRAH needs a horizontal branch from the nearest header or trunk to the CRAH's (x, y), then a drop down \
 from the branch end. A CRAH directly below a trunk still needs a branch — first measure the trunk's extent; \
 if the CRAH's position is outside it, build a branch. Never skip a branch because the CRAH's x matches the \
 trunk's x: a trunk that ends short of the CRAH's y leaves the drop hanging in mid-air. A drop whose top is \
 not within 250 mm of a horizontal segment of the same service is not connected, even if it happens to touch \
-another segment.
+another segment. When the separation gate names the nearest horizontal segment and a direction ("417 mm away \
+to the east"), build the branch in exactly that direction — the gate measured it in 3D.
 - Keep the three services on separate tiers or separated horizontally, from the elevation band in \
 ground_truth.json — NOT at fixed heights of your own. The overhead band is only 515 mm high (z 2600-3115, \
 between the 2600 mm clear height and the 460 mm sprinkler standoff), and the three profiles stacked (tray 127 \
@@ -327,6 +365,11 @@ full length unless the services are separated on at least one axis. And centreli
 spacing: two 600 mm wide trunks whose centrelines are 400 mm apart overlap by 200 mm. Subtract the box width \
 from the centreline spacing before claiming a separation. A feeder must not pass through a column: route \
 around it.
+- **Set tier heights from the sprinkler numbers, not round numbers.** Every route top must sit at least 460 mm \
+below the sprinkler deflector plane (deflector and standoff are in ground_truth.json under band.datums and \
+rules). Max top = deflector − 460; each service's base = max top − its profile height. Do not use a round \
+height like z=3000 — on a real run that put the tray top 12 mm and the busway top 33 mm too high, and the \
+model failed the separation gate on sprinkler clearance alone.
 - Name every route segment clearly (CableTray-1, Busway-1, CHW-1, ...).
 - Write output/routing.json next to the model, with the numbers you actually used: {"entry": [x, y, z], "rows": \
 [{"name": "A", "start": [x, y, z], "end": [x, y, z]}, ...], "crahs": [[x, y, z], ...]}. Then run a connectivity \
@@ -1020,6 +1063,9 @@ class Agent:
     # whether calls go to the Responses API rather than Chat Completions
     self.responses = MODEL.lower().startswith(RESPONSES_MODELS)
     self.finish_margin = FINISH_MARGIN_SEC
+    # Consecutive 429s this agent has hit (reset by a successful call):
+    # the quota-exhaustion budget for complete().
+    self._consec_429 = 0
 
   def time_left(self) -> float | None:
     """Remaining seconds for this phase: the task's or the phase's, sooner."""
@@ -1382,12 +1428,14 @@ class Agent:
     """
     reserve = self.finish_margin if reserve is None else reserve
     waits = iter(RETRY_WAITS)
+    waits_429 = iter(RETRY_WAITS_429)
     while True:
       try:
         reply = await self.stream(self.messages, tool_choice, reserve, head)
         if reply.finish is None:
           raise StreamCut("the stream ended without a finish reason")
         await self.record(reply)
+        self._consec_429 = 0  # a success resets the quota budget
         return reply
       except openai.APIStatusError as exc:
         if exc.status_code == 400 and await self.remedy(str(exc)):
@@ -1395,6 +1443,20 @@ class Agent:
         if not (exc.status_code in (408, 409, 429) or exc.status_code >= 500):
           raise
         failure = exc
+        if exc.status_code == 429:
+          # Quota, not overload: 3 retries per call (5/15/30 s), then
+          # give up, and a global budget of 10 consecutive 429s per
+          # agent — past that the quota is gone for this phase.
+          self._consec_429 += 1
+          if self._consec_429 > MAX_CONSECUTIVE_429:
+            await self.session.log(
+                "429 budget exhausted"
+                f" ({MAX_CONSECUTIVE_429} consecutive); quota is gone"
+                " for this phase — not retrying")
+            raise failure
+          wait = next(waits_429, None)
+        else:
+          wait = next(waits, None)
       except StreamBadRequest as exc:
         if await self.remedy(str(exc)):
           continue
@@ -1402,7 +1464,7 @@ class Agent:
       # a connection error, a timeout, or a stream that errored or ended early
       except (openai.APIError, StreamCut) as exc:
         failure = exc
-      wait = next(waits, None)
+        wait = next(waits, None)
       if wait is None:
         raise failure
       left = self.time_left()
@@ -2486,6 +2548,19 @@ def _pt_seg_dist2d(p, a, b):
     return _pt_seg_dist((p[0], p[1], 0.0), (a[0], a[1], 0.0), (b[0], b[1], 0.0))
 
 
+def _pt_aabb_dist2d(p, a_min, a_max):
+    '''Plan distance from a point to an axis-aligned box's footprint (0
+    when the point is inside the footprint). The entry/CRAH checks are
+    plan checks against the model's footprint: measuring to the segment's
+    longest-axis centreline is wrong for a wide flat box (the entry
+    feeder is 631 mm long x 683 mm wide, so its "centreline" is the width
+    axis) and reported 316 mm for a feeder whose box contains the entry
+    point.'''
+    dx = max(a_min[0] - p[0], 0.0, p[0] - a_max[0])
+    dy = max(a_min[1] - p[1], 0.0, p[1] - a_max[1])
+    return math.hypot(dx, dy)
+
+
 def _coverage(start, end, segments, tol):
     n, hit = 100, 0
     for i in range(n + 1):
@@ -2680,8 +2755,8 @@ def main():
         print(f"CONN measuring against {source}")
         entry = _v(routing['entry'])
         for svc in ('tray', 'busway', 'chw'):
-            if segs[svc]:
-                d = min(_pt_seg_dist2d(entry, a, b) for a, b in segs[svc])
+            if boxes[svc]:
+                d = min(_pt_aabb_dist2d(entry, b[0], b[1]) for b in boxes[svc])
                 print(f"CONN {svc}: entry distance {d:.0f} mm")
                 if d > ENTRY_TOL:
                     problems.append(f"{svc}: nothing within {ENTRY_TOL:.0f} mm of the entry ({d:.0f} mm) — the network is not fed")
@@ -2698,7 +2773,7 @@ def main():
             p = _v(crah)
             if not segs['chw']:
                 break
-            d = min(_pt_seg_dist2d(p, a, b) for a, b in segs['chw'])
+            d = min(_pt_aabb_dist2d(p, b[0], b[1]) for b in boxes['chw'])
             if d > CRAH_TOL:
                 problems.append(f"CRAH at {tuple(int(v) for v in p)} is {d:.0f} mm from the nearest CHW segment (needs {CRAH_TOL:.0f} mm)")
     if problems:
@@ -3011,10 +3086,38 @@ def main():
                 problems.append(
                     f"{svc} segment {product.Name or product.is_a()} is {vertical:.0f} mm tall but its profile is only {expect:.0f} mm high — the profile is oriented wrong (width standing vertical)")
                 break
-    # 4. Drops must go down: a vertical route segment's top must hang from
-    # a horizontal segment of the same service (a header or trunk). A drop
-    # that only touches a riser is not hung. Name the nearest horizontal
-    # segment and where to build the branch, so the fix knows what to do.
+    # 4. Drops and risers: a vertical route segment must touch a horizontal
+    # segment of the same service at one end — its top (an overhead drop
+    # hanging from a header) or its bottom (a plenum riser standing on an
+    # under-floor header). A riser is not a failed drop: on run 12 the
+    # CHW ran in the under-floor plenum, so the drops were risers whose
+    # bottoms touched the header 0.1 mm away, and the old top-only rule
+    # failed them (417 mm from the header's centreline). But the bottom
+    # only counts when the header is UNDER the floor: on run 7 the drops
+    # were built upward from an overhead header, so their bottoms touched
+    # it too — a drop built upward is not a riser, it is a drop going the
+    # wrong way. Only when neither end is near a horizontal segment does
+    # the check fail, and the message names the nearer end with the
+    # correct direction.
+    def _nearest_horiz(point, svc, skip, underfloor_only=False):
+        nearest = None
+        nearest_name = None
+        nearest_ends = None
+        for p2, s2, c2, ax2, mn2, mx2 in items:
+            if s2 != svc or p2 is skip:
+                continue
+            if underfloor_only and mx2[2] > 0:
+                continue  # a riser stands on a plenum header, not a hall one
+            longest2 = max(ax2, key=lambda a: a[1])
+            if abs(longest2[0][2]) > 0.5:
+                continue  # a riser: a drop hangs from a header, not a riser
+            e1, e2 = _endpoints(c2, ax2)
+            d = _pt_seg_dist(point, e1, e2)
+            if nearest is None or d < nearest:
+                nearest = d
+                nearest_name = p2.Name or p2.is_a()
+                nearest_ends = (e1, e2)
+        return nearest, nearest_name, nearest_ends
     for product, svc, centre, axes, a_min, a_max in items:
         if svc not in ('tray', 'busway', 'chw'):
             continue
@@ -3022,49 +3125,58 @@ def main():
         if abs(longest[0][2]) <= 0.5:
             continue  # horizontal: skip
         top = (centre[0], centre[1], a_max[2])
-        nearest = None
-        nearest_name = None
-        nearest_ends = None
-        for p2, s2, c2, ax2, mn2, mx2 in items:
-            if s2 != svc or p2 is product:
-                continue
-            longest2 = max(ax2, key=lambda a: a[1])
-            if abs(longest2[0][2]) > 0.5:
-                continue  # a riser: a drop hangs from a header, not a riser
-            e1, e2 = _endpoints(c2, ax2)
-            d = _pt_seg_dist(top, e1, e2)
-            if nearest is None or d < nearest:
-                nearest = d
-                nearest_name = p2.Name or p2.is_a()
-                nearest_ends = (e1, e2)
-        if nearest is None or nearest > 250.0:
-            if nearest_ends is not None:
-                e1, e2 = nearest_ends
-                closest = _closest_point(top, e1, e2)
-                dx = closest[0] - top[0]
-                dy = closest[1] - top[1]
-                dz = closest[2] - top[2]
-                if abs(dz) >= max(abs(dx), abs(dy)):
-                    # The gap is vertical: the closest point is directly
-                    # above/below the drop's top, so the fix is to extend
-                    # the drop up (or rebuild it going down), not to move it
-                    # sideways.
-                    if dz > 0:
-                        gap = f"{nearest:.0f} mm away to the above (drop top z={top[2]:.0f}, nearest segment z={closest[2]:.0f}) — extend the drop {nearest:.0f} mm up to the header"
-                    else:
-                        gap = f"{nearest:.0f} mm away to the below (drop top z={top[2]:.0f}, nearest segment z={closest[2]:.0f}) — the drop goes up instead of down; rebuild it hanging from the header at z={closest[2]:.0f} down to the CRAH top"
-                else:
-                    if abs(dx) >= abs(dy):
-                        direction = 'east' if dx > 0 else 'west'
-                    else:
-                        direction = 'north' if dy > 0 else 'south'
-                    gap = f"{nearest:.0f} mm away to the {direction} — build a horizontal branch from that segment to ({top[0]:.0f},{top[1]:.0f}) at the header height, then drop down"
-                problems.append(
-                    f"{svc} vertical segment {product.Name or product.is_a()} at ({top[0]:.0f},{top[1]:.0f}) does not hang from the header: nearest horizontal segment is {nearest_name}, its closest point is ({closest[0]:.0f},{closest[1]:.0f},{closest[2]:.0f}), {gap}")
-            else:
-                problems.append(
-                    f"{svc} vertical segment {product.Name or product.is_a()} does not hang from the header: no horizontal {svc} segment exists — build a header first, then a branch to the drop")
+        bottom = (centre[0], centre[1], a_min[2])
+        d_top, name_top, ends_top = _nearest_horiz(top, svc, product)
+        d_bot, name_bot, ends_bot = _nearest_horiz(
+            bottom, svc, product, underfloor_only=True)
+        if (d_top is not None and d_top <= 250.0) or (d_bot is not None and d_bot <= 250.0):
+            continue  # hung from above, or standing on a header below
+        if d_top is None and d_bot is None:
+            problems.append(
+                f"{svc} vertical segment {product.Name or product.is_a()} does not hang from the header: no horizontal {svc} segment exists — build a header first, then a branch to the drop")
             break
+        # Neither end is near a horizontal segment: name the nearer end.
+        if d_bot is None or (d_top is not None and d_top <= d_bot):
+            point, nearest, nearest_name, nearest_ends = top, d_top, name_top, ends_top
+            end_name = 'top'
+        else:
+            point, nearest, nearest_name, nearest_ends = bottom, d_bot, name_bot, ends_bot
+            end_name = 'bottom'
+        e1, e2 = nearest_ends
+        closest = _closest_point(point, e1, e2)
+        dx = closest[0] - point[0]
+        dy = closest[1] - point[1]
+        dz = closest[2] - point[2]
+        if abs(dz) >= max(abs(dx), abs(dy)):
+            # The gap is vertical: the closest point is directly
+            # above/below the segment's end, so the fix is to extend the
+            # segment toward it, not to move it sideways.
+            if end_name == 'top':
+                if dz > 0:
+                    gap = f"{nearest:.0f} mm away to the above (drop top z={point[2]:.0f}, nearest segment z={closest[2]:.0f}) — extend the drop {nearest:.0f} mm up to the header"
+                else:
+                    gap = f"{nearest:.0f} mm away to the below (drop top z={point[2]:.0f}, nearest segment z={closest[2]:.0f}) — the drop goes up instead of down; rebuild it hanging from the header at z={closest[2]:.0f} down to the CRAH top"
+            else:
+                if dz < 0:
+                    gap = f"{nearest:.0f} mm away to the below (riser bottom z={point[2]:.0f}, nearest segment z={closest[2]:.0f}) — extend the riser {nearest:.0f} mm down to the header"
+                else:
+                    gap = f"{nearest:.0f} mm away to the above (riser bottom z={point[2]:.0f}, nearest segment z={closest[2]:.0f}) — the riser goes down instead of up; rebuild it rising from the header at z={closest[2]:.0f} up to the CRAH"
+        else:
+            if abs(dx) >= abs(dy):
+                direction = 'east' if dx > 0 else 'west'
+            else:
+                direction = 'north' if dy > 0 else 'south'
+            if end_name == 'top':
+                gap = f"{nearest:.0f} mm away to the {direction} — build a horizontal branch from that segment to ({point[0]:.0f},{point[1]:.0f}) at the header height, then drop down"
+            else:
+                gap = f"{nearest:.0f} mm away to the {direction} — build a horizontal branch from that segment to ({point[0]:.0f},{point[1]:.0f}) at the header height, then rise up"
+        if end_name == 'top':
+            problems.append(
+                f"{svc} vertical segment {product.Name or product.is_a()} at ({point[0]:.0f},{point[1]:.0f}) does not hang from the header: nearest horizontal segment is {nearest_name}, its closest point is ({closest[0]:.0f},{closest[1]:.0f},{closest[2]:.0f}), {gap}")
+        else:
+            problems.append(
+                f"{svc} vertical segment {product.Name or product.is_a()} at ({point[0]:.0f},{point[1]:.0f}) does not rise from the header: nearest horizontal segment is {nearest_name}, its closest point is ({closest[0]:.0f},{closest[1]:.0f},{closest[2]:.0f}), {gap}")
+        break
     # 5. Sprinkler clearance: every route top must be >= 460 mm below the
     # sprinkler deflector plane. The plane comes from the drawings
     # (ground_truth.json) when available, else from the model's own
@@ -3364,6 +3476,7 @@ def _gate_score_vector(unit: dict, ifc: dict, sep: dict, conn: dict) -> dict | N
       "frame_ok": sep.get("frame_ok", True),
       "clashes": sep.get("clashes", 0),
       "max_components": max(components.values()) if components else 0,
+      "components": dict(components),
       "rows_below_80": conn.get("rows_below_80", 0),
   }
 
@@ -3373,9 +3486,13 @@ def _is_regression(prev: dict, cur: dict) -> bool:
 
   A fix round is a regression when it flips a fatal check to FAIL (units,
   IFC, frame), raises the clash count, or disconnects the network further
-  without cutting clashes. A clash increase with a component improvement
-  is not a regression — the fix traded a clash for connectivity — but a
-  clash increase alone always is.
+  in ANY service — a per-service component rise is a regression even when
+  clashes fell. On run 12 a fix cut clashes 92 -> 0 by shortening segments
+  short of their neighbours (tray 1 -> 7 components, CHW 4 -> 8), and the
+  old rule let it through because the clash cut "paid" for the disconnect;
+  a disconnected network scores 0 as surely as a clashing one, so the
+  trade is not a payment. A component count that falls is an improvement,
+  not a regression.
   """
   if cur["unit_ok"] is False and prev["unit_ok"] is True:
     return True
@@ -3385,13 +3502,68 @@ def _is_regression(prev: dict, cur: dict) -> bool:
     return True
   if cur["clashes"] > prev["clashes"]:
     return True
-  if (cur["max_components"] > prev["max_components"]
-          and cur["clashes"] >= prev["clashes"]):
-    return True
+  prev_comp = prev.get("components") or {}
+  cur_comp = cur.get("components") or {}
+  for service in set(prev_comp) | set(cur_comp):
+    if cur_comp.get(service, 0) > prev_comp.get(service, 0):
+      return True
   if (cur["rows_below_80"] > prev["rows_below_80"]
           and cur["clashes"] >= prev["clashes"]):
     return True
   return False
+
+
+# Keywords for the PASS claim each gate's subject would use in a summary:
+# a summary that says "clash count 0 (PASS)" while the separation gate
+# FAILs is contradicted on that gate, even if its unit/IFC claims are true.
+_GATE_PASS_KEYWORDS = {
+    "Unit": ("unit", "scale", "millimetre", "millimeter"),
+    "IFC": ("ifc", "express", "validation", "schema"),
+    "Separation": (
+        "clash", "separation", "separate", "sprinkler", "clear height",
+        "hang"),
+    "Connectivity": ("cover", "connect", "entry", "crah", "component"),
+}
+
+
+def _correct_summary(summary: str, verdict: str) -> str:
+  """Appends a correction when the summary claims a PASS the gates deny.
+
+  The agent's prose can claim "Clash count: 0 (PASS)" while the appended
+  verdict says the separation gate FAILs — on run 12 the summary shipped
+  with its own refutation attached and nothing flagged it. The verdict
+  is the measurement; the prose is not. A correction is appended only
+  when the summary makes a PASS claim about a gate that FAILed (a PASS
+  claim about a gate that passed is left alone), quoting both the claim
+  and the failing gate's line. Returns the summary unchanged otherwise.
+  """
+  failing = [name for name in _GATE_PASS_KEYWORDS
+             if any(line.startswith(f"{name} gate: FAIL")
+                    for line in verdict.splitlines())]
+  if not failing:
+    return summary
+  head = summary.split("Deterministic gates:")[0]
+  contradicted = []
+  for name in failing:
+    for line in head.splitlines():
+      low = line.lower()
+      # A line that also says "fail" is not claiming a pass for that gate
+      # ("Unit gate PASS, IFC gate PASS, but the separation gate still
+      # fails" is honest, not a lie).
+      if ("pass" in low and "fail" not in low
+              and any(k in low for k in _GATE_PASS_KEYWORDS[name])):
+        contradicted.append(line.strip())
+        break
+  if not contradicted:
+    return summary
+  fails = [line for line in verdict.splitlines()
+           if any(line.startswith(f"{n} gate: FAIL") for n in failing)]
+  return summary + (
+      "\n\nCORRECTION: the deterministic gates contradict the PASS claims"
+      " above — the following claims are wrong:\n"
+      + "\n".join(f"- {c}" for c in contradicted)
+      + "\nMeasured instead:\n"
+      + "\n".join(f"- {f}" for f in fails))
 
 
 async def _run_all_gates(
@@ -3600,6 +3772,33 @@ def _merge_vision_ground_truth(ground_truth: dict, vision: dict) -> list[str]:
     ground_truth["rules"] = vision["rules"]
     ground_truth.setdefault("extraction_method", {})["rules"] = (
         "vision (E-101/M-101 notes)")
+  # Cross-check the overhead band against the datums and rules: the band
+  # is derivable from them (bottom = clear height, top = deflector minus
+  # the sprinkler standoff), and the vision call reads it wrong — on run
+  # 12 it read A-602's "OVERHEAD PATHWAY ZONE 515" as the top 515 mm
+  # below the soffit ([3085, 3600] instead of [2600, 3115]). The wrong
+  # band quoted wrong tiers to the agent and mis-set the fallback's
+  # heights. When the numbers disagree by >50 mm, datums+rules win.
+  band = ground_truth.get("band") or {}
+  datums = band.get("datums") or {}
+  rules = ground_truth.get("rules") or {}
+  overhead = band.get("overhead")
+  if (overhead and datums.get("deflector") is not None
+          and datums.get("clear_height") is not None
+          and rules.get("sprinkler_standoff") is not None):
+    expected = [float(datums["clear_height"]),
+                float(datums["deflector"])
+                - float(rules["sprinkler_standoff"])]
+    if (abs(float(overhead[0]) - expected[0]) > 50
+            or abs(float(overhead[1]) - expected[1]) > 50):
+      warnings.append(
+          f"overhead band {overhead} disagrees with datums+rules"
+          f" (clear height {expected[0]:.0f}, deflector"
+          f" {float(datums['deflector']):.0f} minus standoff"
+          f" {float(rules['sprinkler_standoff']):.0f} = top"
+          f" {expected[1]:.0f}) — datums+rules win")
+      band["overhead"] = expected
+      ground_truth["band"] = band
   return warnings
 
 
@@ -4028,9 +4227,57 @@ def _fallback_solution(ground_truth: dict | None) -> str:
                    "None" if perim_y is None else json.dumps(perim_y)))
 
 
+async def _standalone_check(worker: Agent) -> str:
+  """Runs output/solution.py alone in a clean directory, as the grader does.
+
+  The grader copies ONLY solution.py into an empty directory and runs it
+  there — a script that opens any other file at runtime (ground_truth.json,
+  an input file, routing.json) dies before scoring. Run 12 scored 0.0
+  exactly this way, 0.4 s in, after every local run passed (the workdir
+  has ground_truth.json, so the bug was invisible there). Routing tasks
+  only: other tasks have no solution.py/model.ifc contract to check.
+
+  Returns "" when the script exits 0 and writes output/model.ifc, else a
+  gap for a fix round. A bash/tool failure is a gap too, never a pass.
+  """
+  try:
+    out = await worker.bash(
+        "rm -rf /tmp/standalone && mkdir -p /tmp/standalone/output"
+        " && cp output/solution.py /tmp/standalone/"
+        " && cd /tmp/standalone && python3 solution.py"
+        " > /tmp/standalone/run.log 2>&1; echo STANDALONE_EXIT:$?"
+        "; test -s /tmp/standalone/output/model.ifc"
+        " && echo STANDALONE_IFC:OK || echo STANDALONE_IFC:MISSING",
+        timeout_sec=300)
+  except Exception as exc:  # pylint: disable=broad-exception-caught
+    return (
+        "STANDALONE FAIL: could not run the standalone check"
+        f" ({type(exc).__name__}: {exc}) — verify output/solution.py"
+        " runs alone before finishing.")
+  if "STANDALONE_EXIT:0" in out and "STANDALONE_IFC:OK" in out:
+    return ""
+  tail = ""
+  try:
+    tail_out = await worker.bash(
+        "tail -5 /tmp/standalone/run.log 2>/dev/null || echo (no log)",
+        timeout_sec=60)
+    tail = clip(tail_out.strip(), 600)
+  except Exception:  # pylint: disable=broad-exception-caught
+    tail = "(could not read the run log)"
+  return (
+      "STANDALONE FAIL: output/solution.py does not run alone in a clean"
+      " directory (the grader copies ONLY solution.py into an empty"
+      " directory and runs it there). Any file it opens at runtime"
+      " (ground_truth.json, an input file, routing.json) will not exist."
+      " Copy every number the script needs into solution.py as literals"
+      " and remove the open() calls, then prove it by copying solution.py"
+      " alone to a clean directory and running it there.\n"
+      f"Standalone run output: {out.strip()[-300:]}\nLog tail: {tail}")
+
+
 async def _empty_submission_guard(
     session: taskbridge.Session, is_routing: bool,
-    ground_truth: dict | None,
+    ground_truth: dict | None, force: bool = False,
 ) -> str | None:
   """Checks output/solution.py is a real submission, not the task's stub.
 
@@ -4039,7 +4286,11 @@ async def _empty_submission_guard(
   marker: log loudly, write the last-resort fallback and run it so
   output/model.ifc exists, and return a clear failure report — never an
   empty string, and never a fake "success". Returns None when a real
-  submission exists (no guard action needed).
+  submission exists (no guard action needed). With force=True the file
+  is replaced even when it is not the stub: the caller already proved
+  the agent's script cannot be submitted (on run 12 it read
+  ground_truth.json at runtime and died in the grader's empty
+  directory), so a 0.585-style fallback beats a 0.0 execution error.
   """
   if not is_routing:
     return None
@@ -4048,9 +4299,14 @@ async def _empty_submission_guard(
     content = raw.decode("utf-8", "replace") if isinstance(raw, bytes) else str(raw)
   except Exception:  # pylint: disable=broad-exception-caught
     content = ""  # no solution.py at all: treat as empty
-  if STUB_MARKER not in content and content.strip():
+  if not force and STUB_MARKER not in content and content.strip():
     return None
-  await session.log("EMPTY SUBMISSION: solution.py is still the stub")
+  if force:
+    await session.log(
+        "EMPTY SUBMISSION: agent solution.py does not run standalone;"
+        " replacing it with the fallback")
+  else:
+    await session.log("EMPTY SUBMISSION: solution.py is still the stub")
   try:
     await session.write_file("output/solution.py",
                              _fallback_solution(ground_truth))
@@ -4062,11 +4318,18 @@ async def _empty_submission_guard(
   except Exception as exc:  # pylint: disable=broad-exception-caught
     await session.log(
         f"EMPTY SUBMISSION: could not write/run the fallback ({exc})")
-  report = (
-      "The agent failed to produce a model; the harness wrote a fallback"
-      f" model{' from ground truth' if ground_truth else ''}."
-      " Gates: not run on the fallback (the agent produced no model to"
-      " verify).")
+  if force:
+    report = (
+        "The agent's solution.py did not run alone in a clean directory"
+        " (it opened a file that only exists in the workdir), so it could"
+        " not be submitted; the harness replaced it with a fallback"
+        f" model{' from ground truth' if ground_truth else ''}.")
+  else:
+    report = (
+        "The agent failed to produce a model; the harness wrote a fallback"
+        f" model{' from ground truth' if ground_truth else ''}."
+        " Gates: not run on the fallback (the agent produced no model to"
+        " verify).")
   session.final_message = report
   return report
 
@@ -4141,6 +4404,7 @@ async def solve(session: taskbridge.Session) -> str:
   prev_scores = None  # score vector from the round before the last fix
   snapshot_exists = False  # whether /tmp/prev_output holds the pre-fix model
   needs_final_gate_pass = False  # the last action was a fix round
+  fix_rounds_used = 0  # fix rounds actually run (for the post-loop repair)
   try:
     for round_no in range(MAX_FIX_ROUNDS + 1):
       left = session.time_left()
@@ -4172,6 +4436,19 @@ async def solve(session: taskbridge.Session) -> str:
             " been restored. Do not rebuild the same way; change the"
             " construction, not the layout.\n")
       needs_final_gate_pass = False  # the gates just measured the current model
+      # Standalone check on the model this round will verify: the grader
+      # runs solution.py alone in an empty directory, so a script that
+      # opens ground_truth.json dies before scoring (run 12: 0.0 in 0.4 s)
+      # while every workdir run passes. A failure is a numbered gap for
+      # the fix round, like any gate failure.
+      if is_routing:
+        standalone_gap = await _standalone_check(worker)
+        if standalone_gap:
+          last_gate_gaps = _merge_gate_gaps(
+              last_gate_gaps, standalone_gap) if last_gate_gaps else standalone_gap
+          last_gate_verdict += (
+              "\nStandalone check: FAIL — solution.py does not run alone;"
+              " see the gaps.")
       # The verdict survives even if a later model call raises: attach it
       # to session.final_message (the deliverable) now, not only to the
       # return value at the end of solve(). On run 9 solve() raised a 503
@@ -4191,6 +4468,11 @@ async def solve(session: taskbridge.Session) -> str:
               + last_gate_verdict,
           ),
       )
+      # The verifier's reply was invisible in the log: on run 12 the
+      # trajectory recorded the tool calls but no text, so a verifier that
+      # passed a failing model could never be audited. Log it (clipped).
+      await session.log(
+          f"verifier reply (round {round_no + 1}): {clip(reply, 500)}")
       session.final_message = summary  # the verifier's text is not the summary
       if last_gate_gaps:
         session.final_message = (
@@ -4227,6 +4509,7 @@ async def solve(session: taskbridge.Session) -> str:
           " distance, coverage) verbatim and must not claim anything the gates"
           f" deny:\n{gaps}"
       )
+      fix_rounds_used += 1
       if not summary:
         summary = session.final_message
   except openai.OpenAIError as exc:
@@ -4253,6 +4536,50 @@ async def solve(session: taskbridge.Session) -> str:
         await worker.bash("rm -rf output && cp -r /tmp/prev_output output")
         last_gate_gaps, last_gate_verdict, scores = await _run_all_gates(
             worker, is_routing)
+  # Standalone check on the submitted model. The loop already checks every
+  # round, but the loop can break early on time and the final gate pass can
+  # restore a model the last round never checked — so check once more
+  # here, before the summary is final. A model that cannot run alone
+  # cannot be submitted (run 12: ERR_EXEC, 0.4 s).
+  if is_routing:
+    standalone_gap = await _standalone_check(worker)
+    if standalone_gap:
+      left = session.time_left()
+      if (fix_rounds_used < MAX_FIX_ROUNDS
+              and (left is None or left >= MIN_VERIFY_SEC)):
+        # One repair round: the agent embeds the numbers, and the model
+        # is re-measured before submission.
+        await session.log("standalone check failed; one repair round")
+        try:
+          fix_rounds_used += 1
+          summary = await worker.resume(
+              "An independent check found that output/solution.py does not"
+              " run alone in a clean directory. Fix it, then answer with"
+              " your updated summary. Your new summary must quote the gate"
+              " numbers verbatim and must not claim anything the gates"
+              f" deny:\n{standalone_gap}")
+        except openai.OpenAIError as exc:
+          await session.log(f"standalone repair round interrupted: {exc}")
+        else:
+          if not summary:
+            summary = session.final_message
+          last_gate_gaps, last_gate_verdict, scores = await _run_all_gates(
+              worker, is_routing)
+          standalone_gap = await _standalone_check(worker)
+          if standalone_gap:
+            last_gate_gaps = _merge_gate_gaps(
+                last_gate_gaps, standalone_gap) if last_gate_gaps else standalone_gap
+            last_gate_verdict += (
+                "\nStandalone check: FAIL — solution.py does not run alone;"
+                " see the gaps.")
+      if standalone_gap:
+        # No repair round left, or the repair did not make the script
+        # standalone: a fallback model that runs beats a 0.0 execution
+        # error. The guard replaces solution.py and returns the report.
+        guard = await _empty_submission_guard(
+            session, is_routing, ground_truth, force=True)
+        if guard is not None:
+          return guard
   if verified:
     summary += "\n\nIndependent verification: PASS."
   # Append the last round's gate verdict so the submitted summary always
@@ -4260,6 +4587,10 @@ async def solve(session: taskbridge.Session) -> str:
   # rounds ran out and the final model still fails a gate.
   if last_gate_gaps and "Deterministic gates:" not in summary:
     summary += "\n\nDeterministic gates:\n" + last_gate_verdict
+  # The agent's prose can claim a PASS the gates deny (run 12: "Clash
+  # count: 0 PASS" while SEP/CONN FAILed). Correct the record before the
+  # summary ships.
+  summary = _correct_summary(summary, last_gate_verdict)
   # Last check before returning: a summary is not a submission. If the
   # worker talked about a model it never wrote, the guard writes the
   # fallback and the failure report replaces the summary — the worker's
