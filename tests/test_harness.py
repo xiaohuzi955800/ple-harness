@@ -1712,6 +1712,131 @@ async def test_standalone_check_passes_clean():
         "STANDALONE FAIL" not in result, repr(result))
 
 
+async def test_empty_summary_still_verifies():
+  print("empty worker summary still runs the gates (run 13)")
+  # Run 13: the work phase died on a 503 ladder after solution.py was
+  # written, so the worker produced no summary text — and solve()
+  # returned "" without ever running the gates or the standalone check.
+  # With a real solution.py the harness must fall through to the verify
+  # loop instead: the gates run, the standalone failure reaches the
+  # worker as a fix round, and the result is a non-empty report.
+  import json
+  session = FakeSession(21600)
+  session.instruction = "Route the cable tray, busway and chilled water."
+  session.files["ground_truth.json"] = json.dumps(
+      _synthetic_ground_truth()).encode()
+  unit_pass = (
+      "exit code 0\nUNIT output/model.ifc: scale x1.000,"
+      " millimetre unit declared: True\n"
+      "UNIT_GATE: PASS (1 file(s), scale x1.0, millimetre units)")
+  ifc_pass = "exit code 0\nIFC_GATE: PASS (1 file(s), 0 EXPRESS violations)"
+  sep_pass = "exit code 0\nSEP collisions: 0\nSEP_GATE: PASS"
+  conn_pass = "exit code 0\nCONN_GATE: PASS"
+  FakeAgent.reset(
+      scripts={"worker": [""], "verifier": ["PASS", "PASS", "PASS"]},
+      bash_outputs=[unit_pass, ifc_pass, sep_pass, conn_pass] * 4,
+      standalone_result="STANDALONE_EXIT:1\nSTANDALONE_IFC:MISSING",
+      standalone_tail="NameError: name 'json' is not defined",
+  )
+  real = serve.Agent
+  serve.Agent = FakeAgent
+  try:
+    result = await serve.solve(session)
+  finally:
+    serve.Agent = real
+  check("verify loop ran (verifier was created)",
+        "verifier" in FakeAgent.roles(), FakeAgent.roles())
+  check("verifier got the harness placeholder, not an empty context",
+        "no summary text" in FakeAgent.first("verifier").context,
+        FakeAgent.first("verifier").context[:200])
+  worker = FakeAgent.first("worker")
+  check("two fix rounds used", len(worker.resumes) == 2, worker.resumes)
+  check("standalone gap reached the worker",
+        any("STANDALONE FAIL" in r for r in worker.resumes),
+        worker.resumes)
+  check("result is not empty", bool(result), repr(result))
+  check("fallback report returned, not a pass",
+        "did not run alone" in result, repr(result))
+  check("not marked verified",
+        "Independent verification: PASS." not in result, repr(result))
+  check("mandatory verification was logged",
+        any("mandatory first verification" in t for t in session.logs),
+        session.logs)
+
+
+async def test_empty_summary_passes_clean():
+  print("empty worker summary passes a clean model")
+  # Same fall-through as above, but the gates and the standalone check
+  # pass: the harness placeholder plus the verifier's PASS is a real
+  # verification, and the result carries it.
+  import json
+  session = FakeSession(21600)
+  session.instruction = "Route the cable tray, busway and chilled water."
+  session.files["ground_truth.json"] = json.dumps(
+      _synthetic_ground_truth()).encode()
+  unit_pass = (
+      "exit code 0\nUNIT output/model.ifc: scale x1.000,"
+      " millimetre unit declared: True\n"
+      "UNIT_GATE: PASS (1 file(s), scale x1.0, millimetre units)")
+  ifc_pass = "exit code 0\nIFC_GATE: PASS (1 file(s), 0 EXPRESS violations)"
+  sep_pass = "exit code 0\nSEP collisions: 0\nSEP_GATE: PASS"
+  conn_pass = "exit code 0\nCONN_GATE: PASS"
+  FakeAgent.reset(
+      scripts={"worker": [""], "verifier": ["PASS"]},
+      bash_outputs=[unit_pass, ifc_pass, sep_pass, conn_pass],
+  )
+  real = serve.Agent
+  serve.Agent = FakeAgent
+  try:
+    result = await serve.solve(session)
+  finally:
+    serve.Agent = real
+  check("result verified",
+        result.endswith("Independent verification: PASS."), repr(result))
+  check("result is the harness summary, not empty",
+        "no summary text" in result, repr(result))
+  check("no fix round needed", len(FakeAgent.first("worker").resumes) == 0,
+        FakeAgent.first("worker").resumes)
+
+
+async def test_empty_summary_verifier_fails_too():
+  print("empty worker summary plus a failed verifier still returns text")
+  # The endpoint is down for both phases: the worker wrote no summary
+  # and the verifier returns nothing. The gates and the standalone check
+  # pass, so there is nothing to fix — but the task must still end with
+  # a non-empty harness summary, never a 0-byte final_message.
+  import json
+  session = FakeSession(21600)
+  session.instruction = "Route the cable tray, busway and chilled water."
+  session.files["ground_truth.json"] = json.dumps(
+      _synthetic_ground_truth()).encode()
+  unit_pass = (
+      "exit code 0\nUNIT output/model.ifc: scale x1.000,"
+      " millimetre unit declared: True\n"
+      "UNIT_GATE: PASS (1 file(s), scale x1.0, millimetre units)")
+  ifc_pass = "exit code 0\nIFC_GATE: PASS (1 file(s), 0 EXPRESS violations)"
+  sep_pass = "exit code 0\nSEP collisions: 0\nSEP_GATE: PASS"
+  conn_pass = "exit code 0\nCONN_GATE: PASS"
+  FakeAgent.reset(
+      scripts={"worker": [""], "verifier": [""]},
+      bash_outputs=[unit_pass, ifc_pass, sep_pass, conn_pass],
+  )
+  real = serve.Agent
+  serve.Agent = FakeAgent
+  try:
+    result = await serve.solve(session)
+  finally:
+    serve.Agent = real
+  check("result is not empty", bool(result), repr(result))
+  check("result is the harness summary",
+        "no summary text" in result, repr(result))
+  check("not marked verified",
+        "Independent verification: PASS." not in result, repr(result))
+  check("verifier failure was logged",
+        any("verify phase returned no text" in t for t in session.logs),
+        session.logs)
+
+
 def test_correct_summary():
   print("final-message correction quotes the real gate numbers")
   verdict = ("Unit gate: no failures reported\n"
@@ -1985,6 +2110,17 @@ def test_routing_fix_guidance():
         "Set tier heights from the sprinkler numbers" in prompt)
   check("drop direction from the gate",
         "the gate measured it in 3D" in prompt)
+  check("import every module",
+        "Import every module solution.py uses" in prompt)
+  check("fix the crash and re-run",
+        "do not stop while the last run crashed" in prompt)
+  check("CRAH replaces racks",
+        "CRAH replaces racks" in prompt)
+  check("trunk must touch every header",
+        "A trunk must touch every header it feeds" in prompt)
+  check("evidence: fix a failed check and re-run",
+        "never finish while the last run of a deliverable crashed"
+        in prompt)
 
 
 async def main():
@@ -2024,6 +2160,9 @@ async def main():
   test_fallback_solution()
   await test_standalone_check_blocks_submission()
   await test_standalone_check_passes_clean()
+  await test_empty_summary_still_verifies()
+  await test_empty_summary_passes_clean()
+  await test_empty_summary_verifier_fails_too()
   test_correct_summary()
   test_band_validation()
   test_sep_gate_riser()

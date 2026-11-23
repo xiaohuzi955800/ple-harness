@@ -210,6 +210,10 @@ objective value. Check each constraint explicitly before you finish.
 - If the task names a check (a validator, a test command, a format), run that exact check with the exact flags on \
 the final deliverable before finishing, and paste its verbatim output in your summary. A check you did not run is \
 a check you failed. Never report 'verified' from a weaker check.
+- If a check fails, fix the failure and run the check again — never finish while the last run of a deliverable \
+crashed. A NameError or ImportError is a one-line fix, not a reason to stop: on a real run the script built and \
+validated the whole model, then died on a json.dump with no `import json`, and the run scored 0 because nobody \
+re-ran it after the fix.
 - The container has no internet access: do not try pip install. List installed packages first (pip list) and work \
 with what is there.
 """
@@ -303,7 +307,15 @@ every number the script needs into solution.py as literals (row positions, CRAH 
 heights). NEVER call open() on ground_truth.json, an input file, or routing.json inside solution.py — reading \
 those files while you are *building* the model is fine, but the delivered script must not depend on them. \
 Before you finish, prove it: copy solution.py alone to a clean directory (no ground_truth.json anywhere near \
-it) and run it there; if it crashes, it is not a deliverable.
+it) and run it there; if it crashes, it is not a deliverable. Fix the crash and run it again until it exits 0 \
+— do not stop while the last run crashed.
+- Import every module solution.py uses at the top (json, os, sys, math, ifcopenshell): on a real run the script \
+built and validated the whole model, then died on a json.dump with no `import json` — one missing line, zero score.
+- Build the hall without overlaps: a CRAH replaces racks — leave its slot empty, do not fill a row completely \
+and then put a CRAH box on top of the racks (on a real run that alone was 48 clashes). A column standing inside \
+a row band means jog the header around it and skip the racks where the column stands. A trunk must touch every \
+header it feeds — end it at the header's face (x=1800 here), not short of the rows: on a real run a 658 mm tray \
+gap and a 516 mm CHW gap each disconnected a whole service.
 - Connect in this order: (a) the service entry first — a feeder from the entry marked on the drawings to your first \
 header; (b) one header per row, every row, all three services; (c) a drop from the CHW header to every CRAH, \
 including perimeter units the row headers do not pass. Never submit a route with one segment per service; every \
@@ -4397,7 +4409,26 @@ async def solve(session: taskbridge.Session) -> str:
     guard = await _empty_submission_guard(session, is_routing, ground_truth)
     if guard is not None:
       return guard
-    return session.final_message
+    # A real deliverable exists but the worker wrote no summary (run 13:
+    # the work phase died on a 503 ladder after solution.py was written,
+    # so the agent never saw its own NameError and never answered). Do
+    # NOT return here: the model still needs its first verification, and
+    # every check below is unreachable otherwise — on run 13 the gates,
+    # the standalone check, the verifier, the fix rounds and the summary
+    # correction all ran zero times because of this early return. The
+    # gates and the standalone check need no model call, so they run even
+    # while the endpoint is down; only the fix rounds need it. Fall
+    # through to the verify loop with a harness-authored placeholder
+    # summary, so the task never ends with a 0-byte final_message.
+    await session.log(
+        "worker produced no summary; running mandatory first verification"
+        " on the existing deliverable")
+    summary = (
+        "The worker produced no summary text (the work phase ended before"
+        " it could answer)."
+        + (" The deliverable is output/solution.py — verify it from the"
+           " files and the gate results below, not from a summary."
+           if is_routing else ""))
   verified = False
   last_gate_gaps = ""
   last_gate_verdict = ""
