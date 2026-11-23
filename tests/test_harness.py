@@ -1392,6 +1392,11 @@ async def test_planner_skipped_with_ground_truth():
         "Ground truth measured from the drawings"
         in FakeAgent.first("worker").plan,
         FakeAgent.first("worker").plan)
+  check("merged ground truth copied to output/",
+        "output/ground_truth.json" in session.files
+        and json.loads(session.files["output/ground_truth.json"])["rows"][0]
+        ["name"] == "A",
+        list(session.files))
   check("summary names the rows",
         "A 3000" in FakeAgent.first("worker").plan
         and "B 6000" in FakeAgent.first("worker").plan)

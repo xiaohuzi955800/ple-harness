@@ -3712,7 +3712,18 @@ async def _run_draw_tools(session: taskbridge.Session,
       f" {len(ground_truth.get('rows', []))} rows,"
       f" {len(ground_truth.get('crahs', []))} CRAHs,"
       f" entry {ground_truth.get('entry_drawn', {}).get('xy')}")
-  return await _vision_call(session, ground_truth)
+  merged = await _vision_call(session, ground_truth)
+  # Copy the merged ground truth into output/ so it ships with the
+  # artifacts (the workdir copy is not uploaded). A failure here must
+  # never break the run.
+  try:
+    await session.write_file(
+        "output/" + GROUND_TRUTH_NAME, json.dumps(merged, indent=2))
+  except Exception as exc:  # pylint: disable=broad-exception-caught
+    await session.log(
+        f"DRAW_TOOLS: could not copy {GROUND_TRUTH_NAME} to output/"
+        f" ({type(exc).__name__}: {exc})")
+  return merged
 
 
 def _ground_truth_summary(ground_truth: dict) -> str:
