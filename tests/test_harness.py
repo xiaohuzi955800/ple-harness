@@ -87,6 +87,13 @@ class FakeAgent:
   # session.final_message, which already carries the previous round's
   # gate verdict).
   resume_texts = None
+  # Canned md5sum outputs for _solution_hash: when set, each call pops
+  # one (a fix round that edits solution.py changes the hash; one that
+  # dies on an endpoint error leaves it unchanged — run 17). When unset,
+  # each call returns a fresh hash, i.e. the model changed, so existing
+  # solve() tests never trigger a fix-round retry.
+  solution_hashes = None
+  _hash_counter = 0
 
   def __init__(
       self,
@@ -131,6 +138,18 @@ class FakeAgent:
       # operation in the task container, not a gate measurement. Pretend it
       # worked so it never consumes a canned gate output.
       return "SNAPSHOT_OK"
+    if "best_output" in command:
+      # The best-model tracker's snapshot/restore (run 17): same shape as
+      # the regression guard's, never a gate measurement.
+      return "BEST_OK"
+    if "md5sum" in command:
+      # _solution_hash: the fix-round retry detector. A canned list
+      # simulates a round that leaves the model unchanged; otherwise
+      # every call differs, i.e. the model changed.
+      if FakeAgent.solution_hashes:
+        return FakeAgent.solution_hashes.pop(0)
+      FakeAgent._hash_counter += 1
+      return f"hash{FakeAgent._hash_counter}  output/solution.py"
     if "cp output/solution.py" in command and "/tmp/standalone" in command:
       # The standalone check runs solution.py alone in a clean directory;
       # the canned result stands in for the run. Never consumes a gate
@@ -146,13 +165,16 @@ class FakeAgent:
   @classmethod
   def reset(cls, scripts=None, fail_roles=None, bash_outputs=None,
             standalone_result=None, standalone_tail=None,
-            resume_texts=None):
+            resume_texts=None, solution_hashes=None):
     cls.instances = []
     cls.scripts = dict(scripts or {})
     cls.fail_roles = set(fail_roles or ())
     cls.bash_outputs = list(bash_outputs or [])
     cls.resume_texts = (
         list(resume_texts) if resume_texts is not None else None)
+    cls.solution_hashes = (
+        list(solution_hashes) if solution_hashes is not None else None)
+    cls._hash_counter = 0
     cls.standalone_result = (
         standalone_result if standalone_result is not None
         else "STANDALONE_EXIT:0\nSTANDALONE_IFC:OK")
@@ -2587,6 +2609,281 @@ def test_routing_fix_guidance():
         and "tray-CHW and busway-CHW need the same 300 mm" in prompt)
   check("plenum riser warning",
         "rise BESIDE the CRAH" in prompt)
+  # Run 17: the v8 warning is now a ban — the underfloor CHW + riser
+  # route scored 91 in run 16's v8 and 118 in run 17, and a riser from
+  # an underfloor header must cross the solid slab (52 of the 118
+  # clashes were the slab alone). The riser base is the header's TOP
+  # face, stated in create_box terms; a CRAH inside its header's band
+  # needs no branch; the agent keeps its best model (run 17 threw away
+  # a 64-clash model for a 118-clash one inside the work phase).
+  check("underfloor CHW banned",
+        "CHW stays overhead" in prompt, prompt)
+  check("slab band rule",
+        "no segment except the slab itself may occupy z -300..0" in prompt,
+        prompt)
+  check("riser base is the header top face",
+        "header_z + 168.3" in prompt and "-132" in prompt, prompt)
+  check("CRAH inside its header band needs no branch",
+        "needs NO branch" in prompt, prompt)
+  check("keep your best model",
+        "Keep your best model" in prompt
+        and "/tmp/best_solution.py" in prompt, prompt)
+
+
+def test_defects_run17_calibration():
+  print("run-17 defect scores: the 64-clash model is worse than the "
+        "118-clash one")
+  # From the run-17 trajectory's own gate outputs: the step-43 model had
+  # 64 clashes but CHW in 4 components (a 390 mm break in the perimeter
+  # header); the submitted model had 118 clashes and CONN PASS. By the
+  # calibrated defect score the submitted model is better, so the
+  # best-model tracker must NOT restore the 64 model over it — the check
+  # record's framing ("the guard threw away the better model") is wrong
+  # on this run. The tracker still matters: it is the only guard that
+  # sees work-phase intermediates at all.
+  model64 = {"unit_ok": True, "ifc_ok": True, "frame_ok": True,
+             "clashes": 64, "max_components": 4,
+             "components": {"tray": 1, "busway": 1, "chw": 4},
+             "rows_below_80": 0}
+  submitted = {"unit_ok": True, "ifc_ok": True, "frame_ok": True,
+               "clashes": 118, "max_components": 1,
+               "components": {"tray": 1, "busway": 1, "chw": 1},
+               "rows_below_80": 0}
+  check("64-clash model defects are 139",
+        serve._defects(model64) == 139, serve._defects(model64))
+  check("submitted model defects are 118",
+        serve._defects(submitted) == 118, serve._defects(submitted))
+  check("submitted is not a regression over the 64 model",
+        not serve._is_regression(model64, submitted))
+  check("the 64 model IS a regression over the submitted one",
+        serve._is_regression(submitted, model64))
+
+
+async def test_best_model_survives_inconclusive_round():
+  print("best model survives an inconclusive middle round (run 17)")
+  session = FakeSession(21600)
+  session.instruction = "Route the cable tray, busway and chilled water."
+  unit_pass = (
+      "exit code 0\nUNIT output/model.ifc: scale x1.000,"
+      " millimetre unit declared: True\n"
+      "UNIT_GATE: PASS (1 file(s), scale x1.0, millimetre units)")
+  ifc_pass = "exit code 0\nIFC_GATE: PASS (1 file(s), 0 EXPRESS violations)"
+
+  def sep_fail(n):
+    return (
+        f"exit code 0\nSEP collisions: {n}\n"
+        f"SEP FAIL: {n} clashes (boxes overlapping > 2 mm on all axes)\n"
+        "SEP_GATE: FAIL")
+
+  conn_pass = (
+      "exit code 0\nCONN tray: 1 connected component(s)\n"
+      "CONN busway: 1 connected component(s)\n"
+      "CONN chw: 1 connected component(s)\n"
+      "CONN_GATE: PASS")
+  unit_skip = "exit code 0\nUNIT_GATE: SKIP (no .ifc files under output/)"
+  ifc_skip = "exit code 0\nIFC_GATE: SKIP (no .ifc files under output/)"
+  sep_skip = "exit code 0\nSEP_GATE: SKIP (no .ifc files under output/)"
+  conn_skip = "exit code 0\nCONN_GATE: SKIP (no .ifc files under output/)"
+
+  FakeAgent.reset(
+      scripts={
+          "planner": ["p"],
+          "worker": ["worker summary"],
+          "verifier": ["FAIL: 64 clashes",
+                       "FAIL: gates inconclusive; re-measure.",
+                       "FAIL: 118 clashes"],
+      },
+      bash_outputs=[
+          # Round 1: the good model — SEP 64, CONN PASS (defects 64).
+          unit_pass, ifc_pass, sep_fail(64), conn_pass,
+          # Round 2: inconclusive — every gate SKIPs, so the adjacent
+          # guard's memory is erased (prev_scores becomes None).
+          unit_skip, ifc_skip, sep_skip, conn_skip,
+          # Round 3: the worse model — SEP 118, CONN PASS (defects 118).
+          unit_pass, ifc_pass, sep_fail(118), conn_pass,
+          # End-of-solve best restore re-runs the gates on the restored
+          # best model (64 again).
+          unit_pass, ifc_pass, sep_fail(64), conn_pass,
+      ],
+  )
+  real = serve.Agent
+  serve.Agent = FakeAgent
+  try:
+    result = await serve.solve(session)
+  finally:
+    serve.Agent = real
+  worker = FakeAgent.first("worker")
+  check("fix-round prompt is a numbered checklist",
+        "1. " in worker.resumes[0], worker.resumes[0])
+  check("fix-round prompt re-injects the riser rule",
+        "TOP face" in worker.resumes[0], worker.resumes[0])
+  check("best-model restore logged",
+        any("restoring the best" in log for log in session.logs),
+        session.logs)
+  check("best-model restore noted in the summary",
+        "the best model" in result and "was restored" in result,
+        repr(result))
+  check("submitted verdict is the restored 64-clash model",
+        "64 clashes" in result, repr(result))
+
+
+async def test_fix_round_resume_retries_unchanged():
+  print("a fix round that changes nothing is retried")
+  session = FakeSession(21600)
+  session.instruction = "Route the cable tray, busway and chilled water."
+  FakeAgent.reset(
+      resume_texts=["fixed summary (1)", "fixed summary (2)"],
+      solution_hashes=["h1  output/solution.py", "h1  output/solution.py",
+                       "h2  output/solution.py"],
+  )
+  worker = FakeAgent(session, role="worker")
+  result = await serve._fix_round_resume(
+      worker, "fix the joints", waits=(0, 0))
+  check("resume retried once when the model did not change",
+        len(worker.resumes) == 2, worker.resumes)
+  check("returns the retried summary",
+        result == "fixed summary (2)", result)
+
+
+async def test_fix_round_resume_no_retry_when_changed():
+  print("a fix round that edits the model is not retried")
+  session = FakeSession(21600)
+  session.instruction = "Route the cable tray, busway and chilled water."
+  FakeAgent.reset(
+      solution_hashes=["h1  output/solution.py", "h2  output/solution.py"])
+  worker = FakeAgent(session, role="worker")
+  result = await serve._fix_round_resume(
+      worker, "fix the joints", waits=(0, 0))
+  check("resume called once when the model changed",
+        len(worker.resumes) == 1, worker.resumes)
+  check("returns the first summary",
+        result == "fixed summary (1)", result)
+
+
+async def test_fix_round_resume_gives_up_after_retries():
+  print("a fix round that never changes the model is retried twice, "
+        "then gives up")
+  session = FakeSession(21600)
+  session.instruction = "Route the cable tray, busway and chilled water."
+  FakeAgent.reset(
+      resume_texts=["fixed summary (1)", "fixed summary (2)",
+                    "fixed summary (3)"],
+      solution_hashes=["h1  output/solution.py"] * 4,
+  )
+  worker = FakeAgent(session, role="worker")
+  result = await serve._fix_round_resume(
+      worker, "fix the joints", waits=(0, 0))
+  check("resume retried twice then gives up",
+        len(worker.resumes) == 3, worker.resumes)
+  check("returns the last summary",
+        result == "fixed summary (3)", result)
+
+
+def test_number_checklist():
+  print("fix-round gaps are numbered as a checklist")
+  check("lines numbered in order",
+        serve._number_checklist("SEP FAIL: 118 clashes\nCONN FAIL: chw")
+        == "1. SEP FAIL: 118 clashes\n2. CONN FAIL: chw")
+  check("blank lines dropped",
+        serve._number_checklist("\n  \nFAIL: x\n") == "1. FAIL: x")
+  check("empty gaps give empty checklist",
+        serve._number_checklist("") == "")
+
+
+def test_sep_gate_slab_diagnostic():
+  print("separation gate names slab overlaps (run 17)")
+  try:
+    import ifcopenshell  # noqa: F401
+  except ImportError:
+    print("  skipped: ifcopenshell not installed")
+    return
+  import shutil
+  import tempfile
+
+  base = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                      "fixtures")
+  with tempfile.TemporaryDirectory() as tmp:
+    # Run 17: 52 of the 118 clashes involve the slab — the underfloor
+    # CHW headers, trunks, branches and risers all sit inside the solid
+    # 300 mm slab band (z -300..0). The gate must name the slab and the
+    # rule, and the clash count must still match the grader exactly.
+    workdir = os.path.join(tmp, "run17")
+    shutil.copytree(os.path.join(base, "run17-model"), workdir)
+    out = _run_sep_gate(workdir)
+    check("run-17 model reports 118 clashes",
+          "SEP collisions: 118" in out, out)
+    check("run-17 slab count is 52",
+          "SEP slab: 52 clash(es) involve the slab" in out, out)
+    check("run-17 slab gap names the rule",
+          "underfloor segments must run below z -300" in out, out)
+    check("run-17 joints are grouped",
+          "SEP FAIL: 3 chw joint(s)" in out
+          and "SEP FAIL: 39 chw joint(s)" in out, out)
+    check("run-17 starts-inside group is 23",
+          "SEP FAIL: 23 chw segment(s) start inside the box they join"
+          in out, out)
+    check("run-17 branch named as starts-inside, not a face move",
+          "CHW-Branch-CRAH-A01 lies inside CHW-Header-A on the y axis"
+          in out, out)
+    check("run-17 riser named with the top face",
+          "CHW-Riser-CRAH-A01 ends at z=-300 inside CHW-Header-A "
+          "(z -300..-132); end it at the chw face z=-132" in out, out)
+    # Run 9: the double-placement model — its clashes are not slab
+    # pairs, so no slab line may appear.
+    workdir = os.path.join(tmp, "run9")
+    shutil.copytree(os.path.join(base, "run9-model"), workdir)
+    out = _run_sep_gate(workdir)
+    check("run-9 model reports 10 clashes",
+          "SEP collisions: 10" in out, out)
+    check("run-9 has no slab clashes", "SEP slab:" not in out, out)
+
+
+def test_sep_gate_starts_inside():
+  print("separation gate reports a segment embedded in a header as "
+        "starts-inside, not as a face move")
+  try:
+    import ifcopenshell  # noqa: F401
+  except ImportError:
+    print("  skipped: ifcopenshell not installed")
+    return
+  import tempfile
+
+  with tempfile.TemporaryDirectory() as tmp:
+    # A CHW branch from a CRAH inside its header's band: the branch
+    # starts at the header's face and ends inside the band, so no
+    # endpoint move fixes it — the branch is redundant (the riser
+    # alone connects the CRAH). A riser whose base is the header's
+    # base (-300) instead of its top face (-132) is a plain joint.
+    outdir = os.path.join(tmp, "starts", "output")
+    os.makedirs(outdir)
+    _build_test_ifc(os.path.join(outdir, "model.ifc"), [
+        ('IfcPipeSegment', 'CHW-Header-A', 17600, 168.3, 168.3,
+         10350, 4500, -300),
+        ('IfcPipeSegment', 'CHW-Branch-CRAH-A01', 168.3, 80.15, 168.3,
+         4528, 4455.9, -300),
+        ('IfcPipeSegment', 'CHW-Riser-CRAH-A01', 114.3, 114.3, 300,
+         4528, 4496, -300),
+    ])
+    out = _run_sep_gate(os.path.join(tmp, "starts"))
+    check("starts-inside model has 3 clashes",
+          "SEP collisions: 3" in out, out)
+    check("branch reported as starts-inside",
+          "CHW-Branch-CRAH-A01 lies inside CHW-Header-A on the y axis"
+          in out, out)
+    check("starts-inside group named",
+          "1 chw segment(s) start inside the box they join" in out, out)
+    check("riser still named with the top face",
+          "CHW-Riser-CRAH-A01 ends at z=-300 inside CHW-Header-A "
+          "(z -300..-132); end it at the chw face z=-132" in out, out)
+    check("two z joints: riser-header and branch-riser",
+          "SEP FAIL: 2 chw joint(s)" in out, out)
+    # The branch's overlap with the riser is a real z joint (its top is
+    # inside the riser), but the branch-header pair must never be
+    # diagnosed as a plan-axis face move — that message would tell the
+    # agent to slide the branch along x or y, which cannot fix it.
+    check("no plan-axis face move for the branch",
+          "CHW-Branch-CRAH-A01 ends at x=" not in out
+          and "CHW-Branch-CRAH-A01 ends at y=" not in out, out)
 
 
 async def main():
@@ -2640,6 +2937,14 @@ async def main():
   test_sep_gate_riser()
   test_conn_gate_entry_aabb()
   await test_retry_429_capped()
+  test_defects_run17_calibration()
+  await test_best_model_survives_inconclusive_round()
+  await test_fix_round_resume_retries_unchanged()
+  await test_fix_round_resume_no_retry_when_changed()
+  await test_fix_round_resume_gives_up_after_retries()
+  test_number_checklist()
+  test_sep_gate_slab_diagnostic()
+  test_sep_gate_starts_inside()
   test_routing_fix_guidance()
   print("ALL TESTS PASSED")
 

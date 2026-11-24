@@ -390,26 +390,36 @@ most common cause of clashes. The unrotated box style above cannot make this mis
 a box whose bottom is the CRAH top and whose top reaches the header — never place a drop at the header and \
 extrude upward:
   create_box_extrusion(w, w, z_top - z_bottom, x, y, z_bottom)  # drop from header z_top down to CRAH top z_bottom
-- **A riser is not a drop.** When a service runs in the under-floor plenum, the vertical segment to a CRAH goes \
-UP: its bottom must touch the under-floor header and its top must reach the CRAH. Either end touching a \
-horizontal segment of the same service counts as connected — but the segment must touch at one end; a vertical \
-segment whose neither end is within 250 mm of a horizontal segment is not connected, even if it happens to \
-touch another segment.
+- **A riser is not a drop.** When a service runs overhead, the vertical segment to a CRAH goes DOWN: it is a \
+drop, and its top ends at the header's BOTTOM face. When a service runs in the under-floor plenum, the vertical \
+segment to a CRAH goes UP: it is a riser, and in create_box(w, d, h, cx, cy, z) the z you pass is the BASE, \
+so the riser base must be the header's TOP face — base = header_z + 168.3 (the insulated CHW profile height; \
+for CHW that is -300 + 168.3 = -132), height = 0 - base — and its top must reach the CRAH base (z=0). NEVER \
+set the base to the header's base (-300): a riser spanning the header's full height overlaps it by the whole \
+profile height (168.3 mm) — on a real run that was 43 of the 118 clashes, every one a riser ending at z=-300 \
+instead of z=-132. Either end touching a horizontal segment of the same service counts as connected — but the \
+segment must touch at one end; a vertical segment whose neither end is within 250 mm of a horizontal segment \
+is not connected, even if it happens to touch another segment. And risers from underfloor headers are banned \
+altogether by the slab rule below — CHW stays overhead, so build drops, not risers.
 - **CHW drop recipe (build every drop this way).** Most CRAHs sit within 66 mm of their row centreline, but \
 one can be ~400 mm off (on a real run CRAH-D01 was 389 mm off row D and its drop hung 398 mm from the header). \
-So for EVERY CRAH: first build a horizontal branch at header height from the row centreline to the CRAH's \
-(x, y) — the branch starts at the header's side face (butt joint, 0 mm overlap) and ends at the drop's side \
-face. Then build the vertical drop from the branch's TOP face up to the CRAH base (z=0): the drop starts at \
-z = header_z + 168.3 (the insulated CHW profile height), never at the header's bottom. A drop that spans the \
-header's full height overlaps it by 168.3 mm — on a real run that was 17 of the 26 CHW clashes, every one a \
-drop built to the header's centreline instead of its top face.
-- Every CRAH needs a horizontal branch from the nearest header or trunk to the CRAH's (x, y), then a drop down \
-from the branch end. A CRAH directly below a trunk still needs a branch — first measure the trunk's extent; \
-if the CRAH's position is outside it, build a branch. Never skip a branch because the CRAH's x matches the \
-trunk's x: a trunk that ends short of the CRAH's y leaves the drop hanging in mid-air. A drop whose top is \
-not within 250 mm of a horizontal segment of the same service is not connected, even if it happens to touch \
-another segment. When the separation gate names the nearest horizontal segment and a direction ("417 mm away \
-to the east"), build the branch in exactly that direction — the gate measured it in 3D.
+So for EVERY CRAH: first decide whether it needs a horizontal branch at all — a CRAH inside its header's band \
+(within half the 168.3 mm profile of the centreline, which is most of them) needs NO branch: the vertical drop \
+alone connects it, at the CRAH's (x, y); a branch there would start inside the header and overlap it along its \
+whole length (on a real run that was 21 of the 118 clashes, plus 22 where the branch overlapped its own riser). \
+Only a CRAH OUTSIDE its header's band gets a branch: build it at header height from the header's side face \
+(butt joint, 0 mm overlap) to the CRAH's (x, y). Then build the vertical drop DOWN from the header's BOTTOM \
+face to the CRAH top: in create_box(w, d, h, cx, cy, z) the z you pass is the BASE, so the drop base is the \
+CRAH top and its height is header base minus CRAH top — its TOP must end exactly at the header's bottom face, \
+never inside the header (on a real run the drops spanned z 2000..2930, tops exactly at the header bottom face, \
+and that was 0 clashes). A drop whose top pokes into the header overlaps it by the full profile height.
+- A CRAH directly below a trunk still needs a branch when it is outside the trunk's extent — first measure \
+the trunk's extent; if the CRAH's position is outside it, build a branch. Never skip a branch because the \
+CRAH's x matches the trunk's x: a trunk that ends short of the CRAH's y leaves the drop hanging in mid-air. \
+A drop whose top is not within 250 mm of a horizontal segment of the same service is not connected, even if \
+it happens to touch another segment. When the separation gate names the nearest horizontal segment and a \
+direction ("417 mm away to the east"), build the branch in exactly that direction — the gate measured it \
+in 3D.
 - Keep the three services on separate tiers or separated horizontally, from the elevation band in \
 ground_truth.json — NOT at fixed heights of your own. The overhead band is only 515 mm high (z 2600-3115, \
 between the 2600 mm clear height and the 460 mm sprinkler standoff), and the three profiles stacked (tray 127 \
@@ -423,10 +433,16 @@ tray-busway: tray-CHW and busway-CHW need the same 300 mm on at least one axis �
 services shared the same aisle centrelines (y=4500/9900/15300) with only 23-33 mm between tiers, which is why \
 the tray-busway separation measured 23.0 mm and there were 18 rule violations. The formula is centreline \
 distance >= 300 + half-width A + half-width B: for tray-busway that is 300 + 341.5 + 64 = 705.5 mm — e.g. \
-tray at aisle-400 and busway at aisle+400 gives 800 mm centrelines and a 394.5 mm edge gap. Do not put a \
-service under the floor and hope the riser fixes itself: on a real run CHW underfloor (z=-300) with a riser \
-scored 91 clashes against 34 all-overhead — a riser must rise BESIDE the CRAH and join with a short branch \
-to the header face, never through the CRAH. An X corridor does NOT separate services: it only separates \
+tray at aisle-400 and busway at aisle+400 gives 800 mm centrelines and a 394.5 mm edge gap. **CHW stays \
+overhead. Never run CHW under the floor and rise to a CRAH: a riser from an underfloor header must cross the \
+slab (a solid 300 mm box, z -300..0) to reach the CRAH, so every riser clashes with it — on a real run the \
+underfloor CHW design scored 118 clashes against 34 all-overhead, and 52 of the 118 were the slab alone; with \
+this slab no underfloor CHW design can score below ~30 clashes even with perfect joints. Even a riser that \
+would rise BESIDE the CRAH still crosses the slab band to reach it, so that does not help either. An underfloor \
+service is allowed only BELOW the slab (its top at most -300, e.g. busway at -600) and only for a run that \
+never rises to a CRAH (the harness fallback's busway at -865 scores 0 clashes). Check: no segment except the \
+slab itself may occupy z -300..0 — after every build run python3 /tmp/sep_gate.py and confirm no clash pair \
+names the slab.** An X corridor does NOT separate services: it only separates \
 trunks running along Y — headers running along X cross the whole hall on the same row and overlap along their \
 full length unless the services are separated on at least one axis. And centreline spacing is not edge \
 spacing: two 600 mm wide trunks whose centrelines are 400 mm apart overlap by 200 mm. Subtract the box width \
@@ -451,6 +467,13 @@ a 2000 mm threshold and always reports 0 clashes — on a real run exactly such 
 gate measured 92, and the agent believed its own script. Never assert a clash count from zoning or placement \
 reasoning either: a self-check that prints "ALL GATES PASSED" from design intent, without a pairwise overlap \
 computation, is not a measurement.
+- **Keep your best model.** After every rewrite, run /tmp/sep_gate.py and /tmp/conn_gate.py and write down \
+the clash count and the component counts. Whenever a rewrite improves them, copy output/solution.py to \
+/tmp/best_solution.py. If a rewrite makes the clash count worse without improving connectivity, restore the \
+best copy (cp /tmp/best_solution.py output/solution.py) and fix from there — never answer with a model that \
+is worse on both counts than one you already had. On a real run the agent's best model (64 clashes) was \
+thrown away for a 118-clash rewrite and the submitted model was the worse one; the harness cannot recover a \
+model you overwrote.
 - If you cannot extract a drawing value after a few tries, record what you could extract and move on with \
 clearly-labelled assumptions — do not keep re-trying the same extraction.
 """
@@ -3076,12 +3099,15 @@ def main():
     # 1. Collision count: every pair of boxes overlapping > CLASH_TOL on all axes.
     clashes = {}
     total = 0
+    slab_pairs = 0
     for i in range(len(items)):
         for j in range(i + 1, len(items)):
             ov = _overlap(items[i][4], items[i][5], items[j][4], items[j][5])
             if ov is None or min(ov) <= CLASH_TOL:
                 continue
             total += 1
+            if items[i][0].is_a('IfcSlab') or items[j][0].is_a('IfcSlab'):
+                slab_pairs += 1
             key = tuple(sorted((items[i][1], items[j][1])))
             clashes[key] = clashes.get(key, 0) + 1
     print(f"SEP collisions: {total}")
@@ -3089,6 +3115,14 @@ def main():
         print(f"SEP   {' x '.join(key)}: {clashes[key]}")
     if total:
         problems.append(f"{total} clashes (boxes overlapping > {CLASH_TOL:.0f} mm on all axes) — joints must be butt joints (0 mm overlap) or leave a gap, never overlapping boxes")
+    # 1a. Slab overlaps: the slab is a solid box (z -300..0), so any
+    # underfloor segment at header height and any riser through it
+    # clashes with it — on run 17 that was 52 of the 118 clashes, and
+    # the category count ("chw x other") never says so. Name the slab
+    # count explicitly so the fix round sees it in one line.
+    if slab_pairs:
+        print(f"SEP slab: {slab_pairs} clash(es) involve the slab (underfloor segments must run below z -300, never inside the slab band -300..0)")
+        problems.append(f"{slab_pairs} clash(es) involve the slab — underfloor segments must run below z -300, never inside the slab band -300..0 (CHW stays overhead; see the guide)")
     # 1b. Rack overlaps: name the racks that overlap CRAHs or columns, so
     # the fix round knows exactly which rack positions to skip. A CRAH
     # replaces racks — on run 15 the agent filled every row completely and
@@ -3113,7 +3147,6 @@ def main():
         more = f' (+{len(rack_hits) - 10} more)' if len(rack_hits) > 10 else ''
         problems.append(
             f"{len(rack_hits)} racks overlap CRAHs or columns — {names}{more}; a CRAH replaces racks: skip any rack whose centre is within 900 mm in x and 950 mm in y of a CRAH centre (CRAH 1200x900, rack 600x1000)")
-    # 1c. Joint overlaps: name the same-service joints built to a
     # centreline instead of a face. When one segment's endpoint lies
     # inside another segment's box, the joint overlaps by exactly the
     # overshoot — on run 16 every one of the 24 CHW clashes was a branch
@@ -3124,8 +3157,25 @@ def main():
     # width on that axis), never at its centreline. Each pair is reported
     # once, moving the shorter segment (the branch, tie or feeder is
     # almost always the shorter one); the face is the side its other end
-    # approaches from.
+    # approaches from. Two shapes do NOT fit that model and are reported
+    # separately: (a) a segment that STARTS inside the box it joins —
+    # both endpoints on its shortest axis lie inside the other box, and
+    # moving the inside endpoint to the face would leave ~zero length
+    # (on run 17 every CHW branch starts inside its header's y-band,
+    # because the CRAH sits on the row centreline). No endpoint move
+    # fixes that: delete the segment or move it to another z. The old
+    # diagnostic named the wrong axis for those pairs ("end it at the
+    # chw face x=1184" for a branch at x=4444 — following it would
+    # disconnect the branch from its CRAH). (b) An endpoint already on
+    # the face — no move to make (on run 17 the branch's z-endpoint sits
+    # on the riser's z face and the old diagnostic named it anyway).
+    # The shortest axis never yields a normal candidate: a small segment
+    # standing inside a long box's plan footprint has both endpoints
+    # "inside" on every plan axis, so a normal candidate there names a
+    # face that would disconnect it (the riser's x-endpoint is inside
+    # the header's 18000 mm x-range).
     joint_groups = {}
+    starts_groups = {}
     for i in range(len(items)):
         for j in range(i + 1, len(items)):
             s1, s2 = items[i][1], items[j][1]
@@ -3135,6 +3185,7 @@ def main():
             if ov is None or min(ov) <= CLASH_TOL:
                 continue
             best = None
+            best_starts = None
             for a, b in ((i, j), (j, i)):
                 pa, sa, ca, axa, mna, mxa = items[a]
                 pb, sb, cb, axb, mnb, mxb = items[b]
@@ -3151,6 +3202,10 @@ def main():
                 if (len(ordered) > 1
                         and ordered[1][1] >= 0.9 * ordered[0][1]):
                     axes_to_try.append(ordered[1])
+                short_axis = max(range(3),
+                                 key=lambda k: abs(ordered[-1][0][k]))
+                if ordered[-1] not in axes_to_try:
+                    axes_to_try.append(ordered[-1])
                 for d, half in axes_to_try:
                     axis = max(range(3), key=lambda k: abs(d[k]))
                     e1 = _sub(ca, _scale(d, half))
@@ -3180,9 +3235,39 @@ def main():
                                     if abs(e[axis] - mnb[axis])
                                     <= abs(e[axis] - mxb[axis])
                                     else mxb[axis])
+                        # Starts-inside: moving this endpoint to the
+                        # face would leave ~zero length, so the segment
+                        # is embedded in the box, not overshooting it.
+                        if abs(face - other[axis]) <= CLASH_TOL:
+                            lo = min(e1[axis], e2[axis])
+                            hi = max(e1[axis], e2[axis])
+                            cand = (2 * half, a, b, axis, e, face, lo, hi)
+                            if (best_starts is None
+                                    or cand[0] < best_starts[0]):
+                                best_starts = cand
+                            continue
+                        # The shortest axis never yields a normal
+                        # candidate (see the note above).
+                        if axis == short_axis:
+                            continue
+                        # An endpoint already on the face has no move.
+                        if abs(e[axis] - face) <= CLASH_TOL:
+                            continue
                         cand = (2 * half, a, b, axis, e, face)
                         if best is None or cand[0] < best[0]:
                             best = cand
+            if best_starts is not None:
+                length, a, b, axis, e, face, lo, hi = best_starts
+                pa, sa, ca, axa, mna, mxa = items[a]
+                pb, sb, cb, axb, mnb, mxb = items[b]
+                axis_name = 'xyz'[axis]
+                msg = (f"{pa.Name or pa.is_a()} lies inside "
+                       f"{pb.Name or pb.is_a()} on the {axis_name} axis "
+                       f"({axis_name} {lo:.0f}..{hi:.0f}, inside "
+                       f"{mnb[axis]:.0f}..{mxb[axis]:.0f}); no endpoint "
+                       f"move fixes it — delete it or move it to another z")
+                starts_groups.setdefault(sa, []).append(msg)
+                continue
             if best is None:
                 continue
             length, a, b, axis, e, face = best
@@ -3203,6 +3288,11 @@ def main():
         more = f" (+{len(msgs) - 2} more)" if len(msgs) > 2 else ''
         problems.append(
             f"{len(msgs)} {svc} joint(s) end inside the box they join (built to a centreline, not a face) — e.g. {shown}{more}; end each segment at the face of the box it joins")
+    for svc, msgs in sorted(starts_groups.items()):
+        shown = '; '.join(msgs[:2])
+        more = f" (+{len(msgs) - 2} more)" if len(msgs) > 2 else ''
+        problems.append(
+            f"{len(msgs)} {svc} segment(s) start inside the box they join — e.g. {shown}{more}; no endpoint move fixes these: delete the segment (a branch from a CRAH inside its header's band is redundant — the riser/drop alone connects it) or move it to another z")
     # 1d. CRAH vs column: the drawings themselves can put a CRAH on top of
     # a column — on run 16 three CRAHs overlapped columns by 13–192 mm
     # while their positions matched the drawings exactly, so this is a
@@ -3777,6 +3867,103 @@ def _is_regression(prev: dict, cur: dict) -> bool:
   if cur["frame_ok"] is False and prev["frame_ok"] is True:
     return True
   return _defects(cur) > _defects(prev)
+
+
+# Waits between retries of a fix round that changed nothing (run 17:
+# both fix rounds died after 0 steps on endpoint failures). The task
+# budget is 6 hours and run 17 used 19 minutes, so waiting is cheap.
+FIX_ROUND_RETRY_WAITS = (60, 120)
+
+
+async def _track_best(worker, scores, best_scores):
+  """Snapshots output/ as the best-measured model when scores beat best.
+
+  The adjacent-round guard only compares consecutive rounds, and an
+  inconclusive round erases its memory (scores None overwrites
+  prev_scores). This tracker keeps the best defect score across ALL
+  conclusive gate runs, so the end of solve() can restore it. A model is
+  only "best" when it is strictly better by defect score with no fatal
+  flip — calibrated so it does NOT restore run 17's 64-clash model
+  (defects 139: CHW 4 components) over the submitted 118 model
+  (defects 118, CONN PASS).
+
+  Args:
+    worker: The worker agent (its bash runs in the task container).
+    scores: The score vector just measured (None when inconclusive).
+    best_scores: The best vector so far (None when nothing measured yet).
+
+  Returns:
+    The updated best vector (unchanged when scores is None, worse, or
+    the snapshot failed).
+  """
+  if scores is None:
+    return best_scores
+  if (best_scores is not None
+      and (_is_regression(best_scores, scores)
+           or _defects(scores) >= _defects(best_scores))):
+    return best_scores
+  out = await worker.bash(
+      "if [ -d output ]; then rm -rf /tmp/best_output"
+      " && cp -r output /tmp/best_output && echo BEST_OK;"
+      " else echo BEST_NONE; fi")
+  return scores if "BEST_OK" in out else best_scores
+
+
+async def _solution_hash(worker) -> str:
+  """md5 of output/solution.py in the task container ("" when absent)."""
+  out = await worker.bash("md5sum output/solution.py 2>/dev/null || echo NOFILE")
+  token = out.split()[0] if out.split() else ""
+  return "" if token == "NOFILE" else token
+
+
+async def _fix_round_resume(worker, feedback, waits=None):
+  """Runs a fix round, retrying it when it changes nothing.
+
+  A fix round killed by an endpoint error returns the old final_message
+  without touching solution.py (run 17: both fix rounds died after 0
+  steps and solve() moved on with the unchanged model, so the next
+  verify round measured the same 118 clashes). Detect that by hashing
+  solution.py before and after; if unchanged, wait and resume again.
+  The 429 budget is per-Agent and only resets on a success, so a
+  retried call that 429s again fails fast — the value of the retry is
+  the wait plus a fresh call, and a 503-ladder recovery or a clean 200
+  resets the budget.
+
+  Args:
+    worker: The worker agent to resume.
+    feedback: The fix-round prompt.
+    waits: Seconds to wait before each retry (defaults to
+      FIX_ROUND_RETRY_WAITS).
+
+  Returns:
+    The last summary the fix round produced.
+  """
+  if waits is None:
+    waits = FIX_ROUND_RETRY_WAITS
+  before = await _solution_hash(worker)
+  summary = await worker.resume(feedback)
+  for wait in waits:
+    after = await _solution_hash(worker)
+    if after != before:
+      return summary
+    await worker.session.log(
+        "fix round changed nothing (solution.py unchanged);"
+        f" retrying after {wait}s")
+    await asyncio.sleep(wait)
+    summary = await worker.resume(feedback)
+  return summary
+
+
+def _number_checklist(gaps: str) -> str:
+  """Numbers each gap line as a checklist item for the fix-round prompt.
+
+  The gaps arrive as merged lines (one per gate failure); numbering
+  them turns a blob of text into items the agent can tick off one by
+  one, and the fix-round prompt requires it to report each item as
+  fixed with the numbers that prove it.
+  """
+  items = [line.strip() for line in gaps.strip().splitlines() if line.strip()]
+  return "\n".join(f"{i}. {line}" for i, line in enumerate(items, 1))
 
 
 # Claim patterns for each gate's subject: (keywords, resolution words).
@@ -4751,13 +4938,17 @@ async def solve(session: taskbridge.Session) -> str:
   verified = False
   last_gate_gaps = ""
   last_gate_verdict = ""
+  scores = None  # score vector from the latest gate run
   prev_scores = None  # score vector from the round before the last fix
+  best_scores = None  # best score vector across all conclusive gate runs
   snapshot_exists = False  # whether /tmp/prev_output holds the pre-fix model
   needs_final_gate_pass = False  # the last action was a fix round
   fix_rounds_used = 0  # fix rounds actually run (for the post-loop repair)
   reverted_info = None  # (pre-fix vector, post-fix vector) of a revert,
   # so the final summary can say the model was restored (run 15: the
   # summary described the discarded fix, not the submitted model)
+  best_restored_info = None  # (best vector, submitted vector) when the
+  # end-of-solve safety net restores the best-measured model
   try:
     for round_no in range(MAX_FIX_ROUNDS + 1):
       left = session.time_left()
@@ -4789,6 +4980,12 @@ async def solve(session: taskbridge.Session) -> str:
             "Your last fix made the model worse and the previous model has"
             " been restored. Do not rebuild the same way; change the"
             " construction, not the layout.\n")
+      # Best-model tracking: the adjacent-round guard above only compares
+      # consecutive rounds, and an inconclusive round erases its memory.
+      # Snapshot the best-measured model so the end of solve() can
+      # restore it even then (run 17: the agent's best work-phase model
+      # was overwritten before any verify round saw it).
+      best_scores = await _track_best(worker, scores, best_scores)
       needs_final_gate_pass = False  # the gates just measured the current model
       # Standalone check on the model this round will verify: the grader
       # runs solution.py alone in an empty directory, so a script that
@@ -4853,13 +5050,23 @@ async def solve(session: taskbridge.Session) -> str:
       snapshot_exists = "SNAPSHOT_OK" in snap_out
       prev_scores = scores
       needs_final_gate_pass = True
-      summary = await worker.resume(
+      # Numbered checklist, not a blob: on run 17 the verifier named the
+      # riser fix exactly and both fix rounds still died before any agent
+      # saw it; when a round does run, the agent must work the items one
+      # by one, edit only the endpoint named (a full rewrite loses fixes),
+      # and re-run the gate scripts. The riser-face and slab rules are
+      # re-injected here because the work phase proved they do not survive
+      # a rewrite on their own. _fix_round_resume retries the round when
+      # it changes nothing (run 17: both rounds died after 0 steps).
+      summary = await _fix_round_resume(
+          worker,
           regression_note
-          + "An independent check of your deliverables found these gaps. Fix each"
-          " one, then answer with your updated summary. Your new summary must"
-          " quote the gate numbers below (clash count, separation, entry"
-          " distance, coverage) verbatim and must not claim anything the gates"
-          f" deny:\n{gaps}"
+          + "An independent check of your deliverables found these gaps. Fix each numbered item below, one by one. "
+          "For each item, edit ONLY the endpoint or line named — do not rewrite output/solution.py from scratch; a full rewrite loses fixes. "
+          "After the edits, re-run python3 /tmp/sep_gate.py and python3 /tmp/conn_gate.py and quote the new clash count and component counts in your summary. "
+          "Remember: every joint ends at the FACE of the box it joins — a drop/riser base is the header's TOP face (for CHW, -300 + 168.3 = -132), never the header's base (-300) or centreline; a CRAH inside its header's band needs no horizontal branch (delete it); and no segment except the slab may occupy z -300..0. "
+          "Report each numbered item as fixed, with the numbers that prove it. Your new summary must quote the gate numbers below (clash count, separation, entry distance, coverage) verbatim and must not claim anything the gates deny:\n"
+          + _number_checklist(gaps)
       )
       fix_rounds_used += 1
       if not summary:
@@ -4896,6 +5103,7 @@ async def solve(session: taskbridge.Session) -> str:
         await worker.bash("rm -rf output && cp -r /tmp/prev_output output")
         last_gate_gaps, last_gate_verdict, scores = await _run_all_gates(
             worker, is_routing)
+      best_scores = await _track_best(worker, scores, best_scores)
   # Standalone check on the submitted model. The loop already checks every
   # round, but the loop can break early on time and the final gate pass can
   # restore a model the last round never checked — so check once more
@@ -4925,6 +5133,7 @@ async def solve(session: taskbridge.Session) -> str:
             summary = _strip_verdict(session.final_message)
           last_gate_gaps, last_gate_verdict, scores = await _run_all_gates(
               worker, is_routing)
+          best_scores = await _track_best(worker, scores, best_scores)
           standalone_gap = await _standalone_check(worker)
           if standalone_gap:
             last_gate_gaps = _merge_gate_gaps(
@@ -4940,6 +5149,20 @@ async def solve(session: taskbridge.Session) -> str:
             session, is_routing, ground_truth, force=True)
         if guard is not None:
           return guard
+  # Best-model safety net: the adjacent-round guard only compares
+  # consecutive rounds, and an inconclusive round erases its memory, so
+  # the submitted model can still be worse than the best-measured one.
+  # Restore the best snapshot and re-measure it, so the submitted model
+  # is the best measured, not the last written.
+  if (best_scores is not None and scores is not None
+          and _is_regression(best_scores, scores)):
+    await session.log(
+        "submitted model is worse than the best-measured model;"
+        " restoring the best")
+    best_restored_info = (best_scores, scores)
+    await worker.bash("rm -rf output && cp -r /tmp/best_output output")
+    last_gate_gaps, last_gate_verdict, scores = await _run_all_gates(
+        worker, is_routing)
   if verified:
     summary += "\n\nIndependent verification: PASS."
   # Attach the last round's gate verdict so the submitted summary always
@@ -4969,6 +5192,17 @@ async def solve(session: taskbridge.Session) -> str:
         " the restored one — judge the summary above against its gate"
         " results in the Deterministic gates section, not against the"
         " fix round's numbers.")
+  # A best-model restore leaves the same stale-summary problem: say so
+  # plainly, with both models' numbers.
+  if best_restored_info is not None:
+    pre, post = best_restored_info
+    summary += (
+        "\n\nNote: the submitted model was worse than the best model"
+        f" measured in this run ({_vector_summary(post)}) and the best"
+        f" model ({_vector_summary(pre)}) was restored. The submitted"
+        " model is the restored one — judge the summary above against"
+        " its gate results in the Deterministic gates section, not"
+        " against the last fix round's numbers.")
   # Last check before returning: a summary is not a submission. If the
   # worker talked about a model it never wrote, the guard writes the
   # fallback and the failure report replaces the summary — the worker's
