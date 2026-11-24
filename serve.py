@@ -207,6 +207,10 @@ labelled assumption.
 - Hard constraints (safety, feasibility, code limits) come before optimisation: never trade one for a better \
 objective value. Check each constraint explicitly before you finish.
 - Recompute key numbers a second way (independent code) and check units before you write them into a deliverable.
+- A measurement you wrote yourself is not evidence until a second, independent check agrees with it — on a real \
+run an agent's own clash script reported 0 clashes while the deterministic gate measured 92, because the script's \
+units were wrong by 1000x (ifcopenshell.geom returns metres, not millimetres). Never trust a count from a script \
+you wrote; run the harness's own check scripts (see the routing guide) and quote their output.
 - If the task names a check (a validator, a test command, a format), run that exact check with the exact flags on \
 the final deliverable before finishing, and paste its verbatim output in your summary. A check you did not run is \
 a check you failed. Never report 'verified' from a weaker check.
@@ -244,7 +248,11 @@ separation, entry distance, coverage) in your reply; a PASS that does not mentio
 collision check that printed a count but measured no geometry is a failed measurement, not a pass. Re-run \
 output/solution.py yourself so the deliverable regenerates. If everything holds, reply with \
 the single word PASS and nothing else. Otherwise reply with a numbered list of the gaps, each specific enough to \
-fix. You have about {minutes} minutes for this checking step."""
+fix. When the task involves routing, re-run the harness gate scripts yourself (python3 /tmp/sep_gate.py and \
+python3 /tmp/conn_gate.py from the task directory) and quote their output — a PASS that does not quote the gate \
+scripts' numbers is not a pass. Never write your own bbox clash script to check collisions: ifcopenshell.geom \
+returns coordinates in metres, so a 2 mm threshold tested against its coordinates is really a 2000 mm threshold \
+and always reports 0 clashes — on a real run exactly such a script reported 0 while the gate measured 92. You have about {minutes} minutes for this checking step."""
 
 # Words in the task instruction that mark a routing task (cable tray /
 # busway / chilled water). Used for the routing prompt guides and for the
@@ -312,10 +320,16 @@ it) and run it there; if it crashes, it is not a deliverable. Fix the crash and 
 - Import every module solution.py uses at the top (json, os, sys, math, ifcopenshell): on a real run the script \
 built and validated the whole model, then died on a json.dump with no `import json` — one missing line, zero score.
 - Build the hall without overlaps: a CRAH replaces racks — leave its slot empty, do not fill a row completely \
-and then put a CRAH box on top of the racks (on a real run that alone was 48 clashes). A column standing inside \
-a row band means jog the header around it and skip the racks where the column stands. A trunk must touch every \
-header it feeds — end it at the header's face (x=1800 here), not short of the rows: on a real run a 658 mm tray \
-gap and a 516 mm CHW gap each disconnected a whole service.
+and then put a CRAH box on top of the racks (on a real run that alone was 48 clashes, on the next run 51). \
+Skip a rack with this exact test, for every CRAH in ground_truth.json: a rack is 600x1000 mm and a CRAH is \
+1200x900 mm, so skip the rack when abs(cx_rack - cx_crah) < 900 and abs(cy_rack - cy_crah) < 950. A 1200 mm \
+CRAH kills three rack positions at 600 mm pitch — on a real run the agent's rack loop skipped only the columns \
+and 51 racks still overlapped CRAHs, because the loop never tested against the CRAH list at all. A column \
+standing inside a row band means jog the header around it — split the header into two segments with a sideways \
+jog of at least 100 mm around the column, keeping the header on the row centreline everywhere else (on a real \
+run the headers grazed two columns by only 21.5 mm and 33.5 mm and that was 4 clashes) — and skip the racks \
+where the column stands. A trunk must touch every header it feeds — end it at the header's face (x=1800 here), \
+not short of the rows: on a real run a 658 mm tray gap and a 516 mm CHW gap each disconnected a whole service.
 - Connect in this order: (a) the service entry first — a feeder from the entry marked on the drawings to your first \
 header; (b) one header per row, every row, all three services; (c) a drop from the CHW header to every CRAH, \
 including perimeter units the row headers do not pass. Never submit a route with one segment per service; every \
@@ -338,7 +352,11 @@ network fails the connectivity gate as surely as a clash fails the clash gate. O
 tray connectors by 264 mm each (to kill joint overlaps) turned 1 tray component into 7 and the model scored 0. \
 When the connectivity gate names a break with coordinates ("nearest unconnected segments are N mm apart — A \
 ends near (...), B starts near (...)"), bridge exactly that gap: extend one of the two named segments so its end \
-touches the other's end. Do not guess a new endpoint.
+touches the other's end. Do not guess a new endpoint. End the extended segment at the other's FACE — a butt \
+joint (0 mm overlap). Never overlap the two segments to join them: an overlap over 2 mm is a clash the \
+separation gate will count, and on a real run bridging a 6499 mm break with overlapping joints fixed \
+connectivity (34 → 47 segments, 1 component) while adding 29 new same-service clashes (26 → 55), so the fix \
+was thrown away. A fix that trades a connectivity pass for more clashes is not a fix.
 - **Do not shift a header off its row to dodge a column.** The row's CRAH drops stand on the header's line: a \
 header 600–800 mm off its row centreline leaves every drop hanging. Jog around the column instead — split the \
 header into two segments with a short sideways jog that goes around the column, keeping the header on the row \
@@ -356,6 +374,14 @@ UP: its bottom must touch the under-floor header and its top must reach the CRAH
 horizontal segment of the same service counts as connected — but the segment must touch at one end; a vertical \
 segment whose neither end is within 250 mm of a horizontal segment is not connected, even if it happens to \
 touch another segment.
+- **CHW drop recipe (build every drop this way).** Most CRAHs sit within 66 mm of their row centreline, but \
+one can be ~400 mm off (on a real run CRAH-D01 was 389 mm off row D and its drop hung 398 mm from the header). \
+So for EVERY CRAH: first build a horizontal branch at header height from the row centreline to the CRAH's \
+(x, y) — the branch starts at the header's side face (butt joint, 0 mm overlap) and ends at the drop's side \
+face. Then build the vertical drop from the branch's TOP face up to the CRAH base (z=0): the drop starts at \
+z = header_z + 168.3 (the insulated CHW profile height), never at the header's bottom. A drop that spans the \
+header's full height overlaps it by 168.3 mm — on a real run that was 17 of the 26 CHW clashes, every one a \
+drop built to the header's centreline instead of its top face.
 - Every CRAH needs a horizontal branch from the nearest header or trunk to the CRAH's (x, y), then a drop down \
 from the branch end. A CRAH directly below a trunk still needs a branch — first measure the trunk's extent; \
 if the CRAH's position is outside it, build a branch. Never skip a branch because the CRAH's x matches the \
@@ -387,6 +413,15 @@ model failed the separation gate on sprinkler clearance alone.
 [{"name": "A", "start": [x, y, z], "end": [x, y, z]}, ...], "crahs": [[x, y, z], ...]}. Then run a connectivity \
 self-check from that file (segment count and total length per service, entry distance, per-row coverage, CRAH \
 reach) and paste its output in your summary. A route you did not measure is a route you did not build.
+- **Check clashes and connectivity with the harness's own gate scripts — never with a script you write.** \
+Run `python3 /tmp/sep_gate.py` and `python3 /tmp/conn_gate.py` from the task directory and quote their output \
+in your summary; their numbers are the ones that count, and your summary must not claim a clash count, a \
+component count, or a coverage that contradicts them. Never write your own bbox clash script: \
+ifcopenshell.geom returns coordinates in METRES, so a 2 mm threshold tested against its coordinates is really \
+a 2000 mm threshold and always reports 0 clashes — on a real run exactly such a script reported 0 while the \
+gate measured 92, and the agent believed its own script. Never assert a clash count from zoning or placement \
+reasoning either: a self-check that prints "ALL GATES PASSED" from design intent, without a pairwise overlap \
+computation, is not a measurement.
 - If you cannot extract a drawing value after a few tries, record what you could extract and move on with \
 clearly-labelled assumptions — do not keep re-trying the same extraction.
 """
@@ -3025,6 +3060,30 @@ def main():
         print(f"SEP   {' x '.join(key)}: {clashes[key]}")
     if total:
         problems.append(f"{total} clashes (boxes overlapping > {CLASH_TOL:.0f} mm on all axes) — joints must be butt joints (0 mm overlap) or leave a gap, never overlapping boxes")
+    # 1b. Rack overlaps: name the racks that overlap CRAHs or columns, so
+    # the fix round knows exactly which rack positions to skip. A CRAH
+    # replaces racks — on run 15 the agent filled every row completely and
+    # 51 racks overlapped CRAHs, while the category count alone ("other x
+    # rack: 51") never told it which ones. This only names racks when the
+    # gate already fails on clashes, so it adds a diagnosis, not a failure.
+    rack_hits = []
+    for product, svc, centre, axes, a_min, a_max in items:
+        if svc != 'rack':
+            continue
+        for p2, s2, c2, ax2, mn2, mx2 in items:
+            if s2 not in ('other', 'column'):
+                continue
+            ov = _overlap(a_min, a_max, mn2, mx2)
+            if ov is None or min(ov) <= CLASH_TOL:
+                continue
+            rack_hits.append((product.Name or product.is_a(),
+                              p2.Name or p2.is_a()))
+            break
+    if rack_hits:
+        names = ', '.join(n for n, _ in rack_hits[:10])
+        more = f' (+{len(rack_hits) - 10} more)' if len(rack_hits) > 10 else ''
+        problems.append(
+            f"{len(rack_hits)} racks overlap CRAHs or columns — {names}{more}; a CRAH replaces racks: skip any rack whose centre is within 900 mm in x and 950 mm in y of a CRAH centre (CRAH 1200x900, rack 600x1000)")
     # 2. Tier separation: when there are clashes, say why — two services
     # sharing a z band over the same plan area clash along their whole
     # length. An X corridor does not separate X-running headers; only
@@ -3493,18 +3552,45 @@ def _gate_score_vector(unit: dict, ifc: dict, sep: dict, conn: dict) -> dict | N
   }
 
 
+def _defects(vector: dict) -> int:
+  """One number for how far a model is from passing both gates.
+
+  clashes + 25 per extra connected component (beyond 1 per service) +
+  25 per row below 80% coverage. The weight is a heuristic for ordering
+  fix-round candidates, not a grader formula: one disconnected component
+  costs one bridge segment to fix, and a bridge that overlaps creates
+  only a couple of clashes, so a component is worth far fewer than 25
+  clashes — but it must cost *something*, or a fix that disconnects the
+  network to kill clashes looks free. The weight is calibrated on the two
+  real oscillation cases: run 15 round 3 (SEP 92 -> 113, CHW 2 -> 1
+  components: 117 -> 113, an improvement) and run 12 round 3 (SEP 92 -> 0,
+  tray 1 -> 7, CHW 4 -> 8: 167 -> 325, a regression).
+  """
+  components = vector.get("components") or {}
+  extra = sum(max(0, n - 1) for n in components.values())
+  return (vector.get("clashes", 0) + 25 * extra
+          + 25 * vector.get("rows_below_80", 0))
+
+
 def _is_regression(prev: dict, cur: dict) -> bool:
   """Whether the current gate scores are worse than the previous round's.
 
   A fix round is a regression when it flips a fatal check to FAIL (units,
-  IFC, frame), raises the clash count, or disconnects the network further
-  in ANY service — a per-service component rise is a regression even when
-  clashes fell. On run 12 a fix cut clashes 92 -> 0 by shortening segments
-  short of their neighbours (tray 1 -> 7 components, CHW 4 -> 8), and the
-  old rule let it through because the clash cut "paid" for the disconnect;
-  a disconnected network scores 0 as surely as a clashing one, so the
-  trade is not a payment. A component count that falls is an improvement,
-  not a regression.
+  IFC, frame), or when its combined defect score rises (see _defects).
+  The old rule reverted whenever ANY gate got worse, which produced a
+  revert loop on run 15: fix round 2 closed the last connectivity break
+  (CHW 2 -> 1 components, CONN PASS) at the cost of 29 new joint
+  overlaps (SEP 92 -> 113), and the guard threw the fix away — leaving
+  the run with two failing gates instead of one, on the last round, with
+  no round left to fix the new clashes. Both models score 0.0 (the
+  grader's hard gates are binary), but the one-gate-failing model is the
+  better base for the next fix round: its 29 new clashes are one
+  localised defect (joint overlaps), while the reverted model still
+  needs the structural change that created them. A component count that
+  falls is an improvement, not a regression — unless the clash rise it
+  costs outweighs it (run 12: clashes 92 -> 0 by shortening segments
+  short of their neighbours, tray 1 -> 7, CHW 4 -> 8 — defects 167 ->
+  325, still a regression, so the run-12 tightening survives).
   """
   if cur["unit_ok"] is False and prev["unit_ok"] is True:
     return True
@@ -3512,44 +3598,61 @@ def _is_regression(prev: dict, cur: dict) -> bool:
     return True
   if cur["frame_ok"] is False and prev["frame_ok"] is True:
     return True
-  if cur["clashes"] > prev["clashes"]:
-    return True
-  prev_comp = prev.get("components") or {}
-  cur_comp = cur.get("components") or {}
-  for service in set(prev_comp) | set(cur_comp):
-    if cur_comp.get(service, 0) > prev_comp.get(service, 0):
-      return True
-  if (cur["rows_below_80"] > prev["rows_below_80"]
-          and cur["clashes"] >= prev["clashes"]):
-    return True
-  return False
+  return _defects(cur) > _defects(prev)
 
 
-# Keywords for the PASS claim each gate's subject would use in a summary:
-# a summary that says "clash count 0 (PASS)" while the separation gate
-# FAILs is contradicted on that gate, even if its unit/IFC claims are true.
-_GATE_PASS_KEYWORDS = {
-    "Unit": ("unit", "scale", "millimetre", "millimeter"),
-    "IFC": ("ifc", "express", "validation", "schema"),
+# Claim patterns for each gate's subject: (keywords, resolution words).
+# A summary line contradicts a failing gate when it names the gate's
+# subject AND claims it resolved — the claim need not use the word
+# "pass". On run 12 the summary said "Clash count: 0 (PASS)"; on run 15
+# it said "Resolved previous hard clashes" and "all 34 CHW segments form
+# a continuous network" — neither contains "pass", and the old
+# pass-only detector missed both. The resolution words are deliberately
+# narrow: a measurement ("Entry Distance: CHW 486.50 mm", "Per-Row
+# Coverage: 100%", "Validation errors: 0" when that gate passed, "Re-ran
+# solution.py successfully") names a subject but claims no resolution,
+# so it is left alone. "fail" anywhere in the line also exempts it
+# ("the separation gate still fails" is honest, not a lie).
+_GATE_CLAIM_PATTERNS = {
+    "Unit": (
+        ("unit", "scale", "millimetre", "millimeter"),
+        ("pass", "resolv", "fix", "correct"),
+    ),
+    "IFC": (
+        ("ifc", "express", "validation", "schema"),
+        ("pass", "resolv", "fix", "0 errors", "no errors",
+         "0 violations", "no violations"),
+    ),
     "Separation": (
-        "clash", "separation", "separate", "sprinkler", "clear height",
-        "hang"),
-    "Connectivity": ("cover", "connect", "entry", "crah", "component"),
+        ("clash", "collision", "separat"),
+        ("pass", "resolv", "fix", "eliminat", "remov", "0 clash",
+         "no clash", "clash-free", "collision-free", "zero"),
+    ),
+    "Connectivity": (
+        ("cover", "connect", "entry", "crah", "component", "continuous",
+         "network"),
+        ("pass", "resolv", "fix", "continuous", "form a",
+         "single network"),
+    ),
 }
 
 
 def _correct_summary(summary: str, verdict: str) -> str:
-  """Appends a correction when the summary claims a PASS the gates deny.
+  """Appends a correction when the summary claims a success the gates deny.
 
   The agent's prose can claim "Clash count: 0 (PASS)" while the appended
   verdict says the separation gate FAILs — on run 12 the summary shipped
-  with its own refutation attached and nothing flagged it. The verdict
+  with its own refutation attached and nothing flagged it. On run 15 the
+  claims were "Resolved previous hard clashes" and "all 34 CHW segments
+  form a continuous network", which contain no "pass" at all. The verdict
   is the measurement; the prose is not. A correction is appended only
-  when the summary makes a PASS claim about a gate that FAILed (a PASS
-  claim about a gate that passed is left alone), quoting both the claim
-  and the failing gate's line. Returns the summary unchanged otherwise.
+  when the summary makes a success claim about a gate that FAILed (a
+  success claim about a gate that passed is left alone), quoting both the
+  claim and the failing gate's line — even when the Deterministic gates
+  section already lists the numbers, because the body is what gets read
+  first. Returns the summary unchanged otherwise.
   """
-  failing = [name for name in _GATE_PASS_KEYWORDS
+  failing = [name for name in _GATE_CLAIM_PATTERNS
              if any(line.startswith(f"{name} gate: FAIL")
                     for line in verdict.splitlines())]
   if not failing:
@@ -3557,13 +3660,15 @@ def _correct_summary(summary: str, verdict: str) -> str:
   head = summary.split("Deterministic gates:")[0]
   contradicted = []
   for name in failing:
+    keywords, resolutions = _GATE_CLAIM_PATTERNS[name]
     for line in head.splitlines():
       low = line.lower()
-      # A line that also says "fail" is not claiming a pass for that gate
+      # A line that also says "fail" is not claiming success for that gate
       # ("Unit gate PASS, IFC gate PASS, but the separation gate still
       # fails" is honest, not a lie).
-      if ("pass" in low and "fail" not in low
-              and any(k in low for k in _GATE_PASS_KEYWORDS[name])):
+      if ("fail" not in low
+              and any(k in low for k in keywords)
+              and any(r in low for r in resolutions)):
         contradicted.append(line.strip())
         break
   if not contradicted:
@@ -3571,7 +3676,7 @@ def _correct_summary(summary: str, verdict: str) -> str:
   fails = [line for line in verdict.splitlines()
            if any(line.startswith(f"{n} gate: FAIL") for n in failing)]
   return summary + (
-      "\n\nCORRECTION: the deterministic gates contradict the PASS claims"
+      "\n\nCORRECTION: the deterministic gates contradict the success claims"
       " above — the following claims are wrong:\n"
       + "\n".join(f"- {c}" for c in contradicted)
       + "\nMeasured instead:\n"
@@ -4346,6 +4451,38 @@ async def _empty_submission_guard(
   return report
 
 
+def _vector_summary(vector: dict) -> str:
+  """One line for a gate score vector, for the revert note."""
+  components = vector.get("components") or {}
+  comp = ", ".join(f"{s} {n}" for s, n in sorted(components.items()))
+  return f"{vector.get('clashes', 0)} clashes; {comp} components"
+
+
+async def _write_gate_scripts(session: taskbridge.Session) -> None:
+  """Writes the SEP and CONN gate scripts into the task container.
+
+  The agent checks its own model with these exact scripts (see
+  ROUTING_GUIDE) instead of writing its own clash script — on run 15 a
+  hand-written bbox script reported 0 clashes while the gate measured 92,
+  because ifcopenshell.geom returns metres and the script tested a 2 mm
+  threshold against metre coordinates. A failure here is logged loudly
+  and the run continues: the harness gates run from the embedded copies
+  regardless.
+  """
+  for name, script in (("sep_gate.py", SEP_GATE_SCRIPT),
+                       ("conn_gate.py", CONN_GATE_SCRIPT)):
+    try:
+      await session.write_file("/tmp/" + name, script)
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+      await session.log(
+          f"GATE_SCRIPTS: could not write /tmp/{name}"
+          f" ({type(exc).__name__}: {exc})")
+  await session.log(
+      "GATE_SCRIPTS: wrote /tmp/sep_gate.py and /tmp/conn_gate.py —"
+      " the agent checks clashes and connectivity with these, not its"
+      " own scripts")
+
+
 async def solve(session: taskbridge.Session) -> str:
   """Runs plan, work, verify, and fix phases and returns the final answer.
 
@@ -4372,6 +4509,10 @@ async def solve(session: taskbridge.Session) -> str:
   # planner and the worker read facts instead of pixels (run 10's planner
   # burned the whole run hand-decoding PNGs and extracted zero dimensions).
   ground_truth = await _run_draw_tools(session, is_routing)
+  if is_routing:
+    # The agent's self-check must be the gate scripts themselves (run 15:
+    # a hand-written clash script reported 0 while the gate measured 92).
+    await _write_gate_scripts(session)
   plan = ""
   if ground_truth is not None:
     # The ground truth IS the plan's input: skip the planner entirely and
@@ -4436,6 +4577,9 @@ async def solve(session: taskbridge.Session) -> str:
   snapshot_exists = False  # whether /tmp/prev_output holds the pre-fix model
   needs_final_gate_pass = False  # the last action was a fix round
   fix_rounds_used = 0  # fix rounds actually run (for the post-loop repair)
+  reverted_info = None  # (pre-fix vector, post-fix vector) of a revert,
+  # so the final summary can say the model was restored (run 15: the
+  # summary described the discarded fix, not the submitted model)
   try:
     for round_no in range(MAX_FIX_ROUNDS + 1):
       left = session.time_left()
@@ -4458,6 +4602,7 @@ async def solve(session: taskbridge.Session) -> str:
               and snapshot_exists and _is_regression(prev_scores, scores)):
         await session.log(
             "fix round made the model worse; restoring the previous model")
+        reverted_info = (prev_scores, scores)
         await worker.bash("rm -rf output && cp -r /tmp/prev_output output")
         last_gate_gaps, last_gate_verdict, scores = await _run_all_gates(
             worker, is_routing)
@@ -4564,6 +4709,7 @@ async def solve(session: taskbridge.Session) -> str:
               and snapshot_exists and _is_regression(prev_scores, scores)):
         await session.log(
             "final model is worse than the previous one; restoring it")
+        reverted_info = (prev_scores, scores)
         await worker.bash("rm -rf output && cp -r /tmp/prev_output output")
         last_gate_gaps, last_gate_verdict, scores = await _run_all_gates(
             worker, is_routing)
@@ -4622,6 +4768,19 @@ async def solve(session: taskbridge.Session) -> str:
   # count: 0 PASS" while SEP/CONN FAILed). Correct the record before the
   # summary ships.
   summary = _correct_summary(summary, last_gate_verdict)
+  # A revert leaves the summary describing a model that was discarded
+  # (run 15: the summary described the round-3 model — 265 elements,
+  # busway under-floor — while the submitted model was the restored
+  # round-2 one). Say so plainly, with both models' numbers.
+  if reverted_info is not None:
+    pre, post = reverted_info
+    summary += (
+        "\n\nNote: a fix round made the model worse"
+        f" ({_vector_summary(post)}) and the previous model"
+        f" ({_vector_summary(pre)}) was restored. The submitted model is"
+        " the restored one — judge the summary above against its gate"
+        " results in the Deterministic gates section, not against the"
+        " fix round's numbers.")
   # Last check before returning: a summary is not a submission. If the
   # worker talked about a model it never wrote, the guard writes the
   # fallback and the failure report replaces the summary — the worker's

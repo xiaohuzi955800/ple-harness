@@ -500,6 +500,43 @@ def test_regression_guard():
                                         "components": {"tray": 3,
                                                        "busway": 3,
                                                        "chw": 3}}))
+  # Run 15: a fix round closed the last connectivity break (CHW 2 -> 1
+  # components, CONN PASS) at the cost of 29 new joint overlaps
+  # (SEP 92 -> 113). The old any-gate-worse rule reverted it, leaving two
+  # failing gates instead of one on the last round. The combined defect
+  # score (clashes + 25 per extra component) accepts it: 117 -> 113.
+  run15_prev = {"unit_ok": True, "ifc_ok": True, "frame_ok": True,
+                "clashes": 92, "max_components": 2, "rows_below_80": 0,
+                "components": {"tray": 1, "busway": 1, "chw": 2}}
+  run15_cur = {"unit_ok": True, "ifc_ok": True, "frame_ok": True,
+               "clashes": 113, "max_components": 1, "rows_below_80": 0,
+               "components": {"tray": 1, "busway": 1, "chw": 1}}
+  check("run-15 defect scores",
+        serve._defects(run15_prev) == 117
+        and serve._defects(run15_cur) == 113,
+        (serve._defects(run15_prev), serve._defects(run15_cur)))
+  check("run-15 CONN fix at +21 clashes is accepted, not reverted",
+        not serve._is_regression(run15_prev, run15_cur))
+  # Run 12: a fix cut clashes 92 -> 0 by shortening segments short of
+  # their neighbours (tray 1 -> 7, CHW 4 -> 8). The defect score still
+  # reverts it (167 -> 325), so the run-12 tightening survives the new
+  # rule.
+  run12_prev = {"unit_ok": True, "ifc_ok": True, "frame_ok": True,
+                "clashes": 92, "max_components": 4, "rows_below_80": 0,
+                "components": {"tray": 1, "busway": 1, "chw": 4}}
+  run12_cur = {"unit_ok": True, "ifc_ok": True, "frame_ok": True,
+               "clashes": 0, "max_components": 8, "rows_below_80": 0,
+               "components": {"tray": 7, "busway": 1, "chw": 8}}
+  check("run-12 defect scores",
+        serve._defects(run12_prev) == 167
+        and serve._defects(run12_cur) == 325,
+        (serve._defects(run12_prev), serve._defects(run12_cur)))
+  check("run-12 disconnect-for-clashes still reverts",
+        serve._is_regression(run12_prev, run12_cur))
+  # A fatal flip still reverts even when the defect score improves.
+  check("fatal flip reverts despite a lower defect score",
+        serve._is_regression(run15_prev,
+                             {**run15_cur, "unit_ok": False}))
   check("inconclusive scores give no vector",
         serve._gate_score_vector({}, {}, {}, {}) is None)
   check("score vector built",
@@ -792,6 +829,89 @@ async def test_regression_guard_restores_worse_fix():
         "Independent verification: PASS." not in result, repr(result))
 
 
+async def test_run15_fix_accepted_then_reverted():
+  print("run-15 oscillation: a CONN fix at +21 clashes is kept, "
+        "a worse round after it is reverted, and the revert is noted")
+  session = FakeSession(21600)
+  session.instruction = "Route the cable tray, busway and chilled water."
+  unit_pass = (
+      "exit code 0\nUNIT output/model.ifc: scale x1.000,"
+      " millimetre unit declared: True\n"
+      "UNIT_GATE: PASS (1 file(s), scale x1.0, millimetre units)")
+  ifc_pass = "exit code 0\nIFC_GATE: PASS (1 file(s), 0 EXPRESS violations)"
+
+  def sep_fail(n):
+    return (
+        f"exit code 0\nSEP collisions: {n}\n"
+        f"SEP FAIL: {n} clashes (boxes overlapping > 2 mm on all axes)\n"
+        "SEP_GATE: FAIL")
+
+  def conn_fail(chw):
+    return (
+        "exit code 0\nCONN tray: 1 connected component(s)\n"
+        "CONN busway: 1 connected component(s)\n"
+        f"CONN chw: {chw} connected component(s)\n"
+        f"CONN FAIL: chw: {chw} disconnected components\n"
+        "CONN_GATE: FAIL")
+
+  conn_pass = (
+      "exit code 0\nCONN tray: 1 connected component(s)\n"
+      "CONN busway: 1 connected component(s)\n"
+      "CONN chw: 1 connected component(s)\n"
+      "CONN_GATE: PASS")
+
+  FakeAgent.reset(
+      scripts={
+          "planner": ["p"],
+          "worker": ["worker summary"],
+          "verifier": ["PASS", "PASS", "PASS"],
+      },
+      bash_outputs=[
+          # Round 1: SEP 92, CONN FAIL (CHW 2 components).
+          unit_pass, ifc_pass, sep_fail(92), conn_fail(2),
+          # Round 2: the fix closed CONN (1 component) at +21 clashes
+          # (SEP 113). Defects 117 -> 113: accepted, no restore, so no
+          # extra gate outputs are consumed here.
+          unit_pass, ifc_pass, sep_fail(113), conn_pass,
+          # Round 3: SEP back to 92 but CONN broken again (2 components).
+          # Defects 113 -> 117: a regression — the guard restores the
+          # round-2 model and re-runs the gates (113 again, CONN PASS).
+          unit_pass, ifc_pass, sep_fail(92), conn_fail(2),
+          unit_pass, ifc_pass, sep_fail(113), conn_pass,
+      ],
+  )
+  real = serve.Agent
+  serve.Agent = FakeAgent
+  try:
+    result = await serve.solve(session)
+  finally:
+    serve.Agent = real
+  worker = FakeAgent.first("worker")
+  check("two fix rounds used", len(worker.resumes) == 2, worker.resumes)
+  check("round-2 fix accepted, not reverted",
+        "113 clashes" in worker.resumes[1]
+        and "made the model worse" not in worker.resumes[1],
+        worker.resumes[1])
+  check("round-2 gaps are the 113-clash model",
+        "113 clashes" in worker.resumes[1]
+        and "92 clashes" not in worker.resumes[1], worker.resumes[1])
+  check("revert note appended to the final summary",
+        "Note: a fix round made the model worse" in result, repr(result))
+  check("revert note names both models",
+        "92 clashes" in result and "113 clashes" in result, repr(result))
+  check("revert note says the submitted model is the restored one",
+        "The submitted model is the restored one" in result, repr(result))
+  check("submitted model is the round-2 one (CONN PASS)",
+        "Connectivity gate: no failures reported" in result, repr(result))
+  check("gate scripts written to the task container",
+        session.files.get("/tmp/sep_gate.py") == serve.SEP_GATE_SCRIPT.encode()
+        and session.files.get("/tmp/conn_gate.py")
+        == serve.CONN_GATE_SCRIPT.encode(),
+        list(session.files))
+  check("gate scripts logged", any("GATE_SCRIPTS" in log for log in session.logs),
+        session.logs)
+
+
 def test_merge_gate_gaps():
   print("gate gap merging and clipping")
   check("empty merge", serve._merge_gate_gaps("", "", "") == "")
@@ -842,6 +962,11 @@ def test_routing_prompts():
   check("verifier quotes numbers", "a PASS that does not quote them" in vprompt)
   check("verifier distrusts empty clash checks",
         "did not actually measure anything" in vprompt)
+  check("verifier re-runs the gate scripts",
+        "python3 /tmp/sep_gate.py" in vprompt
+        and "python3 /tmp/conn_gate.py" in vprompt)
+  check("verifier warned about geom metres",
+        "returns coordinates in metres" in vprompt)
   check("verifier gets the IFC snippet",
         "ifcopenshell.validate.validate(model, _log, express_rules=True)"
         in vprompt)
@@ -1178,6 +1303,50 @@ def test_sep_gate_real_ifc():
     check("run-9 frame failure named", "FRAME FAIL" in out, out)
     check("run-9 drop gap is vertical",
           "400 mm away to the above" in out, out)
+
+
+def test_sep_gate_rack_diagnostic():
+  print("separation gate names the racks overlapping CRAHs")
+  try:
+    import ifcopenshell  # noqa: F401
+  except ImportError:
+    print("  skipped: ifcopenshell not installed")
+    return
+  import shutil
+  import tempfile
+
+  with tempfile.TemporaryDirectory() as tmp:
+    # Run 15's defect, shrunk: a 1200x900 CRAH at (4528, 2996) with two
+    # 600x1000 racks at (4200, 3000) and (4800, 3000) — both overlap it
+    # — plus one rack far away that does not.
+    outdir = os.path.join(tmp, "rack", "output")
+    os.makedirs(outdir)
+    _build_test_ifc(os.path.join(outdir, "model.ifc"), [
+        ('IfcFurniture', 'CRAH-A01', 1200, 900, 2200, 4528, 2996, 0),
+        ('IfcFurniture', 'Rack-A-4', 600, 1000, 2000, 4200, 3000, 0, 'Rack'),
+        ('IfcFurniture', 'Rack-A-5', 600, 1000, 2000, 4800, 3000, 0, 'Rack'),
+        ('IfcFurniture', 'Rack-A-9', 600, 1000, 2000, 9000, 3000, 0, 'Rack'),
+    ])
+    out = _run_sep_gate(os.path.join(tmp, "rack"))
+    check("rack x CRAH pairs counted", "SEP collisions: 2" in out, out)
+    check("gate fails", "SEP_GATE: FAIL" in out, out)
+    check("overlapping racks named",
+          "2 racks overlap CRAHs or columns" in out, out)
+    check("first overlapping rack named", "Rack-A-4" in out, out)
+    check("second overlapping rack named", "Rack-A-5" in out, out)
+    check("non-overlapping rack not named", "Rack-A-9" not in out, out)
+    check("skip rule quoted",
+          "within 900 mm in x and 950 mm in y" in out, out)
+    # No racks at all: no diagnostic line, and the gate passes.
+    outdir2 = os.path.join(tmp, "norack", "output")
+    os.makedirs(outdir2)
+    _build_test_ifc(os.path.join(outdir2, "model.ifc"), [
+        ('IfcFurniture', 'CRAH-A01', 1200, 900, 2200, 4528, 2996, 0),
+    ])
+    out2 = _run_sep_gate(os.path.join(tmp, "norack"))
+    check("no racks, no diagnostic",
+          "racks overlap" not in out2, out2)
+    check("no racks, gate passes", "SEP_GATE: PASS" in out2, out2)
 
 
 def test_sep_gate_z_band_and_drop():
@@ -1878,6 +2047,51 @@ def test_correct_summary():
            "Deterministic gates:\n" + verdict)
   check("no PASS claim, no correction",
         serve._correct_summary(plain, verdict) == plain)
+  # Run 15's summary: no "pass" anywhere, but two success claims about
+  # the failing gates ("Resolved previous hard clashes", "all 34 CHW
+  # segments form a continuous network"). The old pass-only detector
+  # missed both; the phrasing detector must catch them and quote the
+  # real gate numbers even though the Deterministic gates section
+  # already lists them.
+  run15 = ("Separation / Clash Gate: Resolved previous hard clashes by"
+           " vertically and horizontally isolating services.\n"
+           "Connectivity Gate: Resolved chilled water continuity gaps by"
+           " adding the south perimeter CHW header (y = 469 mm) so that"
+           " all 34 CHW segments form a continuous network reaching all"
+           " 22 CRAH units within tolerance.\n"
+           "\nDeterministic gates:\n" + verdict)
+  corrected15 = serve._correct_summary(run15, verdict)
+  check("run-15 correction appended",
+        "\n\nCORRECTION:" in corrected15, corrected15)
+  check("run-15 resolved-clashes claim quoted",
+        "Resolved previous hard clashes" in corrected15, corrected15)
+  check("run-15 continuous-network claim quoted",
+        "form a continuous network" in corrected15, corrected15)
+  check("run-15 failing gate lines quoted",
+        "Separation gate: FAIL" in corrected15
+        and "Connectivity gate: FAIL" in corrected15, corrected15)
+  # The self-check phrasing "Zero hard clashes" is a success claim too.
+  zero = ("Zero hard clashes: verified via separate vertical / horizontal"
+          " zoning.\n\nDeterministic gates:\n" + verdict)
+  check("zero-clashes claim corrected",
+        "\n\nCORRECTION:" in serve._correct_summary(zero, verdict)
+        and "Zero hard clashes" in serve._correct_summary(zero, verdict),
+        serve._correct_summary(zero, verdict))
+  # True claims about the same gates are NOT corrected: the standalone
+  # run really did succeed, the per-row coverage really is 100% (the
+  # gate agrees), and the entry distances are measurements, not success
+  # claims. None of these lines contains a resolution word for its gate.
+  true_claims = ("Re-ran output/solution.py successfully in a clean"
+                 " standalone directory (exited 0, total elements: 265).\n"
+                 "Schema Validation: Re-run using"
+                 " ifcopenshell.validate.validate returned 0 errors.\n"
+                 "Per-Row Coverage: Rows A, B, C, D, E, and F are served"
+                 " along 100% of their length.\n"
+                 "Entry Distance: CHW 486.50 mm, Cable Tray 286.50 mm.\n"
+                 "\nDeterministic gates:\n" + verdict)
+  check("true claims left alone",
+        serve._correct_summary(true_claims, verdict) == true_claims,
+        serve._correct_summary(true_claims, verdict))
 
 
 def test_band_validation():
@@ -2121,6 +2335,25 @@ def test_routing_fix_guidance():
   check("evidence: fix a failed check and re-run",
         "never finish while the last run of a deliverable crashed"
         in prompt)
+  # Run 15: the agent's own clash script reported 0 while the gate
+  # measured 92 (ifcopenshell.geom returns metres); the guide now names
+  # the harness gate scripts as the only clash measurement, with the
+  # exact rack-skip predicate and the CHW drop recipe.
+  check("gate scripts are the clash check",
+        "python3 /tmp/sep_gate.py" in prompt
+        and "python3 /tmp/conn_gate.py" in prompt)
+  check("geom returns metres, not millimetres",
+        "returns coordinates in METRES" in prompt)
+  check("rack skip predicate with exact numbers",
+        "abs(cx_rack - cx_crah) < 900" in prompt
+        and "abs(cy_rack - cy_crah) < 950" in prompt)
+  check("CHW drop recipe",
+        "CHW drop recipe" in prompt
+        and "header_z + 168.3" in prompt)
+  check("column jog is at least 100 mm",
+        "jog of at least 100 mm" in prompt)
+  check("bridge ends at the other's face",
+        "End the extended segment at the other's FACE" in prompt)
 
 
 async def main():
@@ -2146,11 +2379,13 @@ async def main():
   test_conn_gate_real_ifc()
   await test_sep_gate()
   test_sep_gate_real_ifc()
+  test_sep_gate_rack_diagnostic()
   test_sep_gate_z_band_and_drop()
   test_merge_gate_gaps()
   await test_gates_run_in_parallel_and_merge()
   await test_gate_verdict_appended_when_rounds_run_out()
   await test_regression_guard_restores_worse_fix()
+  await test_run15_fix_accepted_then_reverted()
   test_draw_tools_geometry()
   test_vision_parse()
   await test_empty_submission_guard()
