@@ -80,6 +80,13 @@ class FakeAgent:
   # (the run-12 defect: solution.py opens ground_truth.json at runtime).
   standalone_result = "STANDALONE_EXIT:0\nSTANDALONE_IFC:OK"
   standalone_tail = "(no log)"
+  # Canned resume replies: when set, resume() pops one per call instead
+  # of inventing "fixed summary (N)". An empty string simulates a fix
+  # round killed by an endpoint error (run 16: the fix round died on a
+  # 503 ladder before answering, so solve() falls back to
+  # session.final_message, which already carries the previous round's
+  # gate verdict).
+  resume_texts = None
 
   def __init__(
       self,
@@ -110,8 +117,12 @@ class FakeAgent:
 
   async def resume(self, feedback):
     self.resumes.append(feedback)
-    text = f"fixed summary ({len(self.resumes)})"
-    self.session.final_message = text
+    if FakeAgent.resume_texts:
+      text = FakeAgent.resume_texts.pop(0)
+    else:
+      text = f"fixed summary ({len(self.resumes)})"
+    if text:
+      self.session.final_message = text
     return text
 
   async def bash(self, command, timeout_sec=120):
@@ -134,11 +145,14 @@ class FakeAgent:
 
   @classmethod
   def reset(cls, scripts=None, fail_roles=None, bash_outputs=None,
-            standalone_result=None, standalone_tail=None):
+            standalone_result=None, standalone_tail=None,
+            resume_texts=None):
     cls.instances = []
     cls.scripts = dict(scripts or {})
     cls.fail_roles = set(fail_roles or ())
     cls.bash_outputs = list(bash_outputs or [])
+    cls.resume_texts = (
+        list(resume_texts) if resume_texts is not None else None)
     cls.standalone_result = (
         standalone_result if standalone_result is not None
         else "STANDALONE_EXIT:0\nSTANDALONE_IFC:OK")
@@ -912,6 +926,104 @@ async def test_run15_fix_accepted_then_reverted():
         session.logs)
 
 
+async def test_stale_verdict_replaced():
+  print("a fix round that returns no summary leaves no stale gate verdict")
+  session = FakeSession(21600)
+  session.instruction = "Route the cable tray, busway and chilled water."
+  unit_pass = (
+      "exit code 0\nUNIT output/model.ifc: scale x1.000,"
+      " millimetre unit declared: True\n"
+      "UNIT_GATE: PASS (1 file(s), scale x1.0, millimetre units)")
+  ifc_pass = "exit code 0\nIFC_GATE: PASS (1 file(s), 0 EXPRESS violations)"
+  conn_pass = "exit code 0\nCONN_GATE: PASS"
+
+  def sep_fail(n):
+    return (
+        f"exit code 0\nSEP collisions: {n}\n"
+        f"SEP FAIL: {n} clashes (boxes overlapping > 2 mm on all axes)\n"
+        "SEP_GATE: FAIL")
+
+  # Run 16's shape: round 1 measures SEP 157, both fix rounds die on an
+  # endpoint error before answering (resume returns ""), round 3 measures
+  # SEP 34. The final summary must carry exactly one verdict section —
+  # the latest round's — and no trace of the 157.
+  FakeAgent.reset(
+      scripts={
+          "planner": ["p"],
+          "worker": ["worker summary"],
+          "verifier": ["PASS", "PASS", "PASS"],
+      },
+      bash_outputs=[
+          unit_pass, ifc_pass, sep_fail(157), conn_pass,
+          unit_pass, ifc_pass, sep_fail(34), conn_pass,
+          unit_pass, ifc_pass, sep_fail(34), conn_pass,
+      ],
+      resume_texts=["", ""],
+  )
+  real = serve.Agent
+  serve.Agent = FakeAgent
+  try:
+    result = await serve.solve(session)
+  finally:
+    serve.Agent = real
+  check("two fix rounds used",
+        len(FakeAgent.first("worker").resumes) == 2,
+        FakeAgent.first("worker").resumes)
+  check("exactly one verdict section",
+        result.count("Deterministic gates:") == 1, repr(result))
+  check("latest round quoted", "34 clashes" in result, repr(result))
+  check("stale round gone", "157 clashes" not in result, repr(result))
+
+
+async def test_placeholder_summary_quotes_final_gates():
+  print("worker with no summary: the placeholder quotes the final gates")
+  session = FakeSession(21600)
+  session.instruction = "Route the cable tray, busway and chilled water."
+  unit_pass = (
+      "exit code 0\nUNIT output/model.ifc: scale x1.000,"
+      " millimetre unit declared: True\n"
+      "UNIT_GATE: PASS (1 file(s), scale x1.0, millimetre units)")
+  ifc_pass = "exit code 0\nIFC_GATE: PASS (1 file(s), 0 EXPRESS violations)"
+  conn_pass = "exit code 0\nCONN_GATE: PASS"
+
+  def sep_fail(n):
+    return (
+        f"exit code 0\nSEP collisions: {n}\n"
+        f"SEP FAIL: {n} clashes (boxes overlapping > 2 mm on all axes)\n"
+        "SEP_GATE: FAIL")
+
+  # Run 16's other half: the worker never writes a summary (the work
+  # phase died before it could answer), so solve() runs mandatory first
+  # verification on a harness placeholder. Round 1 measures SEP 157,
+  # rounds 2-3 measure SEP 34. The placeholder must quote the final
+  # (submitted) model's numbers, not the first round's.
+  FakeAgent.reset(
+      scripts={
+          "planner": ["p"],
+          "worker": [""],
+          "verifier": ["PASS", "PASS", "PASS"],
+      },
+      bash_outputs=[
+          unit_pass, ifc_pass, sep_fail(157), conn_pass,
+          unit_pass, ifc_pass, sep_fail(34), conn_pass,
+          unit_pass, ifc_pass, sep_fail(34), conn_pass,
+      ],
+      resume_texts=["", ""],
+  )
+  real = serve.Agent
+  serve.Agent = FakeAgent
+  try:
+    result = await serve.solve(session)
+  finally:
+    serve.Agent = real
+  check("placeholder text kept",
+        "The worker produced no summary text" in result, repr(result))
+  check("exactly one verdict section",
+        result.count("Deterministic gates:") == 1, repr(result))
+  check("final round quoted", "34 clashes" in result, repr(result))
+  check("first round gone", "157 clashes" not in result, repr(result))
+
+
 def test_merge_gate_gaps():
   print("gate gap merging and clipping")
   check("empty merge", serve._merge_gate_gaps("", "", "") == "")
@@ -1388,6 +1500,111 @@ def test_sep_gate_z_band_and_drop():
     check("branch guidance given",
           "build a horizontal branch" in out, out)
     check("direction given", "to the south" in out, out)
+
+
+def test_sep_gate_joint_diagnostic():
+  print("separation gate names centreline-built joints and CRAH-column pairs")
+  try:
+    import ifcopenshell  # noqa: F401
+  except ImportError:
+    print("  skipped: ifcopenshell not installed")
+    return
+  import tempfile
+
+  with tempfile.TemporaryDirectory() as tmp:
+    # Run 16's defect, shrunk: a CHW branch ending at the aisle header
+    # centreline (y=4500, must end at the face y=4416), a CHW tie ending
+    # at two aisle header centrelines, and a CRAH overlapping a column
+    # by 192 mm in x.
+    outdir = os.path.join(tmp, "joints", "output")
+    os.makedirs(outdir)
+    _build_test_ifc(os.path.join(outdir, "model.ifc"), [
+        ('IfcPipeSegment', 'CHW-Aisle-1', 17600, 168.3, 168.3, 10350, 4500, 2930),
+        ('IfcPipeSegment', 'CHW-Aisle-3', 17600, 168.3, 168.3, 10350, 15300, 2930),
+        ('IfcPipeSegment', 'CHW-Branch-CRAH-A01', 168.3, 1400, 168.3, 4528, 3800, 2930),
+        ('IfcPipeSegment', 'CHW-Tie', 168.3, 10800, 168.3, 19150, 9900, 2930),
+        ('IfcFurniture', 'CRAH-F03', 1200, 900, 2200, 5000, 3000, 0),
+        ('IfcColumn', 'Column-5', 600, 600, 3600, 5708, 3010, 0),
+    ])
+    out = _run_sep_gate(os.path.join(tmp, "joints"))
+    check("joint model has 4 clashes", "SEP collisions: 4" in out, out)
+    check("gate fails", "SEP_GATE: FAIL" in out, out)
+    check("three CHW joints counted", "3 chw joint(s)" in out, out)
+    check("branch joint named",
+          "CHW-Branch-CRAH-A01 ends at y=4500 inside CHW-Aisle-1" in out, out)
+    check("branch face named",
+          "end it at the chw face y=4416" in out, out)
+    check("tie joint named",
+          "CHW-Tie ends at y=4500 inside CHW-Aisle-1" in out, out)
+    check("tie face named",
+          "end it at the chw face y=4584" in out, out)
+    check("CRAH-column pair named",
+          "CRAH-F03 overlaps Column-5 by 192 mm in x" in out, out)
+    check("CRAH shift named",
+          "shift the CRAH 192 mm west" in out, out)
+    # The same joints built to the faces: the branch ends at y=4416
+    # (the header face, a 0 mm butt joint) and there is no tie and no
+    # CRAH-column overlap — the gate passes and names nothing.
+    outdir2 = os.path.join(tmp, "butt", "output")
+    os.makedirs(outdir2)
+    _build_test_ifc(os.path.join(outdir2, "model.ifc"), [
+        ('IfcPipeSegment', 'CHW-Aisle-1', 17600, 168.3, 168.3, 10350, 4500, 2930),
+        ('IfcPipeSegment', 'CHW-Branch-CRAH-A01', 168.3, 1316, 168.3, 4528, 3758, 2930),
+    ])
+    out2 = _run_sep_gate(os.path.join(tmp, "butt"))
+    check("butt-joint model has no clashes",
+          "SEP collisions: 0" in out2, out2)
+    check("butt-joint model passes", "SEP_GATE: PASS" in out2, out2)
+    check("no joint diagnostic when clean",
+          "joint(s) end inside" not in out2, out2)
+    check("no CRAH diagnostic when clean",
+          "overlaps Column" not in out2, out2)
+
+
+def test_sep_gate_horizontal_band_only():
+  print("separation gate tier diagnostic uses horizontal segments only")
+  try:
+    import ifcopenshell  # noqa: F401
+  except ImportError:
+    print("  skipped: ifcopenshell not installed")
+    return
+  import tempfile
+
+  with tempfile.TemporaryDirectory() as tmp:
+    # Run 16's misleading diagnostic, shrunk: the CHW drop spans
+    # z 2000-2930 under a tray at z 2600-2727, and the CHW horizontals
+    # sit at z 2930-3098 — no horizontal CHW segment shares the tray
+    # tier. The old gate (bands over all segments) reported "tray and
+    # chw share z 2600-2727"; the fixed gate must not. One unrelated
+    # tray-tray clash keeps the total above zero so the tier section
+    # actually runs.
+    outdir = os.path.join(tmp, "dropband", "output")
+    os.makedirs(outdir)
+    _build_test_ifc(os.path.join(outdir, "model.ifc"), [
+        ('IfcCableCarrierSegment', 'CableTray-1', 10000, 683, 127, 5000, 5000, 2600),
+        ('IfcCableCarrierSegment', 'CableTray-2', 2000, 683, 127, 9000, 5000, 2600),
+        ('IfcPipeSegment', 'CHW-1', 10000, 168.3, 168.3, 5000, 5000, 2930),
+        ('IfcPipeSegment', 'CHW-2', 1000, 168.3, 168.3, 15000, 15000, 2930),
+        ('IfcPipeSegment', 'CHW-Drop-1', 168.3, 168.3, 930, 15000, 15000, 2000),
+    ])
+    out = _run_sep_gate(os.path.join(tmp, "dropband"))
+    check("only the tray clash counts", "SEP collisions: 1" in out, out)
+    check("drop does not fake a shared band",
+          "tray and chw share z" not in out, out)
+    check("gate still fails on the real clash",
+          "SEP_GATE: FAIL" in out, out)
+    # Positive control: two horizontal services genuinely sharing a
+    # band still trigger the diagnostic (same case as the flat-tiers
+    # check above).
+    outdir2 = os.path.join(tmp, "flat", "output")
+    os.makedirs(outdir2)
+    _build_test_ifc(os.path.join(outdir2, "model.ifc"), [
+        ('IfcCableCarrierSegment', 'CableTray-1', 10000, 600, 150, 5000, 5000, 2850),
+        ('IfcCableCarrierSegment', 'Busway-1', 10000, 600, 150, 5000, 5000, 2850),
+    ])
+    out2 = _run_sep_gate(os.path.join(tmp, "flat"))
+    check("genuine shared band still named",
+          "tray and busway share z 2850-3000" in out2, out2)
 
 
 def _synthetic_ground_truth():
@@ -2354,6 +2571,22 @@ def test_routing_fix_guidance():
         "jog of at least 100 mm" in prompt)
   check("bridge ends at the other's face",
         "End the extended segment at the other's FACE" in prompt)
+  # Run 16: every joint on every axis ends at the face of the box it
+  # joins (24 CHW clashes were branches ending at header centrelines);
+  # ties across headers that already meet the trunk are deleted; a CRAH
+  # overlapping a column is shifted, not moved; the 300 mm separation
+  # applies to every service pair with the centreline formula.
+  check("every joint ends at the face",
+        "ends at the FACE of the box it joins" in prompt)
+  check("no tie across parallel headers",
+        "Do not build a tie across parallel headers" in prompt)
+  check("CRAH-column shift rule",
+        "shift it along x by (900 - |dx|) mm" in prompt)
+  check("separation formula for every pair",
+        "705.5 mm" in prompt
+        and "tray-CHW and busway-CHW need the same 300 mm" in prompt)
+  check("plenum riser warning",
+        "rise BESIDE the CRAH" in prompt)
 
 
 async def main():
@@ -2381,11 +2614,15 @@ async def main():
   test_sep_gate_real_ifc()
   test_sep_gate_rack_diagnostic()
   test_sep_gate_z_band_and_drop()
+  test_sep_gate_joint_diagnostic()
+  test_sep_gate_horizontal_band_only()
   test_merge_gate_gaps()
   await test_gates_run_in_parallel_and_merge()
   await test_gate_verdict_appended_when_rounds_run_out()
   await test_regression_guard_restores_worse_fix()
   await test_run15_fix_accepted_then_reverted()
+  await test_stale_verdict_replaced()
+  await test_placeholder_summary_quotes_final_gates()
   test_draw_tools_geometry()
   test_vision_parse()
   await test_empty_submission_guard()

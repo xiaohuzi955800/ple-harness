@@ -328,7 +328,12 @@ and 51 racks still overlapped CRAHs, because the loop never tested against the C
 standing inside a row band means jog the header around it — split the header into two segments with a sideways \
 jog of at least 100 mm around the column, keeping the header on the row centreline everywhere else (on a real \
 run the headers grazed two columns by only 21.5 mm and 33.5 mm and that was 4 clashes) — and skip the racks \
-where the column stands. A trunk must touch every header it feeds — end it at the header's face (x=1800 here), \
+where the column stands. A CRAH can overlap a column in the drawings themselves: on a real run three CRAHs \
+overlapped columns by 13-192 mm while their positions matched the drawings exactly, so do not move the CRAH to \
+a "better" spot — shift it along x by (900 - |dx|) mm when |dx| < 900 and |dy| < 750 (CRAH 1200x900, column \
+600x600: they must clear by 900 mm in x or 750 mm in y); a shift under 200 mm is harmless against the 2500 mm \
+CRAH-arrival tolerance, and the rack skip test keys off the CRAH centre so the racks follow automatically. A \
+trunk must touch every header it feeds — end it at the header's face (x=1800 here), \
 not short of the rows: on a real run a 658 mm tray gap and a 516 mm CHW gap each disconnected a whole service.
 - Connect in this order: (a) the service entry first — a feeder from the entry marked on the drawings to your first \
 header; (b) one header per row, every row, all three services; (c) a drop from the CHW header to every CRAH, \
@@ -345,6 +350,22 @@ may touch or sit up to 250 mm apart and still count as connected, so a small gap
 Build each horizontal segment as a flat box (length along the run, width across, thickness up) that starts where \
 the previous segment's box ends:
   create_box_extrusion(x1 - x0, width, thickness, (x0 + x1) / 2, y, z)  # run from (x0, y) to (x1, y) at height z
+- **Every joint, on every axis, ends at the FACE of the box it joins — never at its centreline.** This is the \
+same rule in x, y and z, and it is the single most common clash on a real run: 24 of the last 34 clashes were \
+CHW branches and ties ending at the header CENTRELINE (y=4500/9900/15300, or y=1000 for the south perimeter \
+header) instead of the header FACE (y=4416/4584, 9816/9984, 15216/15384, or y=916) — each one overshooting by \
+exactly half the 168.3 mm insulated CHW width (84 mm). The same mistake made the tray feeder overshoot 242 mm \
+into the trunk (it ends at x=700, the trunk face is x=458) and the tray/busway ties overshoot by half their \
+width (341.5 mm / 64 mm). The rule: a branch joining a header ends 84.15 mm short of the header centreline \
+(half the joined box's width on that axis); a drop ends at the header's BOTTOM face, not inside it; a feeder \
+ends at the trunk's face. When the separation gate names a joint ("CHW-Branch-CRAH-A01 ends at y=4500 inside \
+CHW-Aisle-1 (y 4416..4584); end it at the header face y=4416"), move exactly that endpoint to exactly that \
+face — do not rebuild the segment.
+- **Do not build a tie across parallel headers that already meet the trunk.** On a real run the three ties (one \
+per service, x=19150, y 4500-15300) caused 9 of the 34 clashes and added 32,400 mm of route length for \
+nothing: each aisle header's west end is only 66-138 mm from the trunk face, inside the 250 mm joint \
+tolerance, so all three services are already connected through the trunk. Delete the tie. If a tie is ever \
+genuinely needed, offset it so its faces coincide with the headers' OUTER faces, never their centrelines.
 - **A fix must never break a joint that was connected.** If a service had 1 connected component, keep it at 1. \
 Shorten a segment ONLY to its neighbour's face — end it exactly where the next segment starts (a 0 mm butt \
 joint). Never shorten it short of the neighbour: a gap over 250 mm disconnects the network, and a disconnected \
@@ -397,7 +418,15 @@ more than the band holds. So do NOT stack all three overhead. Use either (a) hor
 busway at the same z but at least 300 mm apart horizontally (the rule requires separation "on at least one \
 axis"), with CHW at a different z; or (b) the under-floor plenum for one service (all three services are \
 allowed OVERHEAD OR PLENUM; the plenum is 865 mm deep, and the top of any under-floor tray must be at least \
-20 mm below the underside of the floor panel). An X corridor does NOT separate services: it only separates \
+20 mm below the underside of the floor panel). The 300 mm rule applies to EVERY pair of services, not just \
+tray-busway: tray-CHW and busway-CHW need the same 300 mm on at least one axis — on a real run all three \
+services shared the same aisle centrelines (y=4500/9900/15300) with only 23-33 mm between tiers, which is why \
+the tray-busway separation measured 23.0 mm and there were 18 rule violations. The formula is centreline \
+distance >= 300 + half-width A + half-width B: for tray-busway that is 300 + 341.5 + 64 = 705.5 mm — e.g. \
+tray at aisle-400 and busway at aisle+400 gives 800 mm centrelines and a 394.5 mm edge gap. Do not put a \
+service under the floor and hope the riser fixes itself: on a real run CHW underfloor (z=-300) with a riser \
+scored 91 clashes against 34 all-overhead — a riser must rise BESIDE the CRAH and join with a short branch \
+to the header face, never through the CRAH. An X corridor does NOT separate services: it only separates \
 trunks running along Y — headers running along X cross the whole hall on the same row and overlap along their \
 full length unless the services are separated on at least one axis. And centreline spacing is not edge \
 spacing: two 600 mm wide trunks whose centrelines are 400 mm apart overlap by 200 mm. Subtract the box width \
@@ -3084,6 +3113,125 @@ def main():
         more = f' (+{len(rack_hits) - 10} more)' if len(rack_hits) > 10 else ''
         problems.append(
             f"{len(rack_hits)} racks overlap CRAHs or columns — {names}{more}; a CRAH replaces racks: skip any rack whose centre is within 900 mm in x and 950 mm in y of a CRAH centre (CRAH 1200x900, rack 600x1000)")
+    # 1c. Joint overlaps: name the same-service joints built to a
+    # centreline instead of a face. When one segment's endpoint lies
+    # inside another segment's box, the joint overlaps by exactly the
+    # overshoot — on run 16 every one of the 24 CHW clashes was a branch
+    # or tie ending at the header centreline (84 mm = half the 168.3 mm
+    # insulated OD), and the 4 tray + 3 busway clashes were the same
+    # mistake in x. The fix is always the same: end the segment at the
+    # face of the box it joins (centreline +/- half the joined box's
+    # width on that axis), never at its centreline. Each pair is reported
+    # once, moving the shorter segment (the branch, tie or feeder is
+    # almost always the shorter one); the face is the side its other end
+    # approaches from.
+    joint_groups = {}
+    for i in range(len(items)):
+        for j in range(i + 1, len(items)):
+            s1, s2 = items[i][1], items[j][1]
+            if s1 != s2 or s1 not in ('tray', 'busway', 'chw'):
+                continue
+            ov = _overlap(items[i][4], items[i][5], items[j][4], items[j][5])
+            if ov is None or min(ov) <= CLASH_TOL:
+                continue
+            best = None
+            for a, b in ((i, j), (j, i)):
+                pa, sa, ca, axa, mna, mxa = items[a]
+                pb, sb, cb, axb, mnb, mxb = items[b]
+                # Endpoints along the run axis — and along the second
+                # axis too when the box is near-square in plan, so the
+                # run axis is ambiguous: on run 16 the tray feeder is
+                # 673 mm long but 683 mm wide, so its longest axis is
+                # its width and the run-axis endpoint (x=700, inside the
+                # trunk) is never tested without this. The tie's width
+                # (683 vs 10800 long) is far outside the 10% band, so
+                # its width endpoints are never mistaken for joints.
+                ordered = sorted(axa, key=lambda x: x[1], reverse=True)
+                axes_to_try = [ordered[0]]
+                if (len(ordered) > 1
+                        and ordered[1][1] >= 0.9 * ordered[0][1]):
+                    axes_to_try.append(ordered[1])
+                for d, half in axes_to_try:
+                    axis = max(range(3), key=lambda k: abs(d[k]))
+                    e1 = _sub(ca, _scale(d, half))
+                    e2 = _add(ca, _scale(d, half))
+                    for e in (e1, e2):
+                        # On-or-inside, not strictly inside: a tie's
+                        # endpoint sits exactly on the header's face (its
+                        # own end plane) while the tie box still overlaps
+                        # the header by half its width — on run 16 the
+                        # CHW tie ends at y=4500, the aisle header's
+                        # centreline, and the pair overlaps 84 mm. A
+                        # true butt joint also has its endpoint on the
+                        # face, but it never reaches this code: the clash
+                        # filter above already excluded it (zero overlap).
+                        inside = all(
+                            mnb[k] - CLASH_TOL <= e[k] <= mxb[k] + CLASH_TOL
+                            for k in range(3))
+                        if not inside:
+                            continue
+                        other = e2 if e is e1 else e1
+                        if other[axis] < mnb[axis]:
+                            face = mnb[axis]
+                        elif other[axis] > mxb[axis]:
+                            face = mxb[axis]
+                        else:
+                            face = (mnb[axis]
+                                    if abs(e[axis] - mnb[axis])
+                                    <= abs(e[axis] - mxb[axis])
+                                    else mxb[axis])
+                        cand = (2 * half, a, b, axis, e, face)
+                        if best is None or cand[0] < best[0]:
+                            best = cand
+            if best is None:
+                continue
+            length, a, b, axis, e, face = best
+            pa, sa, ca, axa, mna, mxa = items[a]
+            pb, sb, cb, axb, mnb, mxb = items[b]
+            axis_name = 'xyz'[axis]
+            msg = (f"{pa.Name or pa.is_a()} ends at {axis_name}={e[axis]:.0f} "
+                   f"inside {pb.Name or pb.is_a()} ({axis_name} "
+                   f"{mnb[axis]:.0f}..{mxb[axis]:.0f}); end it at the "
+                   f"{sa} face {axis_name}={face:.0f}")
+            joint_groups.setdefault((sa, axis_name), []).append(msg)
+    for (svc, axis_name), msgs in sorted(joint_groups.items()):
+        # Two examples, not one: a group usually mixes two shapes of the
+        # same mistake — on run 16 the CHW/y group holds both branches
+        # (end at the header's south face) and ties (end at the north
+        # face), and one example alone teaches only the first shape.
+        shown = '; '.join(msgs[:2])
+        more = f" (+{len(msgs) - 2} more)" if len(msgs) > 2 else ''
+        problems.append(
+            f"{len(msgs)} {svc} joint(s) end inside the box they join (built to a centreline, not a face) — e.g. {shown}{more}; end each segment at the face of the box it joins")
+    # 1d. CRAH vs column: the drawings themselves can put a CRAH on top of
+    # a column — on run 16 three CRAHs overlapped columns by 13–192 mm
+    # while their positions matched the drawings exactly, so this is a
+    # layout conflict to fix by shifting the CRAH, not a misread drawing.
+    # The shift is the smaller of the two escape distances, along the
+    # axis that needs it, away from the column.
+    for product, svc, centre, axes, a_min, a_max in items:
+        if svc != 'other':
+            continue
+        name = (product.Name or '').lower()
+        if 'crah' not in name:
+            continue
+        for p2, s2, c2, ax2, mn2, mx2 in items:
+            if s2 != 'column':
+                continue
+            ov = _overlap(a_min, a_max, mn2, mx2)
+            if ov is None or min(ov) <= CLASH_TOL:
+                continue
+            need_x = (a_max[0] - a_min[0] + mx2[0] - mn2[0]) / 2.0
+            need_y = (a_max[1] - a_min[1] + mx2[1] - mn2[1]) / 2.0
+            if ov[0] <= ov[1]:
+                shift, axis_name = ov[0], 'x'
+                direction = 'east' if centre[0] > c2[0] else 'west'
+            else:
+                shift, axis_name = ov[1], 'y'
+                direction = 'north' if centre[1] > c2[1] else 'south'
+            problems.append(
+                f"{product.Name or product.is_a()} overlaps {p2.Name or p2.is_a()} by {shift:.0f} mm in {axis_name} — shift the CRAH {shift:.0f} mm {direction} (a CRAH and a column must clear by {need_x:.0f} mm in x or {need_y:.0f} mm in y; a shift under 200 mm is harmless against the 2500 mm CRAH-arrival tolerance)")
+            break
     # 2. Tier separation: when there are clashes, say why — two services
     # sharing a z band over the same plan area clash along their whole
     # length. An X corridor does not separate X-running headers; only
@@ -3096,6 +3244,14 @@ def main():
         for product, svc, centre, axes, a_min, a_max in items:
             if svc not in ('tray', 'busway', 'chw'):
                 continue
+            longest = max(axes, key=lambda a: a[1])
+            if abs(longest[0][2]) > 0.5:
+                continue  # vertical (drop/riser): it spans tiers, so it
+                # must not set a service's band — on run 16 the 22 CHW
+                # drops (z 2000-2930) stretched the CHW band down to
+                # 2000 and the gate wrongly reported "tray and chw share
+                # z 2600-2727" although no horizontal CHW segment is
+                # anywhere near the tray tier (CHW horizontals 2930-3098)
             z0, z1 = bands.get(svc, (a_min[2], a_max[2]))
             bands[svc] = (min(z0, a_min[2]), max(z1, a_max[2]))
             x0, y0, x1, y1 = plans.get(
@@ -3529,6 +3685,28 @@ def _gate_verdict_lines(
     else:
       lines.append(f"{name} gate: no failures reported")
   return "\n".join(lines)
+
+
+def _strip_verdict(summary: str) -> str:
+  """Removes any attached "Deterministic gates:" section from a summary.
+
+  The verdict section is always appended at the end, so everything from
+  its first header onward is verdict text. Cutting from the first header
+  also removes a second, stale section when one was appended on top of
+  an earlier round's (run 16: the final message carried round 1's
+  SEP 157 above round 3's SEP 34).
+  """
+  return summary.split("Deterministic gates:")[0].rstrip()
+
+
+def _attach_verdict(summary: str, verdict: str) -> str:
+  """Attaches the latest gate verdict to a summary, replacing any earlier one.
+
+  The final summary must carry exactly one verdict section — the latest
+  round's numbers for the submitted model. Attaching without stripping
+  is how run 16 ended up with two sections (157, then 34).
+  """
+  return _strip_verdict(summary) + "\n\nDeterministic gates:\n" + verdict
 
 
 def _gate_score_vector(unit: dict, ifc: dict, sep: dict, conn: dict) -> dict | None:
@@ -4630,8 +4808,7 @@ async def solve(session: taskbridge.Session) -> str:
       # return value at the end of solve(). On run 9 solve() raised a 503
       # after the summary existed and the appendix died with the exception.
       if last_gate_gaps:
-        session.final_message = (
-            summary + "\n\nDeterministic gates:\n" + last_gate_verdict)
+        session.final_message = _attach_verdict(summary, last_gate_verdict)
       reply = await _run_phase(
           session,
           "verify",
@@ -4651,8 +4828,7 @@ async def solve(session: taskbridge.Session) -> str:
           f"verifier reply (round {round_no + 1}): {clip(reply, 500)}")
       session.final_message = summary  # the verifier's text is not the summary
       if last_gate_gaps:
-        session.final_message = (
-            summary + "\n\nDeterministic gates:\n" + last_gate_verdict)
+        session.final_message = _attach_verdict(summary, last_gate_verdict)
       passed, gaps = _verdict(reply)
       if last_gate_gaps:
         # The gates' gaps join the verifier's (or replace them when the
@@ -4687,14 +4863,21 @@ async def solve(session: taskbridge.Session) -> str:
       )
       fix_rounds_used += 1
       if not summary:
-        summary = session.final_message
+        # The session message may carry the previous round's verdict
+        # (attached before the fix round ran); strip it — the next
+        # round attaches the fresh verdict. Keeping it would leave a
+        # stale section above the new one (run 16: SEP 157 over SEP 34).
+        summary = _strip_verdict(session.final_message)
   except openai.OpenAIError as exc:
     # A transient endpoint failure after the summary exists is not fatal:
     # the summary (plus the last gate verdict, attached to
     # session.final_message each round) is the deliverable.
     await session.log(f"verify phase interrupted by endpoint error: {exc}")
     if session.final_message:
-      summary = session.final_message
+      # Strip any verdict the session message carries: it is the
+      # previous round's, and the end of solve() attaches the latest
+      # measured one. Attaching here as well would duplicate it.
+      summary = _strip_verdict(session.final_message)
   # After the last fix round there is no round left to measure the final
   # model, so run the gates once more (no verifier) — the submitted
   # summary must carry the final model's verdict, not the previous round's.
@@ -4739,7 +4922,7 @@ async def solve(session: taskbridge.Session) -> str:
           await session.log(f"standalone repair round interrupted: {exc}")
         else:
           if not summary:
-            summary = session.final_message
+            summary = _strip_verdict(session.final_message)
           last_gate_gaps, last_gate_verdict, scores = await _run_all_gates(
               worker, is_routing)
           standalone_gap = await _standalone_check(worker)
@@ -4759,11 +4942,16 @@ async def solve(session: taskbridge.Session) -> str:
           return guard
   if verified:
     summary += "\n\nIndependent verification: PASS."
-  # Append the last round's gate verdict so the submitted summary always
+  # Attach the last round's gate verdict so the submitted summary always
   # carries the deterministic checks' conclusion, even when the fix
-  # rounds ran out and the final model still fails a gate.
-  if last_gate_gaps and "Deterministic gates:" not in summary:
-    summary += "\n\nDeterministic gates:\n" + last_gate_verdict
+  # rounds ran out and the final model still fails a gate. Attach
+  # (replace), never append: the summary may already carry an earlier
+  # round's verdict — from a fix round that returned no summary, or from
+  # the session message after an endpoint error — and the reader must see
+  # only the latest round's numbers for the submitted model (run 16
+  # shipped two sections, SEP 157 above SEP 34).
+  if last_gate_gaps:
+    summary = _attach_verdict(summary, last_gate_verdict)
   # The agent's prose can claim a PASS the gates deny (run 12: "Clash
   # count: 0 PASS" while SEP/CONN FAILed). Correct the record before the
   # summary ships.
