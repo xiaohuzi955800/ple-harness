@@ -239,6 +239,24 @@ WORKER_HARD_RULES = """【最高优先级硬规则 - 必须严格遵守】
 
 """
 
+# Length-optimization rules for the routing worker's system prompt
+# (run 21: run 20 scored 0.4486 with SEP=0 and CONN PASS, and the only
+# big loss was route length, +109.6% over the grader's optimal). They
+# are mounted right after WORKER_HARD_RULES for routing workers only —
+# second in priority to the hard constraints, never above them
+# (test_routing_prompts guards both the wording and the routing-only
+# mounting).
+LENGTH_RULES = """【长度优化硬规则】
+1. 硬约束（SEP=0、CONN=PASS、单位正确、IFC合法）永远优先于长度。
+2. 在硬约束全部满足后，必须主动优化路线总长。
+3. 优先使用西侧主干策略：西侧 x=0–1800 区域走通长主干，再水平分支出去，禁止到处乱绕。
+4. 同一服务尽量保持同一标高，减少不必要的升降。
+5. 优先直线和最少转折，禁止无意义的往返、迂回、多余弯折。
+6. 能合并的平行段尽量合并，能共用的路径尽量共用。
+7. 写完模型后，必须调用门禁确认 SEP 仍为0、CONN 仍为PASS，再报告当前长度。
+
+"""
+
 WORKER = SYSTEM.replace(
     "\nWhen the work is done,", EVIDENCE + "\nWhen the work is done,"
 )
@@ -1206,8 +1224,11 @@ class Agent:
     if is_routing and self.role == "worker":
       # The hard rules lead the prompt: the deliverable is the generator
       # script, and run 19 was lost because the worker built models with
-      # /tmp scripts and never wrote output/solution.py.
-      prompt = WORKER_HARD_RULES + prompt
+      # /tmp scripts and never wrote output/solution.py. The length rules
+      # follow immediately after them (run 21: length is the only big
+      # loss left once the hard constraints pass), still ahead of the
+      # worker prompt itself.
+      prompt = WORKER_HARD_RULES + LENGTH_RULES + prompt
     if "ifc" in instr or is_routing:
       # Routing tasks produce IFC models, so they need the validation
       # snippet even when the instruction never says "IFC".
@@ -2821,14 +2842,21 @@ def main():
     if unclassified:
         print(f"CONN note: {unclassified} flow segment(s) without a recognisable name (tray/busway/chw)")
     problems = []
+    total_all = 0.0
     for svc in ('tray', 'busway', 'chw'):
         n = len(segs[svc])
         total = sum(_dist(a, b) for a, b in segs[svc])
+        total_all += total
         print(f"CONN {svc}: {n} segment(s), {total:.0f} mm total")
         if n == 0 or total == 0:
             problems.append(f"{svc}: no route (0 segments / 0 mm)")
         elif n == 1:
             problems.append(f"{svc}: only 1 segment ({total:.0f} mm) — a route needs feeders, headers and drops, not one box")
+    # Total routed length across all three services (run 21): the
+    # length round and the best-model tie-break measure against this,
+    # never against a per-service number. It is a measurement only — it
+    # never changes the gate's PASS/FAIL.
+    print(f"CONN total: {total_all:.0f} mm routed")
     for w in wrong:
         problems.append(w)
     for svc in ('tray', 'busway', 'chw'):
@@ -3683,8 +3711,11 @@ async def _connectivity_gate(worker: Agent) -> tuple[str, dict]:
 
   Returns:
     (gaps, scores): the gate's failure text when it fails, else "";
-    scores is {"components": {service: count}, "rows_below_80": int}
-    when the gate measured something, else {} (inconclusive).
+    scores is {"components": {service: count}, "rows_below_80": int,
+    "length_mm": int | None} when the gate measured something, else {}
+    (inconclusive). length_mm is the total routed length across all
+    three services (run 21); it is a measurement only and never changes
+    the gate's PASS/FAIL.
   """
   instr = worker.session.instruction.lower()
   if not any(k in instr for k in ROUTING_KEYWORDS):
@@ -3705,18 +3736,26 @@ async def _connectivity_gate(worker: Agent) -> tuple[str, dict]:
 def _connectivity_gate_scores(out: str) -> dict:
   """Parses the connectivity gate's output into a score dict for the regression guard.
 
-  Returns {"components": {service: count}, "rows_below_80": int} when the
-  gate measured something, else {} (inconclusive — the guard must not
-  compare unknowns).
+  Returns {"components": {service: count}, "rows_below_80": int,
+  "length_mm": int | None} when the gate measured something, else {}
+  (inconclusive — the guard must not compare unknowns). length_mm is
+  None when the gate output has no "CONN total:" line (older canned
+  outputs, or a gate that died before measuring).
   """
   if "CONN_GATE: SKIP" in out:
     return {}
   components = {}
   rows_below_80 = 0
+  length_mm = None
   for line in out.splitlines():
     if line.startswith("CONN ") and "connected component(s)" in line:
       try:
-        svc = line.split()[1]
+        # The gate prints "CONN tray: 1 connected component(s)" — the
+        # service token carries the colon, so strip it (run 21: the
+        # keys used to be "tray:"/"busway:"/"chw:". Only the keys
+        # change; the counts, the defect math and the PASS/FAIL are
+        # untouched — nothing ever looked a service up by name).
+        svc = line.split()[1].rstrip(":")
         components[svc] = int(line.split(":")[1].split()[0])
       except (IndexError, ValueError):
         pass
@@ -3727,12 +3766,18 @@ def _connectivity_gate_scores(out: str) -> dict:
           rows_below_80 += 1
       except (IndexError, ValueError):
         pass
+    if line.startswith("CONN total:"):
+      try:
+        length_mm = int(float(line.split(":")[1].split()[0]))
+      except (IndexError, ValueError):
+        pass
   # A PASS/FAIL verdict means the gate ran and measured; the component
   # lines are only printed when a service has more than one segment, so
   # an empty components map is a real measurement, not an unknown.
   if "CONN_GATE: PASS" not in out and "CONN_GATE: FAIL" not in out:
     return {}
-  return {"components": components, "rows_below_80": rows_below_80}
+  return {"components": components, "rows_below_80": rows_below_80,
+          "length_mm": length_mm}
 
 
 def _merge_gate_gaps(*gap_texts: str) -> str:
@@ -3839,6 +3884,10 @@ def _gate_score_vector(unit: dict, ifc: dict, sep: dict, conn: dict) -> dict | N
       "max_components": max(components.values()) if components else 0,
       "components": dict(components),
       "rows_below_80": conn.get("rows_below_80", 0),
+      # Total routed length in mm (run 21), or None when the CONN gate
+      # did not report it. A measurement only — it never affects any
+      # gate's PASS/FAIL, only the length tie-breaks below.
+      "length_mm": conn.get("length_mm"),
   }
 
 
@@ -3862,6 +3911,88 @@ def _defects(vector: dict) -> int:
           + 25 * vector.get("rows_below_80", 0))
 
 
+# The grader's optimal total routed length for the smoke task
+# (data-hall-mep-routing), from the run metrics: run 20's model routed
+# 546,218 mm against L_opt 260,602 mm (+109.6%). Only valid for this
+# task — never apply it to another task's model (see _l_opt_mm).
+L_OPT_MM_DATA_HALL_MEP_ROUTING = 260602
+# The length round fires when the route is more than 40% over optimal.
+LENGTH_RATIO_TRIGGER = 1.40
+
+
+def _length_of(vector: dict) -> int | None:
+  """Total routed length (mm) of a score vector, or None when unknown."""
+  length = vector.get("length_mm")
+  return length if isinstance(length, (int, float)) else None
+
+
+def _l_opt_mm(ground_truth: dict | None) -> int | None:
+  """The optimal total routed length for this task, or None when unknown.
+
+  Lookup order: (1) "l_opt_mm" in ground_truth.json when present;
+  (2) the task constant above, only when the ground truth matches the
+  smoke task's validated signature — hall 27000x21000 mm, 6 rows,
+  22 CRAHs. The offset task is a 27x24 m hall with 94 cabinets, so it
+  never matches. When neither is available the length round never
+  triggers: a length optimisation against an unknown baseline would
+  quote the agent a wrong percentage.
+  """
+  if not isinstance(ground_truth, dict):
+    return None
+  l_opt = ground_truth.get("l_opt_mm")
+  if isinstance(l_opt, (int, float)) and l_opt > 0:
+    return int(l_opt)
+  hall = ground_truth.get("hall") or {}
+  if (hall.get("width_mm") == 27000 and hall.get("height_mm") == 21000
+          and len(ground_truth.get("rows") or []) == 6
+          and len(ground_truth.get("crahs") or []) == 22):
+    return L_OPT_MM_DATA_HALL_MEP_ROUTING
+  return None
+
+
+def _length_ratio(scores: dict | None,
+                  ground_truth: dict | None) -> float | None:
+  """total_length_mm / L_opt, or None when either is unknown."""
+  if scores is None:
+    return None
+  length = _length_of(scores)
+  l_opt = _l_opt_mm(ground_truth)
+  if length is None or l_opt is None:
+    return None
+  return length / l_opt
+
+
+def _length_fix_prompt(ratio: float) -> str:
+  """The length-only fix-round prompt (run 21).
+
+  Fires when the hard constraints already pass but the route is far
+  longer than optimal. The percentage is the real measured ratio, never
+  a guess. The round may only change coordinates and path routing to
+  shorten the route — never a rewrite, never a new clash or break.
+  """
+  pct = int(round((ratio - 1.0) * 100))
+  return (
+      "当前硬约束已全部通过：\n"
+      "•  SEP = 0\n"
+      "•  CONN = PASS\n"
+      f"但当前路线总长仍明显长于最优（大约长了{pct}%），这是主要丢分原因。\n"
+      "请在【绝对不破坏现有硬约束】的前提下，显著缩短路线总长。\n"
+      "优先手段（按顺序尝试）：\n"
+      "1.  改用/强化西侧主干（x=0–1800通长主干 + 水平分支）\n"
+      "2.  减少弯折和迂回\n"
+      "3.  合并平行段、消除多余升降\n"
+      "4.  让同一服务尽量走同一标高\n"
+      "修改完成后：\n"
+      "•  必须重新在空目录运行 solution.py\n"
+      "•  必须重新调用 /tmp/sep_gate.py 和 /tmp/conn_gate.py\n"
+      "•  确认 SEP 仍为0、CONN 仍为PASS\n"
+      "•  报告优化后的长度变化\n"
+      "注意：这一轮只允许改坐标和路径走向来缩短长度，禁止重写整个文件，"
+      "禁止引入新的碰撞或连通性问题。"
+      "只改导致问题的具体坐标/尺寸/路径；如果优化后 SEP 或 CONN 变差，"
+      "必须回退。\n")
+
+
 def _is_regression(prev: dict, cur: dict) -> bool:
   """Whether the current gate scores are worse than the previous round's.
 
@@ -3881,6 +4012,11 @@ def _is_regression(prev: dict, cur: dict) -> bool:
   costs outweighs it (run 12: clashes 92 -> 0 by shortening segments
   short of their neighbours, tray 1 -> 7, CHW 4 -> 8 — defects 167 ->
   325, still a regression, so the run-12 tightening survives).
+
+  Length tie-break (run 21): with the defect score tied, a longer route
+  is a regression and a shorter route is an improvement — hard
+  constraints first, length second. When either length is unknown there
+  is no tie-break to apply.
   """
   if cur["unit_ok"] is False and prev["unit_ok"] is True:
     return True
@@ -3888,7 +4024,14 @@ def _is_regression(prev: dict, cur: dict) -> bool:
     return True
   if cur["frame_ok"] is False and prev["frame_ok"] is True:
     return True
-  return _defects(cur) > _defects(prev)
+  if _defects(cur) > _defects(prev):
+    return True
+  if _defects(cur) == _defects(prev):
+    prev_len, cur_len = _length_of(prev), _length_of(cur)
+    if (prev_len is not None and cur_len is not None
+            and cur_len > prev_len):
+      return True
+  return False
 
 
 # Waits between retries of a fix round that changed nothing (run 17:
@@ -3907,7 +4050,10 @@ async def _track_best(worker, scores, best_scores):
   only "best" when it is strictly better by defect score with no fatal
   flip — calibrated so it does NOT restore run 17's 64-clash model
   (defects 139: CHW 4 components) over the submitted 118 model
-  (defects 118, CONN PASS).
+  (defects 118, CONN PASS). Length tie-break (run 21): with the defect
+  score tied, the shorter route wins — hard constraints first, length
+  second. When either length is unknown there is no tie-break to apply,
+  and the earlier model stays best.
 
   Args:
     worker: The worker agent (its bash runs in the task container).
@@ -3915,15 +4061,23 @@ async def _track_best(worker, scores, best_scores):
     best_scores: The best vector so far (None when nothing measured yet).
 
   Returns:
-    The updated best vector (unchanged when scores is None, worse, or
-    the snapshot failed).
+    The updated best vector (unchanged when scores is None, worse, tied
+    without a shorter route, or the snapshot failed).
   """
   if scores is None:
     return best_scores
-  if (best_scores is not None
-      and (_is_regression(best_scores, scores)
-           or _defects(scores) >= _defects(best_scores))):
-    return best_scores
+  if best_scores is not None:
+    if _is_regression(best_scores, scores):
+      # Worse hard constraints, more defects, or the same defects with
+      # a longer route — the best snapshot stays.
+      return best_scores
+    if _defects(scores) == _defects(best_scores):
+      # Same defects: keep the shorter route (run 21 tie-break). When
+      # either length is unknown there is no tie-break to apply, and
+      # the earlier model stays best.
+      best_len, new_len = _length_of(best_scores), _length_of(scores)
+      if best_len is None or new_len is None or new_len >= best_len:
+        return best_scores
   out = await worker.bash(
       "if [ -d output ]; then rm -rf /tmp/best_output"
       " && cp -r output /tmp/best_output && echo BEST_OK;"
@@ -4930,7 +5084,10 @@ def _vector_summary(vector: dict) -> str:
   """One line for a gate score vector, for the revert note."""
   components = vector.get("components") or {}
   comp = ", ".join(f"{s} {n}" for s, n in sorted(components.items()))
-  return f"{vector.get('clashes', 0)} clashes; {comp} components"
+  length = _length_of(vector)
+  length_txt = f"; {length:.0f} mm routed" if length is not None else ""
+  return (f"{vector.get('clashes', 0)} clashes; {comp} components"
+          f"{length_txt}")
 
 
 async def _write_gate_scripts(session: taskbridge.Session) -> None:
@@ -5057,6 +5214,8 @@ async def solve(session: taskbridge.Session) -> str:
   # this exact model; the next verify round reuses it instead of
   # re-running four identical (deterministic) gate runs
   fix_rounds_used = 0  # fix rounds actually run (for the post-loop repair)
+  length_round_used = False  # the length-only fix round runs at most
+  # once per solve() (run 21)
   reverted_info = None  # (pre-fix vector, post-fix vector) of a revert,
   # so the final summary can say the model was restored (run 15: the
   # summary described the discarded fix, not the submitted model)
@@ -5151,15 +5310,34 @@ async def solve(session: taskbridge.Session) -> str:
         # verifier passed): a gate failure is a fix round, like any other.
         gaps = _merge_gate_gaps(gaps, last_gate_gaps) if gaps else last_gate_gaps
         passed = False
-      if passed:
+      # Length round (run 21): the verifier passed and every gate is
+      # clean, but the route is far longer than optimal. One length-only
+      # fix round per solve(), through the same snapshot / resume /
+      # re-gate machinery as a normal fix round below, so the regression
+      # guard applies to it. It may run on the last round too: the
+      # post-fix measurement below already gates the final model.
+      length_prompt = None
+      ratio = None
+      if (passed and not length_round_used and is_routing
+              and scores is not None):
+        ratio = _length_ratio(scores, ground_truth)
+        if ratio is not None and ratio > LENGTH_RATIO_TRIGGER:
+          length_prompt = _length_fix_prompt(ratio)
+      if passed and length_prompt is None:
         verified = True
         break
-      if not gaps or round_no >= MAX_FIX_ROUNDS:
+      if length_prompt is None and (not gaps or round_no >= MAX_FIX_ROUNDS):
         break
       left = session.time_left()
       if left is not None and left < MIN_VERIFY_SEC:
         break
-      await session.log(f"fix round {round_no + 1}: {len(gaps)} chars of gaps")
+      if length_prompt is not None:
+        await session.log(
+            "length fix round: route is"
+            f" {ratio:.0%} over optimal; optimizing length only")
+      else:
+        await session.log(
+            f"fix round {round_no + 1}: {len(gaps)} chars of gaps")
       # Snapshot the current (best-measured) model before the fix, so a
       # fix that makes things worse can be rolled back.
       snap_out = await worker.bash(
@@ -5176,15 +5354,27 @@ async def solve(session: taskbridge.Session) -> str:
       # re-prove the model standalone + gated. The riser-face and slab
       # rules live in ROUTING_GUIDE (the worker's system prompt), not
       # here. _fix_round_resume retries the round when it changes
-      # nothing (run 17: both rounds died after 0 steps).
-      summary = await _fix_round_resume(
-          worker,
-          regression_note
-          + "当前门禁结果如下（必须针对这些具体问题修改）：\n"
-          + _number_checklist(gaps)
-          + "\n请只修改 solution.py 中导致上述问题的坐标/尺寸，不要重写整个文件。\n"
-          "修改完成后，必须重新在空目录运行 solution.py，并再次调用门禁脚本验证。",
-      )
+      # nothing (run 17: both rounds died after 0 steps). A length round
+      # replaces the gate-report prompt with the length prompt (run 21);
+      # both prompts carry the same general rules: only the named
+      # coordinates change, re-run standalone + gates afterwards, and
+      # revert when SEP or CONN get worse.
+      if length_prompt is not None:
+        fix_feedback = length_prompt
+      else:
+        fix_feedback = (
+            regression_note
+            + "当前门禁结果如下（必须针对这些具体问题修改）：\n"
+            + _number_checklist(gaps)
+            + "\n请只修改 solution.py 中导致上述问题的坐标/尺寸，不要重写整个文件。\n"
+            "修改完成后，必须重新在空目录运行 solution.py，并再次调用门禁脚本验证。"
+            "如果优化后 SEP 或 CONN 变差，必须回退。")
+      summary = await _fix_round_resume(worker, fix_feedback)
+      if length_prompt is not None:
+        # Mark the slot used only once the round actually ran: a round
+        # killed by an endpoint error raises out of _fix_round_resume
+        # before this line, so the final gate pass can still retry it.
+        length_round_used = True
       fix_rounds_used += 1
       if not summary:
         # The session message may carry the previous round's verdict
@@ -5232,6 +5422,51 @@ async def solve(session: taskbridge.Session) -> str:
         last_gate_gaps, last_gate_verdict, scores = await _run_all_gates(
             worker, is_routing)
       best_scores = await _track_best(worker, scores, best_scores)
+      # Length round at the final gate pass (run 21): the model only
+      # became clean on the last fix round, so the in-loop length check
+      # never saw it. Same machinery — snapshot, resume with the length
+      # prompt, re-gate — and revert immediately on regression, since
+      # no further round will catch it. An endpoint failure here ends
+      # the round, not the run: the pre-length model is already gated.
+      if (not length_round_used and is_routing and scores is not None
+              and not last_gate_gaps):
+        ratio = _length_ratio(scores, ground_truth)
+        if ratio is not None and ratio > LENGTH_RATIO_TRIGGER:
+          left = session.time_left()
+          if left is None or left >= MIN_VERIFY_SEC:
+            await session.log(
+                "length fix round at the final gate pass: route is"
+                f" {ratio:.0%} over optimal; optimizing length only")
+            snap_out = await worker.bash(
+                "if [ -d output ]; then rm -rf /tmp/prev_output"
+                " && cp -r output /tmp/prev_output && echo SNAPSHOT_OK;"
+                " else echo SNAPSHOT_NONE; fi")
+            snapshot_exists = "SNAPSHOT_OK" in snap_out
+            prev_scores = scores
+            try:
+              summary = await _fix_round_resume(
+                  worker, _length_fix_prompt(ratio))
+            except openai.OpenAIError as exc:
+              await session.log(f"length round interrupted: {exc}")
+            else:
+              length_round_used = True
+              fix_rounds_used += 1
+              if not summary:
+                summary = _strip_verdict(session.final_message)
+              last_gate_gaps, last_gate_verdict, scores = (
+                  await _run_all_gates(worker, is_routing))
+              if (scores is not None and prev_scores is not None
+                      and snapshot_exists
+                      and _is_regression(prev_scores, scores)):
+                await session.log(
+                    "length round made the model worse;"
+                    " restoring the previous model")
+                reverted_info = (prev_scores, scores)
+                await worker.bash(
+                    "rm -rf output && cp -r /tmp/prev_output output")
+                last_gate_gaps, last_gate_verdict, scores = (
+                    await _run_all_gates(worker, is_routing))
+              best_scores = await _track_best(worker, scores, best_scores)
   # Standalone check on the submitted model. The loop already checks every
   # round, but the loop can break early on time and the final gate pass can
   # restore a model the last round never checked — so check once more

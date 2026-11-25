@@ -633,7 +633,10 @@ def test_regression_guard():
             {"components": {"tray": 5}, "rows_below_80": 2})
         == {"unit_ok": True, "ifc_ok": True, "frame_ok": True,
             "clashes": 10, "max_components": 5,
-            "components": {"tray": 5}, "rows_below_80": 2})
+            "components": {"tray": 5}, "rows_below_80": 2,
+            # No "CONN total:" line in this canned output, so the
+            # length is unknown, not zero (run 21).
+            "length_mm": None})
 
 
 async def test_gate_blocks_pass_then_fix():
@@ -685,6 +688,8 @@ def test_prompts():
   check("no pip install", "do not try pip install" in prompt)
   check("no hard rules without routing",
         "【最高优先级硬规则" not in prompt, prompt[:200])
+  check("no length rules without routing (run 21)",
+        "【长度优化硬规则" not in prompt, prompt[:200])
   check("IFC guide present",
         "express_rules=True" in prompt and "WR1" in prompt)
   check("IFC snippet present",
@@ -720,7 +725,10 @@ async def test_conn_gate():
   gaps, scores = await serve._connectivity_gate(worker)
   check("violations returned", "only 1 segment" in gaps, gaps)
   check("scores carry components and rows",
-        scores == {"components": {}, "rows_below_80": 0}, scores)
+        scores == {"components": {}, "rows_below_80": 0,
+                   # No "CONN total:" line in this canned output, so the
+                   # length is unknown, not zero (run 21).
+                   "length_mm": None}, scores)
   check("tool error is inconclusive",
         (await serve._connectivity_gate(worker))[0] == "")
 
@@ -1137,6 +1145,20 @@ def test_routing_prompts():
         "/tmp/sep_gate.py" in prompt and "/tmp/conn_gate.py" in prompt)
   check("worker hard rule: fix only the named coordinates",
         "只改对应坐标" in prompt)
+  # Run 21: the length rules follow the hard rules, verbatim, routing
+  # workers only — hard constraints first, length second.
+  check("length rules present, all seven (run 21)",
+        "【长度优化硬规则" in prompt
+        and "永远优先于长度" in prompt
+        and "必须主动优化路线总长" in prompt
+        and "走通长主干" in prompt
+        and "同一服务尽量保持同一标高" in prompt
+        and "优先直线和最少转折" in prompt
+        and "能合并的平行段尽量合并" in prompt
+        and "必须调用门禁确认 SEP 仍为0、CONN 仍为PASS" in prompt)
+  check("length rules come after the hard rules (run 21)",
+        prompt.index("【最高优先级硬规则")
+        < prompt.index("【长度优化硬规则"))
   check("busway class rule", "never IfcElectricDistributionBoard" in prompt)
   check("routing.json contract", "output/routing.json" in prompt)
   check("ground truth prompt",
@@ -1174,6 +1196,8 @@ def test_routing_prompts():
         "one header per row" not in worker2.system_prompt(""))
   check("no ground truth prompt without routing",
         "ground_truth.json" not in worker2.system_prompt(""))
+  check("no length rules without routing (run 21)",
+        "【长度优化硬规则" not in worker2.system_prompt(""))
 
 
 def _build_test_ifc(path, segments):
@@ -3194,6 +3218,424 @@ async def test_validate_delivery_blocks_empty_at_solve_end():
         session.files["output/solution.py"][:200])
 
 
+def _smoke_task_ground_truth():
+  """Ground truth matching the smoke task's validated signature (run 21):
+  hall 27000x21000, 6 rows, 22 CRAHs — the only task the L_opt task
+  constant applies to."""
+  gt = _synthetic_ground_truth()
+  gt["rows"] = [
+      {"name": n, "y_centre": y, "y_band": [y - 600, y + 600],
+       "x_start": 1800, "x_end": 19200}
+      for n, y in (("A", 3000), ("B", 6000), ("C", 8400),
+                   ("D", 11400), ("E", 13800), ("F", 16800))]
+  gt["crahs"] = [
+      {"x": 4500 + (i % 6) * 2400, "y": 3000 + (i // 6) * 3000,
+       "tag": f"CRAH-{i:02d}", "type": "in-row", "dn": 50}
+      for i in range(22)]
+  return gt
+
+
+def _length_gate_outputs(unit_pass, ifc_pass, sep_pass, conn_pass):
+  """The four canned gate outputs for one gate run, in UNIT/IFC/SEP/CONN
+  consumption order."""
+  return [unit_pass, ifc_pass, sep_pass, conn_pass]
+
+
+def _clean_gate_outputs(total_mm):
+  """Canned all-pass gate outputs for a model routing total_mm."""
+  unit_pass = (
+      "exit code 0\nUNIT output/model.ifc: scale x1.000,"
+      " millimetre unit declared: True\n"
+      "UNIT_GATE: PASS (1 file(s), scale x1.0, millimetre units)")
+  ifc_pass = "exit code 0\nIFC_GATE: PASS (1 file(s), 0 EXPRESS violations)"
+  sep_pass = "exit code 0\nSEP collisions: 0\nSEP_GATE: PASS"
+  conn_pass = (
+      "exit code 0\nCONN tray: 1 connected component(s)\n"
+      "CONN busway: 1 connected component(s)\n"
+      "CONN chw: 1 connected component(s)\n"
+      f"CONN total: {total_mm} mm routed\n"
+      "CONN_GATE: PASS")
+  return _length_gate_outputs(unit_pass, ifc_pass, sep_pass, conn_pass)
+
+
+def test_length_ratio_lookup():
+  print("L_opt lookup: ground truth first, task constant second, "
+        "unknown never triggers (run 21)")
+  gt = _smoke_task_ground_truth()
+  check("smoke-task signature gives the task constant",
+        serve._l_opt_mm(gt) == 260602, serve._l_opt_mm(gt))
+  check("run-20 length is 2.096x optimal",
+        abs(serve._length_ratio({"length_mm": 546218}, gt) - 2.096) < 0.002,
+        serve._length_ratio({"length_mm": 546218}, gt))
+  check("l_opt_mm in ground truth wins over the constant",
+        serve._l_opt_mm({**gt, "l_opt_mm": 300000}) == 300000)
+  check("offset-task hall (27x24 m) never matches",
+        serve._l_opt_mm(
+            {**gt, "hall": {"width_mm": 27000, "height_mm": 24000}})
+        is None)
+  check("synthetic 2-row ground truth never matches",
+        serve._l_opt_mm(_synthetic_ground_truth()) is None)
+  check("no ground truth, no ratio",
+        serve._length_ratio({"length_mm": 546218}, None) is None)
+  check("no length, no ratio",
+        serve._length_ratio({"length_mm": None}, gt) is None)
+  check("non-dict ground truth, no ratio",
+        serve._length_ratio({"length_mm": 546218}, "nope") is None)
+
+
+def test_length_regression_tiebreak():
+  print("regression guard: same defects, longer route is a regression "
+        "(run 21)")
+  base = {"unit_ok": True, "ifc_ok": True, "frame_ok": True,
+          "clashes": 0, "max_components": 1, "rows_below_80": 0,
+          "components": {"tray": 1, "busway": 1, "chw": 1},
+          "length_mm": 400000}
+  check("same defects, longer route is a regression",
+        serve._is_regression(base, {**base, "length_mm": 500000}))
+  check("same defects, shorter route is an improvement",
+        not serve._is_regression(base, {**base, "length_mm": 300000}))
+  check("same defects, equal length is not a regression",
+        not serve._is_regression(base, dict(base)))
+  check("same defects, unknown length is not a regression",
+        not serve._is_regression(
+            base, {k: v for k, v in base.items() if k != "length_mm"}))
+  check("defect rise still beats a shorter route",
+        serve._is_regression(
+            base, {**base, "clashes": 5, "length_mm": 100000}))
+
+
+def test_conn_gate_total_length():
+  print("connectivity gate reports total routed length (run 21)")
+  try:
+    import ifcopenshell  # noqa: F401
+  except ImportError:
+    print("  skipped: ifcopenshell not installed")
+    return
+  import json
+  import subprocess
+  import tempfile
+
+  def run_gate(workdir):
+    script = os.path.join(workdir, "conn_gate.py")
+    with open(script, "w") as f:
+      f.write(serve.CONN_GATE_SCRIPT)
+    r = subprocess.run([sys.executable, script], cwd=workdir,
+                       capture_output=True, text=True)
+    return r.stdout + r.stderr
+
+  with tempfile.TemporaryDirectory() as tmp:
+    outdir = os.path.join(tmp, "good", "output")
+    os.makedirs(outdir)
+    _build_test_ifc(os.path.join(outdir, "model.ifc"), [
+        ('IfcCableCarrierSegment', 'CableTray-1', 1800, 600, 300, 1100, 3360, 2600),
+        ('IfcCableCarrierSegment', 'CableTray-2', 600, 1640, 300, 2000, 4180, 2600),
+        ('IfcCableCarrierSegment', 'Busway-1', 1800, 600, 300, 1100, 3960, 2600),
+        ('IfcCableCarrierSegment', 'Busway-2', 600, 1640, 300, 2000, 4780, 2600),
+        ('IfcPipeSegment', 'CHW-1', 1800, 600, 300, 1100, 2760, 2600),
+        ('IfcPipeSegment', 'CHW-2', 600, 2240, 300, 2000, 3880, 2600),
+        ('IfcPipeSegment', 'CHW-Drop-1', 300, 300, 1600, 2000, 5000, 1000),
+    ])
+    json.dump({
+        'entry': [200, 3360, 0],
+        'rows': [{'name': 'A', 'start': [1100, 3360, 0], 'end': [2000, 3360, 0]}],
+        'crahs': [[2000, 5000, 0]],
+    }, open(os.path.join(outdir, "routing.json"), "w"))
+    out = run_gate(os.path.join(tmp, "good"))
+    check("good route still passes",
+          "CONN_GATE: PASS" in out, out)
+    per_service = {}
+    for line in out.splitlines():
+      if line.startswith("CONN ") and " mm total" in line:
+        per_service[line.split()[1]] = int(
+            line.split(",")[1].split()[0])
+    total = None
+    for line in out.splitlines():
+      if line.startswith("CONN total:"):
+        total = int(line.split(":")[1].split()[0])
+    check("total line present", total is not None, out)
+    check("total is the sum of the three services",
+          total == sum(per_service.values()),
+          (total, per_service))
+    scores = serve._connectivity_gate_scores(out)
+    check("parser reports the total length",
+          scores.get("length_mm") == total, scores)
+    check("pass/fail logic unchanged by the total line",
+          scores.get("components") == {"tray": 1, "busway": 1, "chw": 1},
+          scores)
+
+
+async def test_track_best_length_tiebreak():
+  print("track_best keeps the shorter model at equal defects (run 21)")
+  session = FakeSession(21600)
+  worker = FakeAgent(session, role="worker")
+  base = {"unit_ok": True, "ifc_ok": True, "frame_ok": True,
+          "clashes": 0, "max_components": 1, "rows_below_80": 0,
+          "components": {"tray": 1, "busway": 1, "chw": 1},
+          "length_mm": 546218}
+  best = await serve._track_best(worker, base, None)
+  check("first model becomes best", best == base, best)
+  shorter = {**base, "length_mm": 350000}
+  best = await serve._track_best(worker, shorter, best)
+  check("shorter model at equal defects replaces best",
+        best == shorter, best)
+  longer = {**base, "length_mm": 600000}
+  best = await serve._track_best(worker, longer, best)
+  check("longer model at equal defects does not replace best",
+        best == shorter, best)
+  unknown = {k: v for k, v in base.items() if k != "length_mm"}
+  best = await serve._track_best(worker, unknown, best)
+  check("unknown length does not replace best", best == shorter, best)
+
+
+async def test_length_round_triggers():
+  print("length round fires when SEP=0, CONN PASS and the route is >40% "
+        "over optimal (run 21)")
+  import json
+  session = FakeSession(21600)
+  session.instruction = "Route the cable tray, busway and chilled water."
+  session.files["ground_truth.json"] = json.dumps(
+      _smoke_task_ground_truth()).encode()
+  FakeAgent.reset(
+      scripts={
+          "worker": ["worker summary"],
+          "verifier": ["PASS", "PASS"],
+      },
+      bash_outputs=[
+          # Round 1: clean gates, route 546,218 mm vs L_opt 260,602
+          # (ratio 2.096, +110%) — the run-20 shape.
+          *_clean_gate_outputs(546218),
+          # Post-length-round measurement: shorter route, still clean.
+          *_clean_gate_outputs(350000),
+      ],
+  )
+  real = serve.Agent
+  serve.Agent = FakeAgent
+  try:
+    result = await serve.solve(session)
+  finally:
+    serve.Agent = real
+  worker = FakeAgent.first("worker")
+  check("exactly one resume, the length round",
+        len(worker.resumes) == 1, worker.resumes)
+  check("length prompt quotes the hard constraints",
+        "当前硬约束已全部通过" in worker.resumes[0], worker.resumes[0])
+  check("length prompt quotes the real percentage",
+        "大约长了110%" in worker.resumes[0], worker.resumes[0])
+  check("length prompt names the west trunk first",
+        "西侧主干" in worker.resumes[0], worker.resumes[0])
+  check("length prompt forbids a rewrite",
+        "禁止重写整个文件" in worker.resumes[0], worker.resumes[0])
+  check("length prompt demands a re-gate",
+        "/tmp/sep_gate.py" in worker.resumes[0]
+        and "/tmp/conn_gate.py" in worker.resumes[0],
+        worker.resumes[0])
+  check("result verified after the length round",
+        result.endswith("Independent verification: PASS."), repr(result))
+
+
+async def test_length_round_skipped_at_low_ratio():
+  print("length round does not fire at <=40% over optimal (run 21)")
+  import json
+  session = FakeSession(21600)
+  session.instruction = "Route the cable tray, busway and chilled water."
+  session.files["ground_truth.json"] = json.dumps(
+      _smoke_task_ground_truth()).encode()
+  FakeAgent.reset(
+      scripts={
+          "worker": ["worker summary"],
+          "verifier": ["PASS"],
+      },
+      bash_outputs=[*_clean_gate_outputs(350000)],
+  )
+  real = serve.Agent
+  serve.Agent = FakeAgent
+  try:
+    result = await serve.solve(session)
+  finally:
+    serve.Agent = real
+  worker = FakeAgent.first("worker")
+  check("no fix round at ratio 1.343",
+        len(worker.resumes) == 0, worker.resumes)
+  check("result verified immediately",
+        result.endswith("Independent verification: PASS."), repr(result))
+
+
+async def test_length_round_needs_l_opt():
+  print("length round never fires on an unknown baseline (run 21)")
+  import json
+  session = FakeSession(21600)
+  session.instruction = "Route the cable tray, busway and chilled water."
+  # The 2-row synthetic ground truth does not match the smoke task's
+  # signature, so L_opt is unknown even though the route is long.
+  session.files["ground_truth.json"] = json.dumps(
+      _synthetic_ground_truth()).encode()
+  FakeAgent.reset(
+      scripts={
+          "worker": ["worker summary"],
+          "verifier": ["PASS"],
+      },
+      bash_outputs=[*_clean_gate_outputs(546218)],
+  )
+  real = serve.Agent
+  serve.Agent = FakeAgent
+  try:
+    result = await serve.solve(session)
+  finally:
+    serve.Agent = real
+  worker = FakeAgent.first("worker")
+  check("no fix round without a known L_opt",
+        len(worker.resumes) == 0, worker.resumes)
+  check("result verified immediately",
+        result.endswith("Independent verification: PASS."), repr(result))
+
+
+async def test_length_round_reverts_on_regression():
+  print("length round that breaks SEP is reverted to the pre-round model "
+        "(run 21)")
+  import json
+  session = FakeSession(21600)
+  session.instruction = "Route the cable tray, busway and chilled water."
+  session.files["ground_truth.json"] = json.dumps(
+      _smoke_task_ground_truth()).encode()
+  sep_fail20 = (
+      "exit code 0\nSEP collisions: 20\n"
+      "SEP FAIL: 20 clashes (boxes overlapping > 2 mm on all axes)\n"
+      "SEP_GATE: FAIL")
+  FakeAgent.reset(
+      scripts={
+          "worker": ["worker summary"],
+          "verifier": ["PASS", "PASS"],
+      },
+      bash_outputs=[
+          # Round 1: clean gates, route 546,218 mm (ratio 2.096).
+          *_clean_gate_outputs(546218),
+          # Post-length-round measurement: shorter but 20 clashes.
+          *_clean_gate_outputs(400000)[:2]
+          + [sep_fail20, _clean_gate_outputs(400000)[3]],
+          # Guard re-gate on the restored pre-length model: clean again.
+          *_clean_gate_outputs(546218),
+      ],
+  )
+  real = serve.Agent
+  serve.Agent = FakeAgent
+  try:
+    result = await serve.solve(session)
+  finally:
+    serve.Agent = real
+  worker = FakeAgent.first("worker")
+  check("exactly one resume, the length round",
+        len(worker.resumes) == 1, worker.resumes)
+  check("revert logged",
+        any("restoring the previous model" in log for log in session.logs),
+        session.logs)
+  check("revert note names the regressed model",
+        "20 clashes" in result, repr(result))
+  check("revert note names the restored model's length",
+        "546218 mm routed" in result, repr(result))
+  # The revert note is appended after the verification line, so the
+  # result carries PASS without ending on it.
+  check("result verified on the restored model",
+        "Independent verification: PASS." in result, repr(result))
+
+
+async def test_length_round_at_final_gate_pass():
+  print("a length round killed by an endpoint error is retried at the "
+        "final gate pass (run 21)")
+  import json
+  import openai
+  session = FakeSession(21600)
+  session.instruction = "Route the cable tray, busway and chilled water."
+  session.files["ground_truth.json"] = json.dumps(
+      _smoke_task_ground_truth()).encode()
+  FakeAgent.reset(
+      scripts={
+          "worker": ["worker summary"],
+          "verifier": ["PASS"],
+      },
+      bash_outputs=[
+          # Round 1: clean gates, route 546,218 mm (ratio 2.096).
+          *_clean_gate_outputs(546218),
+          # Final gate pass re-gate: still clean and long.
+          *_clean_gate_outputs(546218),
+          # Post-length-round measurement: shorter, still clean.
+          *_clean_gate_outputs(350000),
+      ],
+  )
+  real_resume = serve._fix_round_resume
+  calls = {"n": 0}
+
+  async def flaky_resume(worker, feedback, waits=None):
+    calls["n"] += 1
+    if calls["n"] == 1:
+      raise openai.OpenAIError("boom")
+    return await real_resume(worker, feedback, waits)
+
+  serve._fix_round_resume = flaky_resume
+  real = serve.Agent
+  serve.Agent = FakeAgent
+  try:
+    result = await serve.solve(session)
+  finally:
+    serve.Agent = real
+    serve._fix_round_resume = real_resume
+  worker = FakeAgent.first("worker")
+  check("the in-loop length round died once",
+        calls["n"] == 2, calls)
+  check("exactly one resume reached the worker",
+        len(worker.resumes) == 1, worker.resumes)
+  check("the retry used the length prompt",
+        "当前硬约束已全部通过" in worker.resumes[0], worker.resumes[0])
+  check("final-gate-pass length round logged",
+        any("length fix round at the final gate pass" in log
+            for log in session.logs),
+        session.logs)
+  check("no verification note: the shortened model was never "
+        "verifier-checked",
+        "fixed summary (1)" in result
+        and not result.endswith("Independent verification: PASS."),
+        repr(result))
+
+
+async def test_fix_round_prompt_revert_rule():
+  print("normal fix-round prompt carries the revert rule (run 21)")
+  FakeAgent.reset(
+      scripts={
+          "planner": ["p"],
+          "worker": ["worker summary"],
+          "verifier": ["FAIL: 100 clashes", "PASS"],
+      },
+      bash_outputs=[
+          # Round 1: SEP 100, CONN PASS.
+          *_clean_gate_outputs(546218)[:2]
+          + ["exit code 0\nSEP collisions: 100\n"
+             "SEP FAIL: 100 clashes (boxes overlapping > 2 mm on all axes)\n"
+             "SEP_GATE: FAIL",
+             _clean_gate_outputs(546218)[3]],
+          # Post-fix measurement: clean.
+          *_clean_gate_outputs(350000),
+      ],
+  )
+  session = FakeSession(21600)
+  session.instruction = "Route the cable tray, busway and chilled water."
+  real = serve.Agent
+  serve.Agent = FakeAgent
+  try:
+    result = await serve.solve(session)
+  finally:
+    serve.Agent = real
+  worker = FakeAgent.first("worker")
+  check("one normal fix round", len(worker.resumes) == 1, worker.resumes)
+  check("fix prompt is the gate-report prompt",
+        "当前门禁结果如下" in worker.resumes[0], worker.resumes[0])
+  check("fix prompt carries the revert rule",
+        "如果优化后 SEP 或 CONN 变差，必须回退" in worker.resumes[0],
+        worker.resumes[0])
+  check("fix prompt still forbids a rewrite",
+        "不要重写整个文件" in worker.resumes[0], worker.resumes[0])
+  check("result verified",
+        result.endswith("Independent verification: PASS."), repr(result))
+
+
 async def main():
   await test_long_task_pass_first_try()
   await test_gaps_then_fix_then_pass()
@@ -3259,6 +3701,16 @@ async def main():
   await test_validate_delivery()
   await test_track_best_after_fix_round()
   await test_validate_delivery_blocks_empty_at_solve_end()
+  test_length_ratio_lookup()
+  test_length_regression_tiebreak()
+  test_conn_gate_total_length()
+  await test_track_best_length_tiebreak()
+  await test_length_round_triggers()
+  await test_length_round_skipped_at_low_ratio()
+  await test_length_round_needs_l_opt()
+  await test_length_round_reverts_on_regression()
+  await test_length_round_at_final_gate_pass()
+  await test_fix_round_prompt_revert_rule()
   print("ALL TESTS PASSED")
 
 
