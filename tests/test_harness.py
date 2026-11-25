@@ -185,13 +185,25 @@ class FakeAgent:
       # the regression guard's, never a gate measurement.
       return "BEST_OK"
     if "md5sum" in command:
-      # _solution_hash: the fix-round retry detector. A canned list
-      # simulates a round that leaves the model unchanged; otherwise
-      # every call differs, i.e. the model changed.
+      # _solution_hash: the fix-round retry detector. Production bash
+      # returns "exit code 0\\n<md5>  output/solution.py" — the fake must
+      # use the same shape, or _solution_hash's parsing is never exercised
+      # (run 22: it took split()[0], which is "exit" in production but the
+      # bare hash here, so every fix round spuriously retried twice).
+      # A canned list simulates a round that leaves the model unchanged;
+      # otherwise every call differs, i.e. the model changed. Hashes are
+      # 32-hex md5s (real or zero-padded counters), never bare words.
       if FakeAgent.solution_hashes:
-        return FakeAgent.solution_hashes.pop(0)
-      FakeAgent._hash_counter += 1
-      return f"hash{FakeAgent._hash_counter}  output/solution.py"
+        h = FakeAgent.solution_hashes.pop(0)
+      else:
+        FakeAgent._hash_counter += 1
+        h = f"{FakeAgent._hash_counter:032x}"
+      return f"exit code 0\n{h}  output/solution.py"
+    if command.startswith("python3 output/solution.py"):
+      # _regenerate_model: re-runs solution.py before a post-fix gate
+      # measurement (run 22). Pretend it worked; never consumes a canned
+      # gate output.
+      return "exit code 0\nSuccessfully generated output/model.ifc"
     if "cp output/solution.py" in command and "/tmp/standalone" in command:
       # The standalone check runs solution.py alone in a clean directory;
       # the canned result stands in for the run. Never consumes a gate
@@ -635,8 +647,9 @@ def test_regression_guard():
             "clashes": 10, "max_components": 5,
             "components": {"tray": 5}, "rows_below_80": 2,
             # No "CONN total:" line in this canned output, so the
-            # length is unknown, not zero (run 21).
-            "length_mm": None})
+            # length is unknown, not zero (run 21). No per-service
+            # lines either, so the per-service maps are empty (run 22).
+            "length_mm": None, "lengths_mm": {}, "segments": {}})
 
 
 async def test_gate_blocks_pass_then_fix():
@@ -674,7 +687,7 @@ async def test_gate_blocks_pass_then_fix():
   check("gate text passed to worker",
         "EXPRESS violations" in worker.resumes[0], worker.resumes[0])
   check("result verified",
-        result.endswith("Independent verification: PASS."), repr(result))
+        "Independent verification: PASS." in result, repr(result))
 
 
 def test_prompts():
@@ -708,6 +721,24 @@ def test_prompts():
         "not independent evidence" in vprompt)
 
 
+def test_prompt_states_objecttype_rule():
+  print("prompts state the exact ObjectType per service (run 22)")
+  check("routing guide has the ObjectType table",
+        "tray 'CableTray'" in serve.ROUTING_GUIDE
+        and "busway 'Busway'" in serve.ROUTING_GUIDE
+        and "CHW 'CHW'" in serve.ROUTING_GUIDE)
+  check("routing guide says the grader classifies by ObjectType",
+        "classifies a segment by its ObjectType" in serve.ROUTING_GUIDE)
+  check("routing guide demands an ObjectType self-check",
+        "ObjectType" in serve.ROUTING_GUIDE
+        and "IfcFlowSegment" in serve.ROUTING_GUIDE)
+  check("routing guide states same-class-different-ObjectType",
+        "DIFFERENT ObjectType" in serve.ROUTING_GUIDE
+        and "busway 'Busway'" in serve.ROUTING_GUIDE)
+  check("routing guide cites the run-21 failure",
+        "run 21" in serve.ROUTING_GUIDE)
+
+
 async def test_conn_gate():
   print("connectivity gate parsing")
   session = FakeSession(21600)
@@ -727,8 +758,10 @@ async def test_conn_gate():
   check("scores carry components and rows",
         scores == {"components": {}, "rows_below_80": 0,
                    # No "CONN total:" line in this canned output, so the
-                   # length is unknown, not zero (run 21).
-                   "length_mm": None}, scores)
+                   # length is unknown, not zero (run 21). The per-service
+                   # line is parsed (run 22).
+                   "length_mm": None, "lengths_mm": {"tray": 23000},
+                   "segments": {"tray": 1}}, scores)
   check("tool error is inconclusive",
         (await serve._connectivity_gate(worker))[0] == "")
 
@@ -776,7 +809,7 @@ async def test_conn_gate_blocks_pass_then_fix():
   check("gate text passed to worker",
         "only 1 segment" in worker.resumes[0], worker.resumes[0])
   check("result verified",
-        result.endswith("Independent verification: PASS."), repr(result))
+        "Independent verification: PASS." in result, repr(result))
 
 
 async def test_gates_run_in_parallel_and_merge():
@@ -830,9 +863,13 @@ async def test_gates_run_in_parallel_and_merge():
         and "Connectivity gate: FAIL"
         in FakeAgent.first("verifier").context)
   check("result verified",
-        result.endswith("Independent verification: PASS."), repr(result))
-  check("no gate verdict appended when clean",
-        "Deterministic gates:" not in result, repr(result))
+        "Independent verification: PASS." in result, repr(result))
+  # Run 22 changed this: on a clean run the verdict IS attached, with the
+  # fresh numbers — run 21's final message quoted stale round-1 numbers
+  # precisely because an all-pass run attached nothing.
+  check("gate verdict appended when clean, with fresh numbers (run 22)",
+        "Deterministic gates:" in result
+        and "Separation gate: PASS — 0 clash(es)" in result, repr(result))
 
 
 async def test_gate_verdict_appended_when_rounds_run_out():
@@ -2201,7 +2238,7 @@ async def test_standalone_check_passes_clean():
   finally:
     serve.Agent = real
   check("result verified",
-        result.endswith("Independent verification: PASS."), repr(result))
+        "Independent verification: PASS." in result, repr(result))
   check("no standalone failure in the summary",
         "STANDALONE FAIL" not in result, repr(result))
 
@@ -2286,7 +2323,7 @@ async def test_empty_summary_passes_clean():
   finally:
     serve.Agent = real
   check("result verified",
-        result.endswith("Independent verification: PASS."), repr(result))
+        "Independent verification: PASS." in result, repr(result))
   check("result is the harness summary, not empty",
         "no summary text" in result, repr(result))
   check("no fix round needed", len(FakeAgent.first("worker").resumes) == 0,
@@ -2822,8 +2859,7 @@ async def test_fix_round_resume_retries_unchanged():
   session.instruction = "Route the cable tray, busway and chilled water."
   FakeAgent.reset(
       resume_texts=["fixed summary (1)", "fixed summary (2)"],
-      solution_hashes=["h1  output/solution.py", "h1  output/solution.py",
-                       "h2  output/solution.py"],
+      solution_hashes=["a" * 32, "a" * 32, "b" * 32],
   )
   worker = FakeAgent(session, role="worker")
   result = await serve._fix_round_resume(
@@ -2839,7 +2875,7 @@ async def test_fix_round_resume_no_retry_when_changed():
   session = FakeSession(21600)
   session.instruction = "Route the cable tray, busway and chilled water."
   FakeAgent.reset(
-      solution_hashes=["h1  output/solution.py", "h2  output/solution.py"])
+      solution_hashes=["a" * 32, "b" * 32])
   worker = FakeAgent(session, role="worker")
   result = await serve._fix_round_resume(
       worker, "fix the joints", waits=(0, 0))
@@ -2857,7 +2893,7 @@ async def test_fix_round_resume_gives_up_after_retries():
   FakeAgent.reset(
       resume_texts=["fixed summary (1)", "fixed summary (2)",
                     "fixed summary (3)"],
-      solution_hashes=["h1  output/solution.py"] * 4,
+      solution_hashes=["a" * 32] * 4,
   )
   worker = FakeAgent(session, role="worker")
   result = await serve._fix_round_resume(
@@ -2866,6 +2902,24 @@ async def test_fix_round_resume_gives_up_after_retries():
         len(worker.resumes) == 3, worker.resumes)
   check("returns the last summary",
         result == "fixed summary (3)", result)
+
+
+async def test_solution_hash_parses_production_format():
+  print("_solution_hash reads the md5 out of production bash output "
+        "(run 22)")
+  session = FakeSession(21600)
+  session.instruction = "Route the cable tray, busway and chilled water."
+  FakeAgent.reset(solution_hashes=["c" * 32])
+  worker = FakeAgent(session, role="worker")
+  check("production-format output yields the md5, not 'exit'",
+        await serve._solution_hash(worker) == "c" * 32)
+  FakeAgent.reset()
+  worker = FakeAgent(session, role="worker")
+  first = await serve._solution_hash(worker)
+  second = await serve._solution_hash(worker)
+  check("successive calls differ (no spurious 'changed nothing')",
+        first != second and len(first) == 32 and len(second) == 32,
+        (first, second))
 
 
 def test_number_checklist():
@@ -3364,6 +3418,157 @@ def test_conn_gate_total_length():
           scores)
 
 
+def test_conn_gate_objecttype_rules_run21():
+  print("connectivity gate classifies by ObjectType like the grader "
+        "(run 22)")
+  try:
+    import ifcopenshell  # noqa: F401
+  except ImportError:
+    print("  skipped: ifcopenshell not installed")
+    return
+  import json
+  import subprocess
+  import tempfile
+
+  def run_gate(workdir):
+    script = os.path.join(workdir, "conn_gate.py")
+    with open(script, "w") as f:
+      f.write(serve.CONN_GATE_SCRIPT)
+    r = subprocess.run([sys.executable, script], cwd=workdir,
+                       capture_output=True, text=True)
+    return r.stdout + r.stderr
+
+  def good_route(objecttypes):
+    # The "good route" geometry from test_conn_gate_real_ifc, with an
+    # ObjectType per segment (9th tuple element). The CHW drop keeps the
+    # run-9 shape: ObjectType 'Drop', Name 'CHW-Drop-1' — classified as
+    # CHW by the Name fallback, exactly as the grader counted it.
+    return [
+        ('IfcCableCarrierSegment', 'CableTray-1', 1800, 600, 300, 1100, 3360, 2600, objecttypes[0]),
+        ('IfcCableCarrierSegment', 'CableTray-2', 600, 1640, 300, 2000, 4180, 2600, objecttypes[0]),
+        ('IfcCableCarrierSegment', 'Busway-1', 1800, 600, 300, 1100, 3960, 2600, objecttypes[1]),
+        ('IfcCableCarrierSegment', 'Busway-2', 600, 1640, 300, 2000, 4780, 2600, objecttypes[1]),
+        ('IfcPipeSegment', 'CHW-1', 1800, 600, 300, 1100, 2760, 2600, objecttypes[2]),
+        ('IfcPipeSegment', 'CHW-2', 600, 2240, 300, 2000, 3880, 2600, objecttypes[2]),
+        ('IfcPipeSegment', 'CHW-Drop-1', 300, 300, 1600, 2000, 5000, 1000, 'Drop'),
+    ]
+
+  routing = {
+      'entry': [200, 3360, 0],
+      'rows': [{'name': 'A', 'start': [1100, 3360, 0], 'end': [2000, 3360, 0]}],
+      'crahs': [[2000, 5000, 0]],
+  }
+  with tempfile.TemporaryDirectory() as tmp:
+    # Correct ObjectTypes: passes, per-service lengths printed.
+    outdir = os.path.join(tmp, "good", "output")
+    os.makedirs(outdir)
+    _build_test_ifc(os.path.join(outdir, "model.ifc"),
+                    good_route(('CableTray', 'Busway', 'CHW')))
+    json.dump(routing, open(os.path.join(outdir, "routing.json"), "w"))
+    out = run_gate(os.path.join(tmp, "good"))
+    check("correct ObjectTypes pass", "CONN_GATE: PASS" in out, out)
+    check("busway length counted separately",
+          "CONN busway: 2 segment(s)" in out, out)
+    check("tray length counted separately",
+          "CONN tray: 2 segment(s)" in out, out)
+    check("drop classified as CHW by Name fallback",
+          "CONN chw: 3 segment(s)" in out, out)
+
+    # Run-21 bug: busway ObjectType 'CableTray' — the grader counts it
+    # as tray, busway is 0, the gate must FAIL.
+    outdir = os.path.join(tmp, "run21", "output")
+    os.makedirs(outdir)
+    _build_test_ifc(os.path.join(outdir, "model.ifc"),
+                    good_route(('CableTray', 'CableTray', 'CHW')))
+    json.dump(routing, open(os.path.join(outdir, "routing.json"), "w"))
+    out = run_gate(os.path.join(tmp, "run21"))
+    check("run-21 busway ObjectType fails", "CONN_GATE: FAIL" in out, out)
+    check("busway reported as no route",
+          "CONN busway: 0 segment(s), 0 mm total" in out, out)
+    check("busway failure named",
+          "CONN FAIL: busway: no route (0 segments / 0 mm)" in out, out)
+    check("tray absorbed the busway segments",
+          "CONN tray: 4 segment(s)" in out, out)
+
+    # No ObjectType at all: the Name fallback keeps the old behaviour,
+    # and the fallback is logged.
+    outdir = os.path.join(tmp, "noname", "output")
+    os.makedirs(outdir)
+    _build_test_ifc(os.path.join(outdir, "model.ifc"), [
+        ('IfcCableCarrierSegment', 'CableTray-1', 1800, 600, 300, 1100, 3360, 2600),
+        ('IfcCableCarrierSegment', 'CableTray-2', 600, 1640, 300, 2000, 4180, 2600),
+        ('IfcCableCarrierSegment', 'Busway-1', 1800, 600, 300, 1100, 3960, 2600),
+        ('IfcCableCarrierSegment', 'Busway-2', 600, 1640, 300, 2000, 4780, 2600),
+        ('IfcPipeSegment', 'CHW-1', 1800, 600, 300, 1100, 2760, 2600),
+        ('IfcPipeSegment', 'CHW-2', 600, 2240, 300, 2000, 3880, 2600),
+        ('IfcPipeSegment', 'CHW-Drop-1', 300, 300, 1600, 2000, 5000, 1000),
+    ])
+    json.dump(routing, open(os.path.join(outdir, "routing.json"), "w"))
+    out = run_gate(os.path.join(tmp, "noname"))
+    check("Name fallback still passes", "CONN_GATE: PASS" in out, out)
+    check("Name fallback is logged",
+          "CONN note:" in out and "classified by Name" in out, out)
+
+
+def test_conn_gate_run21_fixture():
+  print("connectivity gate on the real run-21 model: FAILs as delivered, "
+        "PASSes with busway ObjectType fixed (run 22)")
+  try:
+    import ifcopenshell  # noqa: F401
+  except ImportError:
+    print("  skipped: ifcopenshell not installed")
+    return
+  import shutil
+  import subprocess
+  import tempfile
+
+  def run_gate(workdir):
+    script = os.path.join(workdir, "conn_gate.py")
+    with open(script, "w") as f:
+      f.write(serve.CONN_GATE_SCRIPT)
+    r = subprocess.run([sys.executable, script], cwd=workdir,
+                       capture_output=True, text=True)
+    return r.stdout + r.stderr
+
+  def run_sep_gate(workdir):
+    script = os.path.join(workdir, "sep_gate.py")
+    with open(script, "w") as f:
+      f.write(serve.SEP_GATE_SCRIPT)
+    r = subprocess.run([sys.executable, script], cwd=workdir,
+                       capture_output=True, text=True)
+    return r.stdout + r.stderr
+
+  fixture = os.path.join(
+      os.path.dirname(os.path.abspath(__file__)),
+      "fixtures", "run21-model")
+  with tempfile.TemporaryDirectory() as tmp:
+    workdir = os.path.join(tmp, "run21")
+    shutil.copytree(fixture, workdir)
+    out = run_gate(workdir)
+    check("delivered run-21 model fails CONN", "CONN_GATE: FAIL" in out, out)
+    check("busway is 0 in the delivered model",
+          "CONN busway: 0 segment(s), 0 mm total" in out, out)
+    sep_out = run_sep_gate(workdir)
+    check("delivered model still has no clashes (grader agreed: 0)",
+          "SEP collisions: 0" in sep_out, sep_out)
+    # The one-line fix: busway ObjectType 'CableTray' -> 'Busway'.
+    patched = os.path.join(tmp, "patched")
+    shutil.copytree(fixture, patched)
+    model = ifcopenshell.open(
+        os.path.join(patched, "output", "model.ifc"))
+    fixed = 0
+    for e in model.by_type("IfcCableCarrierSegment"):
+      if (e.Name or "").startswith("Busway"):
+        e.ObjectType = "Busway"
+        fixed += 1
+    model.write(os.path.join(patched, "output", "model.ifc"))
+    check("fixture has busway segments to fix", fixed > 0, fixed)
+    out = run_gate(patched)
+    check("patched model passes CONN", "CONN_GATE: PASS" in out, out)
+    check("busway length counted after the fix",
+          "CONN busway: 8 segment(s), 128025 mm total" in out, out)
+
+
 async def test_track_best_length_tiebreak():
   print("track_best keeps the shorter model at equal defects (run 21)")
   session = FakeSession(21600)
@@ -3430,7 +3635,116 @@ async def test_length_round_triggers():
         and "/tmp/conn_gate.py" in worker.resumes[0],
         worker.resumes[0])
   check("result verified after the length round",
-        result.endswith("Independent verification: PASS."), repr(result))
+        "Independent verification: PASS." in result, repr(result))
+
+
+async def test_final_message_carries_post_round_numbers():
+  print("final message quotes the post-length-round gate numbers, not "
+        "round 1 (run 22)")
+  import json
+  session = FakeSession(21600)
+  session.instruction = "Route the cable tray, busway and chilled water."
+  session.files["ground_truth.json"] = json.dumps(
+      _smoke_task_ground_truth()).encode()
+
+  def clean_split(tray_mm, busway_mm, chw_mm):
+    """Canned all-pass gate outputs with per-service lengths (run 22)."""
+    unit_pass = (
+        "exit code 0\nUNIT output/model.ifc: scale x1.000,"
+        " millimetre unit declared: True\n"
+        "UNIT_GATE: PASS (1 file(s), scale x1.0, millimetre units)")
+    ifc_pass = "exit code 0\nIFC_GATE: PASS (1 file(s), 0 EXPRESS violations)"
+    sep_pass = "exit code 0\nSEP collisions: 0\nSEP_GATE: PASS"
+    conn_pass = (
+        "exit code 0\nCONN tray: 1 connected component(s)\n"
+        "CONN busway: 1 connected component(s)\n"
+        "CONN chw: 1 connected component(s)\n"
+        f"CONN tray: 1 segment(s), {tray_mm} mm total\n"
+        f"CONN busway: 1 segment(s), {busway_mm} mm total\n"
+        f"CONN chw: 1 segment(s), {chw_mm} mm total\n"
+        f"CONN total: {tray_mm + busway_mm + chw_mm} mm routed\n"
+        "CONN_GATE: PASS")
+    return [unit_pass, ifc_pass, sep_pass, conn_pass]
+
+  FakeAgent.reset(
+      scripts={
+          "worker": ["worker summary"],
+          "verifier": ["PASS", "PASS"],
+      },
+      bash_outputs=[
+          # Round 1: clean gates, route 546,218 mm (ratio 2.096).
+          *clean_split(200000, 150000, 196218),
+          # Post-length-round measurement: shorter route, still clean.
+          *clean_split(120000, 100000, 130000),
+      ],
+  )
+  real = serve.Agent
+  serve.Agent = FakeAgent
+  try:
+    result = await serve.solve(session)
+  finally:
+    serve.Agent = real
+  worker = FakeAgent.first("worker")
+  check("exactly one resume, the length round",
+        len(worker.resumes) == 1, worker.resumes)
+  check("final message quotes the new total",
+        "total 350000 mm" in result, repr(result))
+  check("final message does not quote the round-1 total",
+        "546218" not in result, repr(result))
+  check("final message quotes the new per-service lengths",
+        "tray 1 segments 120000 mm" in result, repr(result))
+  check("exactly one verdict section, the latest",
+        result.count("Deterministic gates:") == 1, repr(result))
+
+
+async def test_length_prompt_names_longest_service():
+  print("length prompt names the per-service lengths, longest first "
+        "(run 22)")
+  import json
+  session = FakeSession(21600)
+  session.instruction = "Route the cable tray, busway and chilled water."
+  session.files["ground_truth.json"] = json.dumps(
+      _smoke_task_ground_truth()).encode()
+  unit_pass = (
+      "exit code 0\nUNIT output/model.ifc: scale x1.000,"
+      " millimetre unit declared: True\n"
+      "UNIT_GATE: PASS (1 file(s), scale x1.0, millimetre units)")
+  ifc_pass = "exit code 0\nIFC_GATE: PASS (1 file(s), 0 EXPRESS violations)"
+  sep_pass = "exit code 0\nSEP collisions: 0\nSEP_GATE: PASS"
+  conn_pass = (
+      "exit code 0\nCONN tray: 1 connected component(s)\n"
+      "CONN busway: 1 connected component(s)\n"
+      "CONN chw: 1 connected component(s)\n"
+      "CONN tray: 1 segment(s), 200000 mm total\n"
+      "CONN busway: 1 segment(s), 150000 mm total\n"
+      "CONN chw: 1 segment(s), 196218 mm total\n"
+      "CONN total: 546218 mm routed\n"
+      "CONN_GATE: PASS")
+  FakeAgent.reset(
+      scripts={
+          "worker": ["worker summary"],
+          "verifier": ["PASS", "PASS"],
+      },
+      bash_outputs=[
+          unit_pass, ifc_pass, sep_pass, conn_pass,
+          unit_pass, ifc_pass, sep_pass, conn_pass,
+      ],
+  )
+  real = serve.Agent
+  serve.Agent = FakeAgent
+  try:
+    result = await serve.solve(session)
+  finally:
+    serve.Agent = real
+  worker = FakeAgent.first("worker")
+  check("exactly one resume, the length round",
+        len(worker.resumes) == 1, worker.resumes)
+  check("length prompt lists the per-service lengths",
+        "各服务当前长度" in worker.resumes[0], worker.resumes[0])
+  check("length prompt names the longest service's length",
+        "chw 196218 mm" in worker.resumes[0], worker.resumes[0])
+  check("length prompt says to shorten the longest first",
+        "先缩最长的服务" in worker.resumes[0], worker.resumes[0])
 
 
 async def test_length_round_skipped_at_low_ratio():
@@ -3457,7 +3771,7 @@ async def test_length_round_skipped_at_low_ratio():
   check("no fix round at ratio 1.343",
         len(worker.resumes) == 0, worker.resumes)
   check("result verified immediately",
-        result.endswith("Independent verification: PASS."), repr(result))
+        "Independent verification: PASS." in result, repr(result))
 
 
 async def test_length_round_needs_l_opt():
@@ -3486,7 +3800,7 @@ async def test_length_round_needs_l_opt():
   check("no fix round without a known L_opt",
         len(worker.resumes) == 0, worker.resumes)
   check("result verified immediately",
-        result.endswith("Independent verification: PASS."), repr(result))
+        "Independent verification: PASS." in result, repr(result))
 
 
 async def test_length_round_reverts_on_regression():
@@ -3633,7 +3947,7 @@ async def test_fix_round_prompt_revert_rule():
   check("fix prompt still forbids a rewrite",
         "不要重写整个文件" in worker.resumes[0], worker.resumes[0])
   check("result verified",
-        result.endswith("Independent verification: PASS."), repr(result))
+        "Independent verification: PASS." in result, repr(result))
 
 
 async def main():
@@ -3653,6 +3967,7 @@ async def main():
   test_regression_guard()
   await test_gate_blocks_pass_then_fix()
   test_prompts()
+  test_prompt_states_objecttype_rule()
   await test_conn_gate()
   await test_conn_gate_blocks_pass_then_fix()
   test_routing_prompts()
@@ -3692,6 +4007,7 @@ async def main():
   await test_fix_round_resume_retries_unchanged()
   await test_fix_round_resume_no_retry_when_changed()
   await test_fix_round_resume_gives_up_after_retries()
+  await test_solution_hash_parses_production_format()
   test_number_checklist()
   test_sep_gate_slab_diagnostic()
   test_sep_gate_starts_inside()
@@ -3704,8 +4020,12 @@ async def main():
   test_length_ratio_lookup()
   test_length_regression_tiebreak()
   test_conn_gate_total_length()
+  test_conn_gate_objecttype_rules_run21()
+  test_conn_gate_run21_fixture()
   await test_track_best_length_tiebreak()
   await test_length_round_triggers()
+  await test_final_message_carries_post_round_numbers()
+  await test_length_prompt_names_longest_service()
   await test_length_round_skipped_at_low_ratio()
   await test_length_round_needs_l_opt()
   await test_length_round_reverts_on_regression()

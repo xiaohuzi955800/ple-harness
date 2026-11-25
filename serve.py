@@ -377,7 +377,13 @@ direction or tier change is a new segment.
 - Run the three trunks the full height of the west strip (x 0-1800, clear of cabinets — the strip carries the \
 service trunks and their risers), from the drawn entry south past the lowest row and north past the highest \
 row. The network is then fed from the marked entry and passes within 2500 mm of any west-wall entry point.
-- Busway is IfcCableCarrierSegment, exactly like the tray — never IfcElectricDistributionBoard.
+- Busway is IfcCableCarrierSegment, exactly like the tray — never IfcElectricDistributionBoard. \
+Same entity class, DIFFERENT ObjectType: the grader classifies a segment by its ObjectType, not its \
+Name and not its class, so a busway segment labelled 'CableTray' counts as tray and busway scores 0 \
+(run 21: every 'Busway-*' segment carried ObjectType 'CableTray', the grader read busway 0 mm and \
+gate_2 failed). Set ObjectType exactly: tray 'CableTray', busway 'Busway', CHW 'CHW' (CHW 'CHWPipe' \
+also works). After building the model, print every IfcFlowSegment's Name + ObjectType from \
+output/model.ifc and quote the table in your summary — all three services must show their own ObjectType.
 - Joints are butt joints: two segments meet end to end with 0 mm overlap (touching) or a gap of at most 100 mm. \
 Never build a junction from overlapping boxes — the grader counts every overlap over 2 mm as a clash, including \
 joints and same-service pairs, and more than half the clashes on a real run were joint overlaps. A joint's solids \
@@ -489,6 +495,7 @@ rules). Max top = deflector − 460; each service's base = max top − its profi
 height like z=3000 — on a real run that put the tray top 12 mm and the busway top 33 mm too high, and the \
 model failed the separation gate on sprinkler clearance alone.
 - Name every route segment clearly (CableTray-1, Busway-1, CHW-1, ...).
+- ObjectType per service — the grader classifies a segment by its ObjectType, NOT by its Name: tray 'CableTray', busway 'Busway', CHW 'CHW'. After building the model, print every route segment's Name + ObjectType from output/model.ifc (python3 -c "import ifcopenshell; m=ifcopenshell.open('output/model.ifc'); [print(p.Name, '|', p.ObjectType) for p in m.by_type('IfcFlowSegment')]") and quote the table in your summary: every tray row must show CableTray, every busway row Busway, every CHW row CHW. A busway segment labelled 'CableTray' counts as tray and fails the whole run (run 21).
 - Write output/routing.json next to the model, with the numbers you actually used: {"entry": [x, y, z], "rows": \
 [{"name": "A", "start": [x, y, z], "end": [x, y, z]}, ...], "crahs": [[x, y, z], ...]}. Then run a connectivity \
 self-check from that file (segment count and total length per service, entry distance, per-row coverage, CRAH \
@@ -2788,14 +2795,32 @@ def _closest_break(boxes, tol):
 
 
 def _classify(product):
-    text = ((product.Name or '') + ' ' + (product.ObjectType or '')).lower()
+    '''Service of a route segment, exactly like the grader (run 21).
+
+    The grader classifies by ObjectType, not Name: run 21 named its busway
+    segments 'Busway-*' but gave them ObjectType 'CableTray', and the grader
+    counted them as cable_tray (busway 0 mm, gate_2 FAIL) while a Name-based
+    classifier reported busway PASS. ObjectType keywords win; Name is only a
+    fallback when ObjectType carries no service keyword (run 9: six 'Drop'
+    segments, ObjectType 'Drop', were counted as chw_pipe — their Names are
+    'CHW-Drop-*'). Returns (service, via_name_fallback).
+    '''
+    object_type = (product.ObjectType or '').strip().lower()
+    if object_type:
+        if 'busway' in object_type:
+            return 'busway', False
+        if 'tray' in object_type:
+            return 'tray', False
+        if 'chw' in object_type or 'pipe' in object_type or 'chilled' in object_type:
+            return 'chw', False
+    text = (product.Name or '').lower()
     if 'busway' in text:
-        return 'busway'
+        return 'busway', True
     if 'tray' in text:
-        return 'tray'
+        return 'tray', True
     if 'chw' in text or 'pipe' in text or 'chilled' in text:
-        return 'chw'
-    return None
+        return 'chw', True
+    return None, False
 
 
 def main():
@@ -2814,8 +2839,11 @@ def main():
     names = {'tray': [], 'busway': [], 'chw': []}
     wrong = []
     unclassified = 0
+    name_fallback = 0
     for product in model.by_type('IfcFlowSegment'):
-        svc = _classify(product)
+        svc, via_name = _classify(product)
+        if via_name:
+            name_fallback += 1
         if svc is None:
             unclassified += 1
             continue
@@ -2834,13 +2862,15 @@ def main():
     for product in model.by_type('IfcElectricDistributionBoard'):
         # Only a board that claims to be a route segment is a wrong class;
         # a legitimate PDU (no tray/busway name) is not a route element.
-        svc = _classify(product)
+        svc, _via_name = _classify(product)
         if svc is None:
             continue
         expect = 'IfcCableCarrierSegment' if svc in ('tray', 'busway') else 'IfcPipeSegment'
         wrong.append(f"{svc} modelled as {product.is_a()}, not {expect}")
     if unclassified:
-        print(f"CONN note: {unclassified} flow segment(s) without a recognisable name (tray/busway/chw)")
+        print(f"CONN note: {unclassified} flow segment(s) without a recognisable ObjectType or name (tray/busway/chw)")
+    if name_fallback:
+        print(f"CONN note: {name_fallback} segment(s) classified by Name because their ObjectType carries no service keyword — the grader classifies by ObjectType; set ObjectType explicitly (tray CableTray, busway Busway, CHW CHW)")
     problems = []
     total_all = 0.0
     for svc in ('tray', 'busway', 'chw'):
@@ -3737,17 +3767,32 @@ def _connectivity_gate_scores(out: str) -> dict:
   """Parses the connectivity gate's output into a score dict for the regression guard.
 
   Returns {"components": {service: count}, "rows_below_80": int,
-  "length_mm": int | None} when the gate measured something, else {}
+  "length_mm": int | None, "lengths_mm": {service: mm},
+  "segments": {service: count}} when the gate measured something, else {}
   (inconclusive — the guard must not compare unknowns). length_mm is
   None when the gate output has no "CONN total:" line (older canned
-  outputs, or a gate that died before measuring).
+  outputs, or a gate that died before measuring). lengths_mm/segments
+  come from the per-service "CONN {svc}: N segment(s), M mm total" lines
+  (run 22: the final-message verdict quotes them, so the summary reports
+  the submitted model's numbers, not round 1's).
   """
   if "CONN_GATE: SKIP" in out:
     return {}
   components = {}
   rows_below_80 = 0
   length_mm = None
+  lengths_mm = {}
+  segments = {}
   for line in out.splitlines():
+    if line.startswith("CONN ") and "segment(s)," in line:
+      try:
+        # The gate prints "CONN tray: 8 segment(s), 129334 mm total".
+        svc = line.split()[1].rstrip(":")
+        parts = line.split(",")
+        segments[svc] = int(parts[0].split(":")[1].split()[0])
+        lengths_mm[svc] = int(float(parts[1].split()[0]))
+      except (IndexError, ValueError):
+        pass
     if line.startswith("CONN ") and "connected component(s)" in line:
       try:
         # The gate prints "CONN tray: 1 connected component(s)" — the
@@ -3777,7 +3822,8 @@ def _connectivity_gate_scores(out: str) -> dict:
   if "CONN_GATE: PASS" not in out and "CONN_GATE: FAIL" not in out:
     return {}
   return {"components": components, "rows_below_80": rows_below_80,
-          "length_mm": length_mm}
+          "length_mm": length_mm, "lengths_mm": lengths_mm,
+          "segments": segments}
 
 
 def _merge_gate_gaps(*gap_texts: str) -> str:
@@ -3801,13 +3847,19 @@ def _merge_gate_gaps(*gap_texts: str) -> str:
 
 
 def _gate_verdict_lines(
-    unit_gaps: str, ifc_gaps: str, sep_gaps: str, conn_gaps: str, is_routing: bool
+    unit_gaps: str, ifc_gaps: str, sep_gaps: str, conn_gaps: str, is_routing: bool,
+    scores: dict | None = None,
 ) -> str:
   """One summary line per gate, for the verifier's context and the final summary.
 
   A gate returns "" when it passes, when the task is not a routing task, or
   when it could not run — those cases are not distinguished, so a clean gate
-  is reported as "no failures reported", never as a pass.
+  without a measurement is reported as "no failures reported", never as a
+  pass. When the score vector is given (all four gates measured), a clean
+  separation/connectivity gate reports its measured numbers instead (run 22:
+  run 21's final message quoted round 1's CONN numbers — tray 129,481 mm /
+  14 segments — because the verdict never carried numbers and was only
+  attached when a gate failed).
 
   Args:
     unit_gaps: Unit gate failure text, "" when clean.
@@ -3816,6 +3868,8 @@ def _gate_verdict_lines(
     conn_gaps: Connectivity gate failure text, "" when clean.
     is_routing: Whether the task is a routing task (the separation and
       connectivity gates only run on those).
+    scores: The score vector from _gate_score_vector, or None when any gate
+      was inconclusive.
 
   Returns:
     Four lines, one per gate.
@@ -3839,6 +3893,25 @@ def _gate_verdict_lines(
           gaps.strip().splitlines()[0],
       )[:200]
       lines.append(f"{name} gate: FAIL — {detail}")
+    elif scores is not None and name == "Separation":
+      lines.append(
+          f"Separation gate: PASS — {scores.get('clashes', 0)} clash(es)")
+    elif scores is not None and name == "Connectivity":
+      segments = scores.get("segments") or {}
+      lengths = scores.get("lengths_mm") or {}
+      total = scores.get("length_mm")
+      if segments and lengths and total is not None:
+        lines.append(
+            "Connectivity gate: PASS — "
+            f"tray {segments.get('tray', 0)} segments "
+            f"{lengths.get('tray', 0)} mm, "
+            f"busway {segments.get('busway', 0)} segments "
+            f"{lengths.get('busway', 0)} mm, "
+            f"chw {segments.get('chw', 0)} segments "
+            f"{lengths.get('chw', 0)} mm, "
+            f"total {total} mm")
+      else:
+        lines.append(f"{name} gate: no failures reported")
     else:
       lines.append(f"{name} gate: no failures reported")
   return "\n".join(lines)
@@ -3886,8 +3959,13 @@ def _gate_score_vector(unit: dict, ifc: dict, sep: dict, conn: dict) -> dict | N
       "rows_below_80": conn.get("rows_below_80", 0),
       # Total routed length in mm (run 21), or None when the CONN gate
       # did not report it. A measurement only — it never affects any
-      # gate's PASS/FAIL, only the length tie-breaks below.
+      # gate's PASS/FAIL, only the length tie-breaks below. Per-service
+      # lengths/segment counts (run 22) feed the verdict numbers and the
+      # length-round prompt, so the final message quotes the submitted
+      # model's numbers.
       "length_mm": conn.get("length_mm"),
+      "lengths_mm": dict(conn.get("lengths_mm") or {}),
+      "segments": dict(conn.get("segments") or {}),
   }
 
 
@@ -3962,20 +4040,28 @@ def _length_ratio(scores: dict | None,
   return length / l_opt
 
 
-def _length_fix_prompt(ratio: float) -> str:
+def _length_fix_prompt(ratio: float, lengths: dict | None = None) -> str:
   """The length-only fix-round prompt (run 21).
 
   Fires when the hard constraints already pass but the route is far
   longer than optimal. The percentage is the real measured ratio, never
   a guess. The round may only change coordinates and path routing to
   shorten the route — never a rewrite, never a new clash or break.
+  When the per-service lengths are given, name them so the round targets
+  the longest service first (run 22: in run 21 CHW was longest at
+  169,575 mm, but the agent merged tray/busway bridges instead).
   """
   pct = int(round((ratio - 1.0) * 100))
-  return (
+  prompt = (
       "当前硬约束已全部通过：\n"
       "•  SEP = 0\n"
       "•  CONN = PASS\n"
-      f"但当前路线总长仍明显长于最优（大约长了{pct}%），这是主要丢分原因。\n"
+      f"但当前路线总长仍明显长于最优（大约长了{pct}%），这是主要丢分原因。\n")
+  if lengths:
+    detail = "、".join(
+        f"{svc} {lengths.get(svc, 0)} mm" for svc in ("tray", "busway", "chw"))
+    prompt += f"各服务当前长度：{detail}。先缩最长的服务。\n"
+  return prompt + (
       "请在【绝对不破坏现有硬约束】的前提下，显著缩短路线总长。\n"
       "优先手段（按顺序尝试）：\n"
       "1.  改用/强化西侧主干（x=0–1800通长主干 + 水平分支）\n"
@@ -4086,10 +4172,21 @@ async def _track_best(worker, scores, best_scores):
 
 
 async def _solution_hash(worker) -> str:
-  """md5 of output/solution.py in the task container ("" when absent)."""
+  """md5 of output/solution.py in the task container ("" when absent).
+
+  Agent.bash returns "exit code 0\\n<md5>  output/solution.py", so the
+  first whitespace token is the literal "exit" — taking split()[0] made
+  every comparison equal and _fix_round_resume retried after every fix
+  round since run 17 (run 21: two spurious retries, each killed at 0
+  steps on 503s, after a round that had already rewritten the file).
+  Scan for the 32-hex md5 token instead; "" when absent (NOFILE).
+  """
   out = await worker.bash("md5sum output/solution.py 2>/dev/null || echo NOFILE")
-  token = out.split()[0] if out.split() else ""
-  return "" if token == "NOFILE" else token
+  for token in out.split():
+    if (len(token) == 32
+            and all(c in "0123456789abcdef" for c in token)):
+      return token
+  return ""
 
 
 async def _fix_round_resume(worker, feedback, waits=None):
@@ -4224,6 +4321,21 @@ def _correct_summary(summary: str, verdict: str) -> str:
       + "\n".join(f"- {f}" for f in fails))
 
 
+async def _regenerate_model(worker: Agent) -> None:
+  """Re-runs output/solution.py so output/model.ifc matches the script.
+
+  A fix round can rewrite solution.py and then die before re-running it
+  (run 21: the length round rewrote the script and died after 2 steps, so
+  the post-fix gates measured the stale model.ifc — CONN 14/14/44 instead
+  of 8/8/38 — and _track_best saw identical scores). The gates measure the
+  .ifc file, not the script, so regenerate first. Best-effort: a crashing
+  script leaves the old model.ifc in place (scripts write it at the end),
+  so this never makes a measurement worse.
+  """
+  out = await worker.bash("python3 output/solution.py output/model.ifc")
+  await worker.session.log(f"regenerated model.ifc: {clip(out, 200)}")
+
+
 async def _run_all_gates(
     worker: Agent, is_routing: bool
 ) -> tuple[str, str, dict | None]:
@@ -4238,9 +4350,9 @@ async def _run_all_gates(
           _unit_gate(worker), _ifc_gate(worker), _separation_gate(worker),
           _connectivity_gate(worker))
   gaps = _merge_gate_gaps(unit_gaps, ifc_gaps, sep_gaps, conn_gaps)
-  verdict = _gate_verdict_lines(
-      unit_gaps, ifc_gaps, sep_gaps, conn_gaps, is_routing)
   scores = _gate_score_vector(unit_scores, ifc_scores, sep_scores, conn_scores)
+  verdict = _gate_verdict_lines(
+      unit_gaps, ifc_gaps, sep_gaps, conn_gaps, is_routing, scores)
   return gaps, verdict, scores
 
 
@@ -5282,7 +5394,12 @@ async def solve(session: taskbridge.Session) -> str:
       # to session.final_message (the deliverable) now, not only to the
       # return value at the end of solve(). On run 9 solve() raised a 503
       # after the summary existed and the appendix died with the exception.
-      if last_gate_gaps:
+      # Attach whenever the gates measured something, not only on failures
+      # (run 22): on an all-pass run the verdict carries the fresh numbers
+      # the worker's pasted gate block may not. When the gates were
+      # inconclusive (scores None) there is nothing to attach — "no
+      # failures reported" would mislead, since the gates never ran.
+      if scores is not None:
         session.final_message = _attach_verdict(summary, last_gate_verdict)
       reply = await _run_phase(
           session,
@@ -5302,7 +5419,7 @@ async def solve(session: taskbridge.Session) -> str:
       await session.log(
           f"verifier reply (round {round_no + 1}): {clip(reply, 500)}")
       session.final_message = summary  # the verifier's text is not the summary
-      if last_gate_gaps:
+      if scores is not None:
         session.final_message = _attach_verdict(summary, last_gate_verdict)
       passed, gaps = _verdict(reply)
       if last_gate_gaps:
@@ -5322,7 +5439,8 @@ async def solve(session: taskbridge.Session) -> str:
               and scores is not None):
         ratio = _length_ratio(scores, ground_truth)
         if ratio is not None and ratio > LENGTH_RATIO_TRIGGER:
-          length_prompt = _length_fix_prompt(ratio)
+          length_prompt = _length_fix_prompt(
+              ratio, scores.get("lengths_mm") if scores else None)
       if passed and length_prompt is None:
         verified = True
         break
@@ -5385,9 +5503,13 @@ async def solve(session: taskbridge.Session) -> str:
       # Measure the post-fix model now: _track_best must see every model
       # a fix round produces, not only the ones a later round happens to
       # measure (run 19: the verify loop never ran, so nothing was ever
-      # tracked). The next verify round reuses this measurement — the
-      # gates are deterministic — instead of re-running them.
+      # tracked). Regenerate the model first: the fix round may have
+      # rewritten solution.py without re-running it (run 21), and the
+      # gates measure the .ifc file, not the script. The next verify round
+      # reuses this measurement — the gates are deterministic — instead of
+      # re-running them.
       await session.log("fix round done; measuring the post-fix model")
+      await _regenerate_model(worker)
       last_gate_gaps, last_gate_verdict, scores = await _run_all_gates(
           worker, is_routing)
       best_scores = await _track_best(worker, scores, best_scores)
@@ -5445,7 +5567,9 @@ async def solve(session: taskbridge.Session) -> str:
             prev_scores = scores
             try:
               summary = await _fix_round_resume(
-                  worker, _length_fix_prompt(ratio))
+                  worker, _length_fix_prompt(
+                      ratio,
+                      scores.get("lengths_mm") if scores else None))
             except openai.OpenAIError as exc:
               await session.log(f"length round interrupted: {exc}")
             else:
@@ -5453,6 +5577,7 @@ async def solve(session: taskbridge.Session) -> str:
               fix_rounds_used += 1
               if not summary:
                 summary = _strip_verdict(session.final_message)
+              await _regenerate_model(worker)
               last_gate_gaps, last_gate_verdict, scores = (
                   await _run_all_gates(worker, is_routing))
               if (scores is not None and prev_scores is not None
@@ -5494,6 +5619,7 @@ async def solve(session: taskbridge.Session) -> str:
         else:
           if not summary:
             summary = _strip_verdict(session.final_message)
+          await _regenerate_model(worker)
           last_gate_gaps, last_gate_verdict, scores = await _run_all_gates(
               worker, is_routing)
           best_scores = await _track_best(worker, scores, best_scores)
@@ -5540,8 +5666,11 @@ async def solve(session: taskbridge.Session) -> str:
   # round's verdict — from a fix round that returned no summary, or from
   # the session message after an endpoint error — and the reader must see
   # only the latest round's numbers for the submitted model (run 16
-  # shipped two sections, SEP 157 above SEP 34).
-  if last_gate_gaps:
+  # shipped two sections, SEP 157 above SEP 34). Attach whenever the gates
+  # measured something, not only on failures (run 22): run 21's final
+  # message quoted round 1's CONN numbers because an all-pass run attached
+  # nothing. When the gates were inconclusive there is nothing to attach.
+  if scores is not None:
     summary = _attach_verdict(summary, last_gate_verdict)
   # The agent's prose can claim a PASS the gates deny (run 12: "Clash
   # count: 0 PASS" while SEP/CONN FAILed). Correct the record before the
