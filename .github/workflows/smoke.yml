@@ -1,0 +1,90 @@
+# PLE smoke test — place at .github/workflows/smoke.yml in the submission
+# repo (lin-ple-harness). Run manually from the Actions tab.
+#
+# What it does: checks out the harness, clones the official kit, installs
+# uv + Harbor, switches submission.yaml to a local Gemini model
+# (gemini/<id>, the kit's designed local-run path — the committed yaml
+# keeps google-cloud/gemini-4-argon and is restored before the job ends),
+# runs ONE dev task with eval/run.py, and uploads the run + artifacts.
+#
+# Secrets needed (repo Settings → Secrets and variables → Actions):
+#   GEMINI_API_KEY — lin's Google AI Studio key (the PLE key)
+#   HF_TOKEN       — lin's Hugging Face read-only token (for the gated
+#                    PLE dataset; create a fresh one in HF settings if
+#                    the old value was not saved)
+# Neither secret is ever printed: the env file is written with printf
+# and lives outside the repo; nothing in the job echoes it.
+#
+# Cost: one smoke run is roughly 30–90 min of the free 2000 Linux
+# minutes/month on lin's GitHub account.
+name: PLE smoke test
+
+on:
+  workflow_dispatch:
+    inputs:
+      task:
+        description: "Dev task id to run"
+        default: "data-hall-mep-routing"
+        required: true
+      model:
+        description: "Local Gemini model (gemini/<id>)"
+        default: "gemini/gemini-3.5-flash-lite"
+        required: true
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Clone the official kit
+        run: git clone --depth 1 https://github.com/google-research/ple kit
+
+      - name: Install uv and Harbor
+        run: |
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          "$HOME/.local/bin/uv" tool install harbor==0.20.0 --with websockets
+
+      - name: Switch submission.yaml to the local Gemini model
+        run: |
+          cp submission.yaml submission.yaml.orig
+          sed -i 's|google-cloud/gemini-4-argon|${{ inputs.model }}|' submission.yaml
+          grep '^model_api' submission.yaml
+
+      - name: Write env file from secrets (never logged)
+        run: |
+          printf 'GEMINI_API_KEY=%s\n' '${{ secrets.GEMINI_API_KEY }}' > "$RUNNER_TEMP/local.env"
+          printf 'HF_TOKEN=%s\n' '${{ secrets.HF_TOKEN }}' >> "$RUNNER_TEMP/local.env"
+          chmod 600 "$RUNNER_TEMP/local.env"
+
+      - name: kit check (build + smoke-test the harness)
+        # With a local gemini/ model_api this never reports "ready to
+        # submit" — that is expected. It still builds the serve image
+        # and smoke-tests the harness, which is what we want here.
+        continue-on-error: true
+        run: |
+          cd kit
+          "$HOME/.local/bin/uv" run python -m kit check ../ --env-file "$RUNNER_TEMP/local.env"
+
+      - name: Run one dev task
+        run: |
+          cd kit
+          "$HOME/.local/bin/uv" run python eval/run.py ../ \
+            --tasks '${{ inputs.task }}' \
+            --env-file "$RUNNER_TEMP/local.env" --trials 1 --out "$RUNNER_TEMP/runs/smoke"
+
+      - name: Restore submission.yaml
+        if: always()
+        run: mv -f submission.yaml.orig submission.yaml
+
+      - name: Upload run results and artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-${{ inputs.task }}
+          path: |
+            ${{ runner.temp }}/runs/smoke
+            artifacts/
+          retention-days: 30
