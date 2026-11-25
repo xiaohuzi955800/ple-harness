@@ -382,7 +382,10 @@ Same entity class, DIFFERENT ObjectType: the grader classifies a segment by its 
 Name and not its class, so a busway segment labelled 'CableTray' counts as tray and busway scores 0 \
 (run 21: every 'Busway-*' segment carried ObjectType 'CableTray', the grader read busway 0 mm and \
 gate_2 failed). Set ObjectType exactly: tray 'CableTray', busway 'Busway', CHW 'CHW' (CHW 'CHWPipe' \
-also works). After building the model, print every IfcFlowSegment's Name + ObjectType from \
+also works). Normalize before writing: strip whitespace, exact case, no spaces or extra words — \
+'Cable Tray' or 'CHW-Supply' fails the gate, and an empty ObjectType fails too. The gate falls back \
+to Name only when ObjectType is present but carries no service keyword (e.g. 'Drop'), and that \
+fallback is reported loudly as a warning — never rely on it. After building the model, print every IfcFlowSegment's Name + ObjectType from \
 output/model.ifc and quote the table in your summary — all three services must show their own ObjectType.
 - Joints are butt joints: two segments meet end to end with 0 mm overlap (touching) or a gap of at most 100 mm. \
 Never build a junction from overlapping boxes — the grader counts every overlap over 2 mm as a clash, including \
@@ -495,7 +498,7 @@ rules). Max top = deflector − 460; each service's base = max top − its profi
 height like z=3000 — on a real run that put the tray top 12 mm and the busway top 33 mm too high, and the \
 model failed the separation gate on sprinkler clearance alone.
 - Name every route segment clearly (CableTray-1, Busway-1, CHW-1, ...).
-- ObjectType per service — the grader classifies a segment by its ObjectType, NOT by its Name: tray 'CableTray', busway 'Busway', CHW 'CHW'. After building the model, print every route segment's Name + ObjectType from output/model.ifc (python3 -c "import ifcopenshell; m=ifcopenshell.open('output/model.ifc'); [print(p.Name, '|', p.ObjectType) for p in m.by_type('IfcFlowSegment')]") and quote the table in your summary: every tray row must show CableTray, every busway row Busway, every CHW row CHW. A busway segment labelled 'CableTray' counts as tray and fails the whole run (run 21).
+- ObjectType per service — the grader classifies a segment by its ObjectType, NOT by its Name: tray 'CableTray', busway 'Busway', CHW 'CHW'. Write ObjectType exactly. The gate normalizes case, spaces, hyphens and underscores before classifying by service keyword, like the grader, so a spaced value like 'Cable Tray' still counts — but a value that names no service at all hard-fails. Name fallback only when ObjectType is empty or names no service, and it is reported loudly as a warning. After building the model, print every route segment's Name + ObjectType from output/model.ifc (python3 -c "import ifcopenshell; m=ifcopenshell.open('output/model.ifc'); [print(p.Name, '|', p.ObjectType) for p in m.by_type('IfcFlowSegment')]") and quote the table in your summary: every tray row must show CableTray, every busway row Busway, every CHW row CHW. A busway segment labelled 'CableTray' counts as tray and fails the whole run (run 21).
 - Write output/routing.json next to the model, with the numbers you actually used: {"entry": [x, y, z], "rows": \
 [{"name": "A", "start": [x, y, z], "end": [x, y, z]}, ...], "crahs": [[x, y, z], ...]}. Then run a connectivity \
 self-check from that file (segment count and total length per service, entry distance, per-row coverage, CRAH \
@@ -2794,33 +2797,65 @@ def _closest_break(boxes, tol):
     return best
 
 
-def _classify(product):
-    '''Service of a route segment, exactly like the grader (run 21).
+OBJECT_TYPES = {'cabletray': 'tray', 'busway': 'busway', 'chw': 'chw',
+                'chwpipe': 'chw'}
+_SERVICE_KEYWORDS = ('busway', 'tray', 'chw', 'pipe', 'chilled')
 
-    The grader classifies by ObjectType, not Name: run 21 named its busway
-    segments 'Busway-*' but gave them ObjectType 'CableTray', and the grader
-    counted them as cable_tray (busway 0 mm, gate_2 FAIL) while a Name-based
-    classifier reported busway PASS. ObjectType keywords win; Name is only a
-    fallback when ObjectType carries no service keyword (run 9: six 'Drop'
-    segments, ObjectType 'Drop', were counted as chw_pipe — their Names are
-    'CHW-Drop-*'). Returns (service, via_name_fallback).
-    '''
-    object_type = (product.ObjectType or '').strip().lower()
-    if object_type:
-        if 'busway' in object_type:
-            return 'busway', False
-        if 'tray' in object_type:
-            return 'tray', False
-        if 'chw' in object_type or 'pipe' in object_type or 'chilled' in object_type:
-            return 'chw', False
-    text = (product.Name or '').lower()
+
+def _name_service(name):
+    '''Service named by a Name, or None (the Name-fallback helper).'''
+    text = (name or '').lower()
     if 'busway' in text:
-        return 'busway', True
+        return 'busway'
     if 'tray' in text:
-        return 'tray', True
+        return 'tray'
     if 'chw' in text or 'pipe' in text or 'chilled' in text:
-        return 'chw', True
-    return None, False
+        return 'chw'
+    return None
+
+
+def _normalize_objecttype(raw):
+    '''ObjectType with case, spacing and separators stripped out.'''
+    return ''.join((raw or '').strip().casefold().split()).replace(
+        '-', '').replace('_', '')
+
+
+def _classify(product):
+    '''Service of a route segment: ObjectType first, then Name fallback.
+
+    The grader classifies by ObjectType, not Name (run 21: busway segments
+    named 'Busway-*' with ObjectType 'CableTray' counted as cable_tray,
+    busway 0 mm, gate_2 FAIL). DeepSeek review: the prompt's printed
+    ObjectType table can be bypassed and variants were never locked down,
+    so the final IFC itself is asserted here (run 22+). The ObjectType is
+    normalized first — strip + casefold with spaces, hyphens and
+    underscores removed — then matched against the exact set (cabletray /
+    busway / chw / chwpipe) and then by service keyword, exactly like the
+    grader: the grader counted run 17's 'Cable Tray' / 'CHW Pipe' by
+    keyword (its gate_2 passed with all three services non-zero), so a
+    literal exact-set rule would fail a grader-passing model and break
+    the gates-match-the-grader invariant — normalization, not rejection,
+    is the fix for variants. An empty ObjectType, or one that names no
+    service, falls back to the Name (run 15: ObjectType None on all 50
+    segments, the grader counted all three services by Name) — and that
+    fallback is reported loudly as a warning, never silently. Only a
+    segment whose ObjectType AND Name name no service at all is
+    unclassifiable and hard-fails. Returns (service, via_name_fallback,
+    status): status is None on a clean classification, else
+    'unclassified'.
+    '''
+    norm = _normalize_objecttype(product.ObjectType)
+    if norm in OBJECT_TYPES:
+        return OBJECT_TYPES[norm], False, None
+    for keyword, svc in (('busway', 'busway'), ('tray', 'tray'),
+                         ('chw', 'chw'), ('pipe', 'chw'),
+                         ('chilled', 'chw')):
+        if keyword in norm:
+            return svc, False, None
+    svc = _name_service(product.Name)
+    if svc is not None:
+        return svc, True, None
+    return None, False, 'unclassified'
 
 
 def main():
@@ -2838,20 +2873,46 @@ def main():
     boxes = {'tray': [], 'busway': [], 'chw': []}
     names = {'tray': [], 'busway': [], 'chw': []}
     wrong = []
-    unclassified = 0
     name_fallback = 0
+    # Hard ObjectType assertion (run 22+, DeepSeek review): every flow
+    # segment must be classifiable by service — normalized ObjectType
+    # (exact set or service keyword) or, failing that, its Name. A
+    # segment whose ObjectType AND Name name no service is unclassifiable
+    # and hard-fails below; offenders are named.
+    bad_object_types = []
+    fallback_names = []
+    # Centreline length of EVERY flow segment with a box, classified or
+    # not: the classified sum must equal this, or some segment escaped
+    # classification (an unclassifiable segment makes the sums disagree).
+    total_flow = 0.0
+    flow_excluded = 0
     for product in model.by_type('IfcFlowSegment'):
-        svc, via_name = _classify(product)
+        svc, via_name, status = _classify(product)
+        if status == 'unclassified':
+            bad_object_types.append(
+                (product.Name or product.is_a(), product.ObjectType,
+                 'unrecognisable ObjectType and Name'))
         if via_name:
             name_fallback += 1
+            fallback_names.append(product.Name or product.is_a())
+        b = _box(product)
+        if b is not None:
+            centre, axes = b
+            d, half = max(axes, key=lambda a: a[1])
+            total_flow += _dist(_sub(centre, _scale(d, half)),
+                                _add(centre, _scale(d, half)))
         if svc is None:
-            unclassified += 1
+            if b is not None:
+                flow_excluded += 1
             continue
         expect = 'IfcCableCarrierSegment' if svc in ('tray', 'busway') else 'IfcPipeSegment'
         if not product.is_a(expect):
+            # Wrong IFC class for the claimed service — a warning, not a
+            # fail: the grader classifies by ObjectType regardless of
+            # class, so excluding the segment would fail a model the
+            # grader passes. The busway-mislabelled-as-CHW case is still
+            # caught: busway lands at 0 segments (see the >=1 check).
             wrong.append(f"{svc} modelled as {product.is_a()}, not {expect}")
-            continue
-        b = _box(product)
         if b is None:
             continue
         centre, axes = b
@@ -2862,16 +2923,38 @@ def main():
     for product in model.by_type('IfcElectricDistributionBoard'):
         # Only a board that claims to be a route segment is a wrong class;
         # a legitimate PDU (no tray/busway name) is not a route element.
-        svc, _via_name = _classify(product)
+        # A board claims a service through its ObjectType, or — when it
+        # has none — through its Name (run 6: busway board, no ObjectType,
+        # Name 'Busway'). Like a wrong-class flow segment, a board's claim
+        # is a warning, not a fail: the grader ignores boards for routing,
+        # so a board cannot zero a service that has real segments.
+        svc, _via_name, _status = _classify(product)
+        if svc is None:
+            svc = _name_service(product.Name)
         if svc is None:
             continue
         expect = 'IfcCableCarrierSegment' if svc in ('tray', 'busway') else 'IfcPipeSegment'
         wrong.append(f"{svc} modelled as {product.is_a()}, not {expect}")
-    if unclassified:
-        print(f"CONN note: {unclassified} flow segment(s) without a recognisable ObjectType or name (tray/busway/chw)")
     if name_fallback:
-        print(f"CONN note: {name_fallback} segment(s) classified by Name because their ObjectType carries no service keyword — the grader classifies by ObjectType; set ObjectType explicitly (tray CableTray, busway Busway, CHW CHW)")
+        # The fallback is an alarm, not a silent classification (run 22+):
+        # it is a WARNING in the gate output, so it reaches the gaps text
+        # on a FAIL and the verdict line on a PASS — the agent and the
+        # final message both show it.
+        shown = ', '.join(fallback_names[:5])
+        print(f"CONN WARNING: {name_fallback} segment(s) classified by Name because their ObjectType is empty or carries no service keyword — the grader classifies by ObjectType; set ObjectType exactly (tray CableTray, busway Busway, CHW CHW). First: {shown}")
+    if wrong:
+        # Wrong IFC class is a warning, not a fail (see above): the
+        # grader counts these toward the named service, so they still
+        # appear in the per-service lengths and the classified sum.
+        shown = '; '.join(wrong[:5])
+        print(f"CONN WARNING: {len(wrong)} segment(s) modelled as the wrong IFC class for their ObjectType — the grader classifies by ObjectType, so these still count toward the named service. First: {shown}")
     problems = []
+    for name, raw, reason in bad_object_types[:5]:
+        problems.append(
+            f"segment '{name}' has ObjectType '{raw}' ({reason}) — the ObjectType and the Name name no service, so the grader cannot classify it; set ObjectType to CableTray, Busway, CHW or CHWPipe")
+    if len(bad_object_types) > 5:
+        problems.append(
+            f"... and {len(bad_object_types) - 5} more segment(s) with a bad ObjectType")
     total_all = 0.0
     for svc in ('tray', 'busway', 'chw'):
         n = len(segs[svc])
@@ -2879,6 +2962,9 @@ def main():
         total_all += total
         print(f"CONN {svc}: {n} segment(s), {total:.0f} mm total")
         if n == 0 or total == 0:
+            # Each service must have at least one segment (run 22+): this
+            # is what catches a busway mislabelled as CHW — it classifies
+            # as CHW, so busway is left at 0, the run-21 failure again.
             problems.append(f"{svc}: no route (0 segments / 0 mm)")
         elif n == 1:
             problems.append(f"{svc}: only 1 segment ({total:.0f} mm) — a route needs feeders, headers and drops, not one box")
@@ -2887,8 +2973,13 @@ def main():
     # never against a per-service number. It is a measurement only — it
     # never changes the gate's PASS/FAIL.
     print(f"CONN total: {total_all:.0f} mm routed")
-    for w in wrong:
-        problems.append(w)
+    # The classified per-service lengths must sum to the model total
+    # (run 22+): an unclassifiable or wrong-class segment is in the model
+    # but in no service, so the sums disagree — and a model whose lengths
+    # do not add up is not a model whose services are all accounted for.
+    if abs(total_flow - total_all) > 1.0:
+        problems.append(
+            f"classified length sum {total_all:.0f} mm != model total {total_flow:.0f} mm — {flow_excluded} flow segment(s) unclassified; every flow segment must name a service by ObjectType or Name")
     for svc in ('tray', 'busway', 'chw'):
         if len(boxes[svc]) > 1:
             c = _components(boxes[svc], JOIN_TOL)
@@ -3742,10 +3833,12 @@ async def _connectivity_gate(worker: Agent) -> tuple[str, dict]:
   Returns:
     (gaps, scores): the gate's failure text when it fails, else "";
     scores is {"components": {service: count}, "rows_below_80": int,
-    "length_mm": int | None} when the gate measured something, else {}
-    (inconclusive). length_mm is the total routed length across all
-    three services (run 21); it is a measurement only and never changes
-    the gate's PASS/FAIL.
+    "length_mm": int | None, "name_fallback": int} when the gate measured
+    something, else {} (inconclusive). length_mm is the total routed
+    length across all three services (run 21); it is a measurement only
+    and never changes the gate's PASS/FAIL. name_fallback counts the
+    segments classified by Name fallback (run 22+: an alarm, carried so
+    the verdict line shows it even when the gate passes).
   """
   instr = worker.session.instruction.lower()
   if not any(k in instr for k in ROUTING_KEYWORDS):
@@ -3768,13 +3861,17 @@ def _connectivity_gate_scores(out: str) -> dict:
 
   Returns {"components": {service: count}, "rows_below_80": int,
   "length_mm": int | None, "lengths_mm": {service: mm},
-  "segments": {service: count}} when the gate measured something, else {}
-  (inconclusive — the guard must not compare unknowns). length_mm is
-  None when the gate output has no "CONN total:" line (older canned
-  outputs, or a gate that died before measuring). lengths_mm/segments
-  come from the per-service "CONN {svc}: N segment(s), M mm total" lines
-  (run 22: the final-message verdict quotes them, so the summary reports
-  the submitted model's numbers, not round 1's).
+  "segments": {service: count}, "name_fallback": int} when the gate
+  measured something, else {} (inconclusive — the guard must not compare
+  unknowns). length_mm is None when the gate output has no "CONN total:"
+  line (older canned outputs, or a gate that died before measuring).
+  lengths_mm/segments come from the per-service "CONN {svc}: N segment(s),
+  M mm total" lines (run 22: the final-message verdict quotes them, so the
+  summary reports the submitted model's numbers, not round 1's).
+  name_fallback is the count of segments the gate classified by Name
+  because their ObjectType carries no service keyword, parsed from the
+  "CONN WARNING:" line (run 22+: the fallback is an alarm, and the
+  verdict line must show it even when the gate passes).
   """
   if "CONN_GATE: SKIP" in out:
     return {}
@@ -3783,6 +3880,7 @@ def _connectivity_gate_scores(out: str) -> dict:
   length_mm = None
   lengths_mm = {}
   segments = {}
+  name_fallback = 0
   for line in out.splitlines():
     if line.startswith("CONN ") and "segment(s)," in line:
       try:
@@ -3816,6 +3914,13 @@ def _connectivity_gate_scores(out: str) -> dict:
         length_mm = int(float(line.split(":")[1].split()[0]))
       except (IndexError, ValueError):
         pass
+    if line.startswith("CONN WARNING:") and "classified by Name" in line:
+      try:
+        # The gate prints "CONN WARNING: 6 segment(s) classified by Name
+        # because their ObjectType is empty or carries no service keyword ...".
+        name_fallback = int(line.split()[2])
+      except (IndexError, ValueError):
+        pass
   # A PASS/FAIL verdict means the gate ran and measured; the component
   # lines are only printed when a service has more than one segment, so
   # an empty components map is a real measurement, not an unknown.
@@ -3823,7 +3928,7 @@ def _connectivity_gate_scores(out: str) -> dict:
     return {}
   return {"components": components, "rows_below_80": rows_below_80,
           "length_mm": length_mm, "lengths_mm": lengths_mm,
-          "segments": segments}
+          "segments": segments, "name_fallback": name_fallback}
 
 
 def _merge_gate_gaps(*gap_texts: str) -> str:
@@ -3892,7 +3997,16 @@ def _gate_verdict_lines(
           (line for line in gaps.strip().splitlines() if "FAIL:" in line),
           gaps.strip().splitlines()[0],
       )[:200]
-      lines.append(f"{name} gate: FAIL — {detail}")
+      fail_line = f"{name} gate: FAIL — {detail}"
+      # The Name fallback is an alarm even on a failing gate (run 22+):
+      # the fix round must see that some segments were classified by
+      # Name, not ObjectType.
+      if (name == "Connectivity" and scores is not None
+              and scores.get("name_fallback", 0)):
+        fail_line += (
+            f" WARNING: {scores['name_fallback']} segment(s) classified by"
+            " Name fallback (grader uses ObjectType) — set ObjectType exactly")
+      lines.append(fail_line)
     elif scores is not None and name == "Separation":
       lines.append(
           f"Separation gate: PASS — {scores.get('clashes', 0)} clash(es)")
@@ -3901,7 +4015,7 @@ def _gate_verdict_lines(
       lengths = scores.get("lengths_mm") or {}
       total = scores.get("length_mm")
       if segments and lengths and total is not None:
-        lines.append(
+        conn_line = (
             "Connectivity gate: PASS — "
             f"tray {segments.get('tray', 0)} segments "
             f"{lengths.get('tray', 0)} mm, "
@@ -3911,7 +4025,15 @@ def _gate_verdict_lines(
             f"{lengths.get('chw', 0)} mm, "
             f"total {total} mm")
       else:
-        lines.append(f"{name} gate: no failures reported")
+        conn_line = f"{name} gate: no failures reported"
+      # The Name fallback is an alarm, not a silent classification
+      # (run 22+): say so on the verdict line even when the gate passes,
+      # or the final message would hide it.
+      if scores.get("name_fallback", 0):
+        conn_line += (
+            f" WARNING: {scores['name_fallback']} segment(s) classified by"
+            " Name fallback (grader uses ObjectType) — set ObjectType exactly")
+      lines.append(conn_line)
     else:
       lines.append(f"{name} gate: no failures reported")
   return "\n".join(lines)
@@ -3962,10 +4084,13 @@ def _gate_score_vector(unit: dict, ifc: dict, sep: dict, conn: dict) -> dict | N
       # gate's PASS/FAIL, only the length tie-breaks below. Per-service
       # lengths/segment counts (run 22) feed the verdict numbers and the
       # length-round prompt, so the final message quotes the submitted
-      # model's numbers.
+      # model's numbers. name_fallback (run 22+) counts the segments the
+      # gate classified by Name fallback; informational only, it never
+      # affects the guard — it feeds the verdict warning.
       "length_mm": conn.get("length_mm"),
       "lengths_mm": dict(conn.get("lengths_mm") or {}),
       "segments": dict(conn.get("segments") or {}),
+      "name_fallback": conn.get("name_fallback", 0),
   }
 
 
@@ -4041,12 +4166,15 @@ def _length_ratio(scores: dict | None,
 
 
 def _length_fix_prompt(ratio: float, lengths: dict | None = None) -> str:
-  """The length-only fix-round prompt (run 21).
+  """The length-only fix-round prompt (run 22+: structural, not trimming).
 
   Fires when the hard constraints already pass but the route is far
   longer than optimal. The percentage is the real measured ratio, never
-  a guess. The round may only change coordinates and path routing to
-  shorten the route — never a rewrite, never a new clash or break.
+  a guess. Run 21 proved local trimming is noise (one length round saved
+  147 mm on a 426,934 mm route): this round must RESTRUCTURE the routing
+  — re-route trunks, merge parallel runs, move headers, delete redundant
+  ties/branches. The round may only change coordinates and path routing
+  to shorten the route — never a rewrite, never a new clash or break.
   When the per-service lengths are given, name them so the round targets
   the longest service first (run 22: in run 21 CHW was longest at
   169,575 mm, but the agent merged tray/busway bridges instead).
@@ -4062,12 +4190,13 @@ def _length_fix_prompt(ratio: float, lengths: dict | None = None) -> str:
         f"{svc} {lengths.get(svc, 0)} mm" for svc in ("tray", "busway", "chw"))
     prompt += f"各服务当前长度：{detail}。先缩最长的服务。\n"
   return prompt + (
-      "请在【绝对不破坏现有硬约束】的前提下，显著缩短路线总长。\n"
-      "优先手段（按顺序尝试）：\n"
-      "1.  改用/强化西侧主干（x=0–1800通长主干 + 水平分支）\n"
-      "2.  减少弯折和迂回\n"
-      "3.  合并平行段、消除多余升降\n"
-      "4.  让同一服务尽量走同一标高\n"
+      "本轮必须做结构性改动：只做局部修修补补是不够的（上一次长度轮只省了"
+      " 147 mm，相对 426,934 mm 的总长是噪音）。优先手段（按顺序尝试）：\n"
+      "1.  改用/强化西侧主干（x=0–1800通长主干 + 水平分支），砍掉绕远的主干\n"
+      "2.  合并平行段、共用同一路径\n"
+      "3.  把 header 移到过道中心线（y=4500/9900/15300），缩短分支\n"
+      "4.  删掉多余的 tie / branch（只留 riser 连 CRAH）\n"
+      "5.  让同一服务尽量走同一标高，消除多余升降\n"
       "修改完成后：\n"
       "•  必须重新在空目录运行 solution.py\n"
       "•  必须重新调用 /tmp/sep_gate.py 和 /tmp/conn_gate.py\n"
@@ -4077,6 +4206,31 @@ def _length_fix_prompt(ratio: float, lengths: dict | None = None) -> str:
       "禁止引入新的碰撞或连通性问题。"
       "只改导致问题的具体坐标/尺寸/路径；如果优化后 SEP 或 CONN 变差，"
       "必须回退。\n")
+
+
+def _length_shortfall_line(scores: dict | None,
+                           ground_truth: dict | None) -> str:
+  """'长度未达标' line for the final report (run 22+).
+
+  Appended to the final summary whenever the submitted model's final
+  length ratio is still over the +40% target — CONN PASS is not a reason
+  to submit an over-long route. All numbers are measured (the final
+  score vector's total length and the task's L_opt), never guessed.
+  Returns "" when the ratio is unknown or within target.
+  """
+  if scores is None:
+    return ""
+  ratio = _length_ratio(scores, ground_truth)
+  if ratio is None or ratio <= LENGTH_RATIO_TRIGGER:
+    return ""
+  total = _length_of(scores)
+  l_opt = _l_opt_mm(ground_truth)
+  pct = int(round((ratio - 1.0) * 100))
+  limit = int(round(l_opt * LENGTH_RATIO_TRIGGER))
+  return (
+      f"长度未达标：当前路线总长 {total} mm，最优 {l_opt} mm，"
+      f"超 {pct}%（目标 +40% 以内，即总长 ≤ {limit} mm，"
+      f"仍超 {total - limit} mm）。硬约束已通过，但长度仍是主要丢分原因。")
 
 
 def _is_regression(prev: dict, cur: dict) -> bool:
@@ -4784,7 +4938,8 @@ CRAHS = __CRAHS__
 PERIM_Y = __PERIM_Y__
 
 
-def _box(model, context, storey, cls, name, w, d, h, cx, cy, z):
+def _box(model, context, storey, cls, name, w, d, h, cx, cy, z,
+         objecttype=None):
     pt = model.create_entity(
         'IfcCartesianPoint', Coordinates=[float(cx), float(cy), float(z)])
     placement = model.create_entity(
@@ -4814,11 +4969,17 @@ def _box(model, context, storey, cls, name, w, d, h, cx, cy, z):
         'IfcShapeRepresentation', ContextOfItems=context,
         RepresentationIdentifier='Body', RepresentationType='SweptSolid',
         Items=[solid])
-    product = model.create_entity(
-        cls, GlobalId=ifcopenshell.guid.new(), Name=name,
+    # Route segments carry the exact ObjectType the grader classifies by
+    # (run 22+): tray 'CableTray', busway 'Busway', CHW 'CHW'. The slab
+    # and cabinets are not route segments, so they carry none.
+    attrs = dict(
+        GlobalId=ifcopenshell.guid.new(), Name=name,
         ObjectPlacement=placement,
         Representation=model.create_entity(
             'IfcProductDefinitionShape', Representations=[shape]))
+    if objecttype is not None:
+        attrs["ObjectType"] = objecttype
+    product = model.create_entity(cls, **attrs)
     model.create_entity(
         'IfcRelContainedInSpatialStructure',
         GlobalId=ifcopenshell.guid.new(),
@@ -4883,13 +5044,13 @@ def create_model(out_ifc_path, out_json_path):
     chw_east = chw_x + CHW["od_insulated"] / 2.0
     _box(model, context, storey, 'IfcCableCarrierSegment',
          'CableTray-Trunk', TRAY["width"], hh, TRAY["height"],
-         tray_x, hh / 2.0, TRAY_Z)
+         tray_x, hh / 2.0, TRAY_Z, 'CableTray')
     _box(model, context, storey, 'IfcCableCarrierSegment',
          'Busway-Trunk', BUSWAY["width"], hh, BUSWAY["height"],
-         busway_x, hh / 2.0, BUSWAY_Z)
+         busway_x, hh / 2.0, BUSWAY_Z, 'Busway')
     _box(model, context, storey, 'IfcPipeSegment',
          'CHW-Trunk', CHW["od_insulated"], hh, CHW["od_insulated"],
-         chw_x, hh / 2.0, CHW_Z)
+         chw_x, hh / 2.0, CHW_Z, 'CHW')
     # One header per row per service, butt-jointed to its trunk (0 mm
     # gap: touching counts as connected, overlapping counts as a clash).
     # Busway and CHW headers are offset from the row centreline so the
@@ -4900,22 +5061,22 @@ def create_model(out_ifc_path, out_json_path):
         _box(model, context, storey, 'IfcCableCarrierSegment',
              'CableTray-' + row["name"], x_end - tray_east,
              TRAY["width"], TRAY["height"],
-             (tray_east + x_end) / 2.0, y, TRAY_Z)
+             (tray_east + x_end) / 2.0, y, TRAY_Z, 'CableTray')
         _box(model, context, storey, 'IfcCableCarrierSegment',
              'Busway-' + row["name"], x_end - busway_east,
              BUSWAY["width"], BUSWAY["height"],
-             (busway_east + x_end) / 2.0, y + 750, BUSWAY_Z)
+             (busway_east + x_end) / 2.0, y + 750, BUSWAY_Z, 'Busway')
         _box(model, context, storey, 'IfcPipeSegment',
              'CHW-' + row["name"], x_end - chw_east,
              CHW["od_insulated"], CHW["od_insulated"],
-             (chw_east + x_end) / 2.0, y - 500, CHW_Z)
+             (chw_east + x_end) / 2.0, y - 500, CHW_Z, 'CHW')
     # The perimeter CRAHs sit along the south wall, east of the last row
     # header's end — a south CHW header picks them all up.
     if PERIM_Y is not None:
         _box(model, context, storey, 'IfcPipeSegment',
              'CHW-Perimeter', hw - chw_east,
              CHW["od_insulated"], CHW["od_insulated"],
-             (chw_east + hw) / 2.0, PERIM_Y, CHW_Z)
+             (chw_east + hw) / 2.0, PERIM_Y, CHW_Z, 'CHW')
     model.write(out_ifc_path)
     routing = {
         "entry": [ENTRY[0], ENTRY[1], 0],
@@ -5700,6 +5861,14 @@ async def solve(session: taskbridge.Session) -> str:
         " model is the restored one — judge the summary above against"
         " its gate results in the Deterministic gates section, not"
         " against the last fix round's numbers.")
+  # Length pre-judgment (run 22+): CONN PASS is not a reason to submit an
+  # over-long route. Say so in the final report with the measured numbers
+  # whenever the submitted model is still over the +40% target — even
+  # after the length round ran (run 21: the round saved 147 mm and the
+  # route was still +64%).
+  shortfall = _length_shortfall_line(scores, ground_truth)
+  if shortfall:
+    summary += "\n\n" + shortfall
   # Last check before returning: a summary is not a submission. If the
   # worker talked about a model it never wrote, the guard writes the
   # fallback and the failure report replaces the summary — the worker's

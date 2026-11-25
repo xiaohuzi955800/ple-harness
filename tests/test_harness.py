@@ -649,7 +649,9 @@ def test_regression_guard():
             # No "CONN total:" line in this canned output, so the
             # length is unknown, not zero (run 21). No per-service
             # lines either, so the per-service maps are empty (run 22).
-            "length_mm": None, "lengths_mm": {}, "segments": {}})
+            # No "CONN WARNING:" line either, so no Name fallback (run 22+).
+            "length_mm": None, "lengths_mm": {}, "segments": {},
+            "name_fallback": 0})
 
 
 async def test_gate_blocks_pass_then_fix():
@@ -759,9 +761,10 @@ async def test_conn_gate():
         scores == {"components": {}, "rows_below_80": 0,
                    # No "CONN total:" line in this canned output, so the
                    # length is unknown, not zero (run 21). The per-service
-                   # line is parsed (run 22).
+                   # line is parsed (run 22). No "CONN WARNING:" line, so
+                   # no Name fallback (run 22+).
                    "length_mm": None, "lengths_mm": {"tray": 23000},
-                   "segments": {"tray": 1}}, scores)
+                   "segments": {"tray": 1}, "name_fallback": 0}, scores)
   check("tool error is inconclusive",
         (await serve._connectivity_gate(worker))[0] == "")
 
@@ -1321,16 +1324,18 @@ def test_conn_gate_real_ifc():
 
   with tempfile.TemporaryDirectory() as tmp:
     # Good: a connected route (feeder + header per service, one CHW drop).
+    # Segments carry exact ObjectTypes (run 22+: a missing ObjectType is
+    # a hard fail now, so the connectivity cases below state theirs).
     outdir = os.path.join(tmp, "good", "output")
     os.makedirs(outdir)
     _build_test_ifc(os.path.join(outdir, "model.ifc"), [
-        ('IfcCableCarrierSegment', 'CableTray-1', 1800, 600, 300, 1100, 3360, 2600),
-        ('IfcCableCarrierSegment', 'CableTray-2', 600, 1640, 300, 2000, 4180, 2600),
-        ('IfcCableCarrierSegment', 'Busway-1', 1800, 600, 300, 1100, 3960, 2600),
-        ('IfcCableCarrierSegment', 'Busway-2', 600, 1640, 300, 2000, 4780, 2600),
-        ('IfcPipeSegment', 'CHW-1', 1800, 600, 300, 1100, 2760, 2600),
-        ('IfcPipeSegment', 'CHW-2', 600, 2240, 300, 2000, 3880, 2600),
-        ('IfcPipeSegment', 'CHW-Drop-1', 300, 300, 1600, 2000, 5000, 1000),
+        ('IfcCableCarrierSegment', 'CableTray-1', 1800, 600, 300, 1100, 3360, 2600, 'CableTray'),
+        ('IfcCableCarrierSegment', 'CableTray-2', 600, 1640, 300, 2000, 4180, 2600, 'CableTray'),
+        ('IfcCableCarrierSegment', 'Busway-1', 1800, 600, 300, 1100, 3960, 2600, 'Busway'),
+        ('IfcCableCarrierSegment', 'Busway-2', 600, 1640, 300, 2000, 4780, 2600, 'Busway'),
+        ('IfcPipeSegment', 'CHW-1', 1800, 600, 300, 1100, 2760, 2600, 'CHW'),
+        ('IfcPipeSegment', 'CHW-2', 600, 2240, 300, 2000, 3880, 2600, 'CHW'),
+        ('IfcPipeSegment', 'CHW-Drop-1', 300, 300, 1600, 2000, 5000, 1000, 'CHW'),
     ])
     json.dump({
         'entry': [200, 3360, 0],
@@ -1340,13 +1345,15 @@ def test_conn_gate_real_ifc():
     out = run_gate(os.path.join(tmp, "good"))
     check("good route passes", "CONN_GATE: PASS" in out, out)
 
-    # Run-6 replica: one box per service, busway as a board.
+    # Run-6 replica: one box per service, busway as a board. The tray and
+    # CHW boxes carry exact ObjectTypes (run 22+); the busway board still
+    # claims its service through its Name, as before.
     outdir = os.path.join(tmp, "run6", "output")
     os.makedirs(outdir)
     _build_test_ifc(os.path.join(outdir, "model.ifc"), [
-        ('IfcCableCarrierSegment', 'CableTray', 23000, 600, 300, 13500, 10100, 2600),
+        ('IfcCableCarrierSegment', 'CableTray', 23000, 600, 300, 13500, 10100, 2600, 'CableTray'),
         ('IfcElectricDistributionBoard', 'Busway', 23000, 400, 300, 13500, 10700, 2600),
-        ('IfcPipeSegment', 'CHWPipe', 23000, 300, 300, 13500, 7000, 2800),
+        ('IfcPipeSegment', 'CHWPipe', 23000, 300, 300, 13500, 7000, 2800, 'CHWPipe'),
     ])
     out = run_gate(os.path.join(tmp, "run6"))
     check("run-6 replica fails", "CONN_GATE: FAIL" in out, out)
@@ -1358,10 +1365,10 @@ def test_conn_gate_real_ifc():
     outdir = os.path.join(tmp, "disc", "output")
     os.makedirs(outdir)
     _build_test_ifc(os.path.join(outdir, "model.ifc"), [
-        ('IfcCableCarrierSegment', 'CableTray-1', 11800, 600, 300, 6100, 5000, 2600),
-        ('IfcCableCarrierSegment', 'CableTray-2', 12000, 600, 300, 19000, 5000, 2600),
-        ('IfcCableCarrierSegment', 'Busway-1', 24800, 600, 300, 12600, 5000, 2600),
-        ('IfcPipeSegment', 'CHW-1', 24800, 600, 300, 12600, 5000, 2600),
+        ('IfcCableCarrierSegment', 'CableTray-1', 11800, 600, 300, 6100, 5000, 2600, 'CableTray'),
+        ('IfcCableCarrierSegment', 'CableTray-2', 12000, 600, 300, 19000, 5000, 2600, 'CableTray'),
+        ('IfcCableCarrierSegment', 'Busway-1', 24800, 600, 300, 12600, 5000, 2600, 'Busway'),
+        ('IfcPipeSegment', 'CHW-1', 24800, 600, 300, 12600, 5000, 2600, 'CHW'),
     ])
     out = run_gate(os.path.join(tmp, "disc"))
     check("disconnected route fails", "CONN_GATE: FAIL" in out, out)
@@ -1374,16 +1381,16 @@ def test_conn_gate_real_ifc():
     outdir = os.path.join(tmp, "butt", "output")
     os.makedirs(outdir)
     _build_test_ifc(os.path.join(outdir, "model.ifc"), [
-        ('IfcCableCarrierSegment', 'CableTray-1', 1800, 600, 300, 1100, 3360, 2600),
-        ('IfcCableCarrierSegment', 'CableTray-2', 600, 1340, 300, 2000, 4330, 2600),
-        ('IfcCableCarrierSegment', 'CableTray-3', 22700, 600, 300, 13650, 5000, 2600),
-        ('IfcCableCarrierSegment', 'Busway-1', 2400, 600, 300, 1400, 3960, 3000),
-        ('IfcCableCarrierSegment', 'Busway-2', 600, 1340, 300, 2600, 4930, 3000),
-        ('IfcCableCarrierSegment', 'Busway-3', 22100, 600, 300, 13950, 5600, 3000),
-        ('IfcPipeSegment', 'CHW-1', 3000, 600, 300, 1700, 2760, 3400),
-        ('IfcPipeSegment', 'CHW-2', 600, 1340, 300, 3200, 3730, 3400),
-        ('IfcPipeSegment', 'CHW-3', 21500, 600, 300, 14250, 4400, 3400),
-        ('IfcPipeSegment', 'CHW-Drop-1', 300, 300, 2400, 3200, 4400, 1000),
+        ('IfcCableCarrierSegment', 'CableTray-1', 1800, 600, 300, 1100, 3360, 2600, 'CableTray'),
+        ('IfcCableCarrierSegment', 'CableTray-2', 600, 1340, 300, 2000, 4330, 2600, 'CableTray'),
+        ('IfcCableCarrierSegment', 'CableTray-3', 22700, 600, 300, 13650, 5000, 2600, 'CableTray'),
+        ('IfcCableCarrierSegment', 'Busway-1', 2400, 600, 300, 1400, 3960, 3000, 'Busway'),
+        ('IfcCableCarrierSegment', 'Busway-2', 600, 1340, 300, 2600, 4930, 3000, 'Busway'),
+        ('IfcCableCarrierSegment', 'Busway-3', 22100, 600, 300, 13950, 5600, 3000, 'Busway'),
+        ('IfcPipeSegment', 'CHW-1', 3000, 600, 300, 1700, 2760, 3400, 'CHW'),
+        ('IfcPipeSegment', 'CHW-2', 600, 1340, 300, 3200, 3730, 3400, 'CHW'),
+        ('IfcPipeSegment', 'CHW-3', 21500, 600, 300, 14250, 4400, 3400, 'CHW'),
+        ('IfcPipeSegment', 'CHW-Drop-1', 300, 300, 2400, 3200, 4400, 1000, 'CHW'),
     ])
     json.dump({
         'entry': [200, 3360, 0],
@@ -1397,6 +1404,9 @@ def test_conn_gate_real_ifc():
 
     # ObjectType fallback: segments with no Name are classified from
     # ObjectType, and a legitimate PDU is not mistaken for a route element.
+    # A keyword-carrying ObjectType classifies by keyword (run 22+: the
+    # last CHW segment is 'CHW-Supply', which counts as CHW — the grader
+    # reads the keyword, not the exact string).
     outdir = os.path.join(tmp, "objtype", "output")
     os.makedirs(outdir)
     _build_test_ifc(os.path.join(outdir, "model.ifc"), [
@@ -1404,8 +1414,8 @@ def test_conn_gate_real_ifc():
         ('IfcCableCarrierSegment', None, 600, 1640, 300, 2000, 4180, 2600, 'CableTray'),
         ('IfcCableCarrierSegment', None, 1800, 600, 300, 1100, 3960, 2600, 'Busway'),
         ('IfcCableCarrierSegment', None, 600, 1640, 300, 2000, 4780, 2600, 'Busway'),
-        ('IfcPipeSegment', None, 1800, 600, 300, 1100, 2760, 2600, 'CHW-Supply'),
-        ('IfcPipeSegment', None, 600, 2240, 300, 2000, 3880, 2600, 'CHW-Supply'),
+        ('IfcPipeSegment', None, 1800, 600, 300, 1100, 2760, 2600, 'CHW'),
+        ('IfcPipeSegment', None, 600, 2240, 300, 2000, 3880, 2600, 'CHW'),
         ('IfcPipeSegment', None, 300, 300, 1600, 2000, 5000, 1000, 'CHW-Supply'),
         ('IfcElectricDistributionBoard', 'PDU-1', 600, 400, 300, 5000, 5000, 2600),
     ])
@@ -1424,8 +1434,8 @@ def test_conn_gate_real_ifc():
     outdir = os.path.join(tmp, "nochw", "output")
     os.makedirs(outdir)
     _build_test_ifc(os.path.join(outdir, "model.ifc"), [
-        ('IfcCableCarrierSegment', 'CableTray-1', 1800, 600, 300, 1100, 3360, 2600),
-        ('IfcCableCarrierSegment', 'Busway-1', 1800, 600, 300, 1100, 3960, 2600),
+        ('IfcCableCarrierSegment', 'CableTray-1', 1800, 600, 300, 1100, 3360, 2600, 'CableTray'),
+        ('IfcCableCarrierSegment', 'Busway-1', 1800, 600, 300, 1100, 3960, 2600, 'Busway'),
     ])
     json.dump({
         'entry': [200, 3360, 0],
@@ -1997,13 +2007,13 @@ def test_conn_gate_ground_truth():
   # (200, 3360), one row at y=3360) but nowhere near the ground truth
   # (entry (27, 9889), rows at y=3000/6000 spanning x 1800-19200).
   segments = [
-      ('IfcCableCarrierSegment', 'CableTray-1', 1800, 600, 300, 1100, 3360, 2600),
-      ('IfcCableCarrierSegment', 'CableTray-2', 600, 1640, 300, 2000, 4180, 2600),
-      ('IfcCableCarrierSegment', 'Busway-1', 1800, 600, 300, 1100, 3960, 2600),
-      ('IfcCableCarrierSegment', 'Busway-2', 600, 1640, 300, 2000, 4780, 2600),
-      ('IfcPipeSegment', 'CHW-1', 1800, 600, 300, 1100, 2760, 2600),
-      ('IfcPipeSegment', 'CHW-2', 600, 2240, 300, 2000, 3880, 2600),
-      ('IfcPipeSegment', 'CHW-Drop-1', 300, 300, 1600, 2000, 5000, 1000),
+      ('IfcCableCarrierSegment', 'CableTray-1', 1800, 600, 300, 1100, 3360, 2600, 'CableTray'),
+      ('IfcCableCarrierSegment', 'CableTray-2', 600, 1640, 300, 2000, 4180, 2600, 'CableTray'),
+      ('IfcCableCarrierSegment', 'Busway-1', 1800, 600, 300, 1100, 3960, 2600, 'Busway'),
+      ('IfcCableCarrierSegment', 'Busway-2', 600, 1640, 300, 2000, 4780, 2600, 'Busway'),
+      ('IfcPipeSegment', 'CHW-1', 1800, 600, 300, 1100, 2760, 2600, 'CHW'),
+      ('IfcPipeSegment', 'CHW-2', 600, 2240, 300, 2000, 3880, 2600, 'CHW'),
+      ('IfcPipeSegment', 'CHW-Drop-1', 300, 300, 1600, 2000, 5000, 1000, 'CHW'),
   ]
   routing = {
       'entry': [200, 3360, 0],
@@ -2581,7 +2591,7 @@ def test_conn_gate_entry_aabb():
     os.makedirs(outdir)
     _build_test_ifc(os.path.join(outdir, "model.ifc"), [
         ('IfcCableCarrierSegment', 'CableTray-EntryFeeder', 2000, 683, 127,
-         27, 9650, 2600),
+         27, 9650, 2600, 'CableTray'),
     ])
     json.dump(_synthetic_ground_truth(),
               open(os.path.join(tmp, "entry", "ground_truth.json"), "w"))
@@ -3381,13 +3391,13 @@ def test_conn_gate_total_length():
     outdir = os.path.join(tmp, "good", "output")
     os.makedirs(outdir)
     _build_test_ifc(os.path.join(outdir, "model.ifc"), [
-        ('IfcCableCarrierSegment', 'CableTray-1', 1800, 600, 300, 1100, 3360, 2600),
-        ('IfcCableCarrierSegment', 'CableTray-2', 600, 1640, 300, 2000, 4180, 2600),
-        ('IfcCableCarrierSegment', 'Busway-1', 1800, 600, 300, 1100, 3960, 2600),
-        ('IfcCableCarrierSegment', 'Busway-2', 600, 1640, 300, 2000, 4780, 2600),
-        ('IfcPipeSegment', 'CHW-1', 1800, 600, 300, 1100, 2760, 2600),
-        ('IfcPipeSegment', 'CHW-2', 600, 2240, 300, 2000, 3880, 2600),
-        ('IfcPipeSegment', 'CHW-Drop-1', 300, 300, 1600, 2000, 5000, 1000),
+        ('IfcCableCarrierSegment', 'CableTray-1', 1800, 600, 300, 1100, 3360, 2600, 'CableTray'),
+        ('IfcCableCarrierSegment', 'CableTray-2', 600, 1640, 300, 2000, 4180, 2600, 'CableTray'),
+        ('IfcCableCarrierSegment', 'Busway-1', 1800, 600, 300, 1100, 3960, 2600, 'Busway'),
+        ('IfcCableCarrierSegment', 'Busway-2', 600, 1640, 300, 2000, 4780, 2600, 'Busway'),
+        ('IfcPipeSegment', 'CHW-1', 1800, 600, 300, 1100, 2760, 2600, 'CHW'),
+        ('IfcPipeSegment', 'CHW-2', 600, 2240, 300, 2000, 3880, 2600, 'CHW'),
+        ('IfcPipeSegment', 'CHW-Drop-1', 300, 300, 1600, 2000, 5000, 1000, 'CHW'),
     ])
     json.dump({
         'entry': [200, 3360, 0],
@@ -3490,8 +3500,12 @@ def test_conn_gate_objecttype_rules_run21():
     check("tray absorbed the busway segments",
           "CONN tray: 4 segment(s)" in out, out)
 
-    # No ObjectType at all: the Name fallback keeps the old behaviour,
-    # and the fallback is logged.
+    # No ObjectType at all: the Name fallback covers it and alarms —
+    # the grader counted run 15's all-None ObjectTypes by Name, so the
+    # gate must too. The fallback survives for an ObjectType that is
+    # empty or carries no service keyword, like the 'Drop' segments
+    # above; only a segment whose ObjectType AND Name name no service
+    # hard-fails.
     outdir = os.path.join(tmp, "noname", "output")
     os.makedirs(outdir)
     _build_test_ifc(os.path.join(outdir, "model.ifc"), [
@@ -3505,9 +3519,13 @@ def test_conn_gate_objecttype_rules_run21():
     ])
     json.dump(routing, open(os.path.join(outdir, "routing.json"), "w"))
     out = run_gate(os.path.join(tmp, "noname"))
-    check("Name fallback still passes", "CONN_GATE: PASS" in out, out)
-    check("Name fallback is logged",
-          "CONN note:" in out and "classified by Name" in out, out)
+    check("missing ObjectType passes via Name fallback",
+          "CONN_GATE: PASS" in out, out)
+    check("missing ObjectType alarms",
+          "CONN WARNING:" in out and "classified by Name" in out, out)
+    scores = serve._connectivity_gate_scores(out)
+    check("parser counts all seven fallbacks",
+          scores.get("name_fallback") == 7, scores)
 
 
 def test_conn_gate_run21_fixture():
@@ -3567,6 +3585,191 @@ def test_conn_gate_run21_fixture():
     check("patched model passes CONN", "CONN_GATE: PASS" in out, out)
     check("busway length counted after the fix",
           "CONN busway: 8 segment(s), 128025 mm total" in out, out)
+
+
+def test_conn_gate_run17_fixture():
+  print("connectivity gate on the real run-17 model: PASSes (grader agreed)")
+  try:
+    import ifcopenshell  # noqa: F401
+  except ImportError:
+    print("  skipped: ifcopenshell not installed")
+    return
+  import shutil
+  import subprocess
+  import tempfile
+
+  def run_gate(workdir):
+    script = os.path.join(workdir, "conn_gate.py")
+    with open(script, "w") as f:
+      f.write(serve.CONN_GATE_SCRIPT)
+    r = subprocess.run([sys.executable, script], cwd=workdir,
+                       capture_output=True, text=True)
+    return r.stdout + r.stderr
+
+  fixture = os.path.join(
+      os.path.dirname(os.path.abspath(__file__)),
+      "fixtures", "run17-model")
+  with tempfile.TemporaryDirectory() as tmp:
+    # Run 17's segments carry 'Cable Tray' (x8) and 'CHW Pipe' (x52) —
+    # the grader counted them by keyword (its gate_2 passed with all
+    # three services non-zero), so the gate must count them too. A
+    # literal exact-set rule failed this grader-passing model; this test
+    # pins the normalization decision.
+    workdir = os.path.join(tmp, "run17")
+    shutil.copytree(fixture, workdir)
+    out = run_gate(workdir)
+    check("run-17 model passes CONN (grader agreed)",
+          "CONN_GATE: PASS" in out, out)
+    check("spaced tray is counted",
+          "CONN tray: 8 segment(s)" in out, out)
+    check("busway is counted",
+          "CONN busway: 8 segment(s)" in out, out)
+
+
+def test_conn_gate_objecttype_normalized():
+  print("connectivity gate normalizes ObjectType before classifying "
+        "(run 22+, DeepSeek review)")
+  try:
+    import ifcopenshell  # noqa: F401
+  except ImportError:
+    print("  skipped: ifcopenshell not installed")
+    return
+  import json
+  import subprocess
+  import tempfile
+
+  def run_gate(workdir):
+    script = os.path.join(workdir, "conn_gate.py")
+    with open(script, "w") as f:
+      f.write(serve.CONN_GATE_SCRIPT)
+    r = subprocess.run([sys.executable, script], cwd=workdir,
+                       capture_output=True, text=True)
+    return r.stdout + r.stderr
+
+  def good_route(objecttypes):
+    # The "good route" geometry from test_conn_gate_real_ifc, with an
+    # ObjectType per segment (9th tuple element). The CHW drop keeps the
+    # run-9 shape: ObjectType 'Drop', Name 'CHW-Drop-1' — classified as
+    # CHW by the Name fallback, exactly as the grader counted it.
+    return [
+        ('IfcCableCarrierSegment', 'CableTray-1', 1800, 600, 300, 1100, 3360, 2600, objecttypes[0]),
+        ('IfcCableCarrierSegment', 'CableTray-2', 600, 1640, 300, 2000, 4180, 2600, objecttypes[0]),
+        ('IfcCableCarrierSegment', 'Busway-1', 1800, 600, 300, 1100, 3960, 2600, objecttypes[1]),
+        ('IfcCableCarrierSegment', 'Busway-2', 600, 1640, 300, 2000, 4780, 2600, objecttypes[1]),
+        ('IfcPipeSegment', 'CHW-1', 1800, 600, 300, 1100, 2760, 2600, objecttypes[2]),
+        ('IfcPipeSegment', 'CHW-2', 600, 2240, 300, 2000, 3880, 2600, objecttypes[2]),
+        ('IfcPipeSegment', 'CHW-Drop-1', 300, 300, 1600, 2000, 5000, 1000, 'Drop'),
+    ]
+
+  routing = {
+      'entry': [200, 3360, 0],
+      'rows': [{'name': 'A', 'start': [1100, 3360, 0], 'end': [2000, 3360, 0]}],
+      'crahs': [[2000, 5000, 0]],
+  }
+  with tempfile.TemporaryDirectory() as tmp:
+    # Case folds: 'CABLETRAY' normalizes to the exact value and passes.
+    # The 'Drop' fallback is still a WARNING even on a pass.
+    outdir = os.path.join(tmp, "case", "output")
+    os.makedirs(outdir)
+    _build_test_ifc(os.path.join(outdir, "model.ifc"),
+                    good_route(('CABLETRAY', 'Busway', 'CHW')))
+    json.dump(routing, open(os.path.join(outdir, "routing.json"), "w"))
+    out = run_gate(os.path.join(tmp, "case"))
+    check("case variant passes after normalization",
+          "CONN_GATE: PASS" in out, out)
+    check("fallback is a warning even on a pass",
+          "CONN WARNING:" in out and "classified by Name" in out, out)
+    scores = serve._connectivity_gate_scores(out)
+    check("parser reports the fallback count",
+          scores.get("name_fallback") == 1, scores)
+    vector = serve._gate_score_vector(
+        {"unit_ok": True, "scale": 1.0},
+        {"ifc_ok": True, "violations": 0},
+        {"clashes": 0, "frame_ok": True, "frame_outside": 0},
+        scores)
+    verdict = serve._gate_verdict_lines("", "", "", "", True, scores=vector)
+    check("verdict line carries the fallback warning",
+          "Connectivity gate: PASS" in verdict
+          and "WARNING" in verdict and "Name fallback" in verdict,
+          verdict)
+
+    # A space inside the value normalizes away: 'Cable Tray' counts as
+    # tray and 'CHW Pipe' as CHW — the grader counted run 17's spaced
+    # values by keyword (its gate_2 passed), so the gate must too. A
+    # literal exact-set rule failed that grader-passing model.
+    outdir = os.path.join(tmp, "space", "output")
+    os.makedirs(outdir)
+    _build_test_ifc(os.path.join(outdir, "model.ifc"),
+                    good_route(('Cable Tray', 'Busway', 'CHW Pipe')))
+    json.dump(routing, open(os.path.join(outdir, "routing.json"), "w"))
+    out = run_gate(os.path.join(tmp, "space"))
+    check("spaced values pass after normalization",
+          "CONN_GATE: PASS" in out, out)
+    check("spaced tray is counted",
+          "CONN tray: 2 segment(s)" in out, out)
+    check("spaced CHW is counted",
+          "CONN chw: 3 segment(s)" in out, out)
+
+    # A hyphenated value ('CHW-Supply') classifies as CHW by keyword —
+    # the grader reads the keyword, not the exact string.
+    outdir = os.path.join(tmp, "hyphen", "output")
+    os.makedirs(outdir)
+    _build_test_ifc(os.path.join(outdir, "model.ifc"),
+                    good_route(('CableTray', 'Busway', 'CHW-Supply')))
+    json.dump(routing, open(os.path.join(outdir, "routing.json"), "w"))
+    out = run_gate(os.path.join(tmp, "hyphen"))
+    check("hyphenated value passes by keyword",
+          "CONN_GATE: PASS" in out, out)
+    check("hyphenated CHW is counted",
+          "CONN chw: 3 segment(s)" in out, out)
+
+    # An empty ObjectType falls back to the Name and alarms: the grader
+    # counted run 15's all-None ObjectTypes by Name, so the gate must
+    # too — with a loud warning, never silently.
+    outdir = os.path.join(tmp, "empty", "output")
+    os.makedirs(outdir)
+    _build_test_ifc(os.path.join(outdir, "model.ifc"),
+                    good_route(('', 'Busway', 'CHW')))
+    json.dump(routing, open(os.path.join(outdir, "routing.json"), "w"))
+    out = run_gate(os.path.join(tmp, "empty"))
+    check("empty ObjectType passes via Name fallback",
+          "CONN_GATE: PASS" in out, out)
+    check("empty ObjectType alarms",
+          "CONN WARNING:" in out and "classified by Name" in out, out)
+    scores = serve._connectivity_gate_scores(out)
+    check("parser counts the empty-ObjectType fallbacks",
+          scores.get("name_fallback") == 3, scores)
+
+    # Busway mislabelled as 'CHW': it classifies as CHW, so busway is
+    # left at 0 — the each-service-≥1 check catches it (vulnerability 3).
+    outdir = os.path.join(tmp, "mislabel", "output")
+    os.makedirs(outdir)
+    _build_test_ifc(os.path.join(outdir, "model.ifc"),
+                    good_route(('CableTray', 'CHW', 'CHW')))
+    json.dump(routing, open(os.path.join(outdir, "routing.json"), "w"))
+    out = run_gate(os.path.join(tmp, "mislabel"))
+    check("busway mislabelled as CHW fails", "CONN_GATE: FAIL" in out, out)
+    check("busway is caught at zero",
+          "CONN FAIL: busway: no route (0 segments / 0 mm)" in out, out)
+    check("mislabelled segments are wrong-class",
+          "chw modelled as IfcCableCarrierSegment" in out, out)
+
+    # An unclassifiable segment makes the classified length sum disagree
+    # with the model total.
+    outdir = os.path.join(tmp, "widget", "output")
+    os.makedirs(outdir)
+    _build_test_ifc(os.path.join(outdir, "model.ifc"),
+                    good_route(('CableTray', 'Busway', 'CHW')) + [
+                        ('IfcFlowSegment', 'Widget-1', 300, 300, 300,
+                         5000, 5000, 2600, 'Widget'),
+                    ])
+    json.dump(routing, open(os.path.join(outdir, "routing.json"), "w"))
+    out = run_gate(os.path.join(tmp, "widget"))
+    check("unclassifiable segment fails", "CONN_GATE: FAIL" in out, out)
+    check("unclassifiable segment is named",
+          "segment 'Widget-1' has ObjectType 'Widget'" in out, out)
+    check("classified sum disagrees with the model total",
+          "classified length sum" in out and "model total" in out, out)
 
 
 async def test_track_best_length_tiebreak():
@@ -3697,6 +3900,50 @@ async def test_final_message_carries_post_round_numbers():
         result.count("Deterministic gates:") == 1, repr(result))
 
 
+async def test_length_shortfall_in_final_report():
+  print("final report states '长度未达标' when the length round cannot "
+        "reach +40% (run 22+)")
+  import json
+  session = FakeSession(21600)
+  session.instruction = "Route the cable tray, busway and chilled water."
+  session.files["ground_truth.json"] = json.dumps(
+      _smoke_task_ground_truth()).encode()
+  FakeAgent.reset(
+      scripts={
+          "worker": ["worker summary"],
+          "verifier": ["PASS", "PASS"],
+      },
+      bash_outputs=[
+          # Round 1: clean gates, route 546,218 mm (ratio 2.096, +110%).
+          *_clean_gate_outputs(546218),
+          # Post-length-round measurement: still 500,000 mm (ratio 1.919,
+          # +92%) — the round ran but could not reach the +40% target.
+          *_clean_gate_outputs(500000),
+      ],
+  )
+  real = serve.Agent
+  serve.Agent = FakeAgent
+  try:
+    result = await serve.solve(session)
+  finally:
+    serve.Agent = real
+  worker = FakeAgent.first("worker")
+  check("exactly one resume, the length round",
+        len(worker.resumes) == 1, worker.resumes)
+  check("final report states the shortfall",
+        "长度未达标" in result, repr(result))
+  check("shortfall quotes the final total",
+        "500000" in result, repr(result))
+  check("shortfall quotes the optimal",
+        "260602" in result, repr(result))
+  check("shortfall quotes the overrun percent",
+        "92%" in result, repr(result))
+  check("shortfall quotes the +40% limit",
+        "364843" in result, repr(result))
+  check("result verified (hard constraints pass)",
+        "Independent verification: PASS." in result, repr(result))
+
+
 async def test_length_prompt_names_longest_service():
   print("length prompt names the per-service lengths, longest first "
         "(run 22)")
@@ -3745,6 +3992,58 @@ async def test_length_prompt_names_longest_service():
         "chw 196218 mm" in worker.resumes[0], worker.resumes[0])
   check("length prompt says to shorten the longest first",
         "先缩最长的服务" in worker.resumes[0], worker.resumes[0])
+
+
+def test_length_prompt_structural():
+  print("length-round prompt leads with structural moves, not local "
+        "trimming (run 22+)")
+  prompt = serve._length_fix_prompt(
+      2.096, {"tray": 128481, "busway": 128162, "chw": 169575})
+  check("prompt quotes the hard constraints",
+        "当前硬约束已全部通过" in prompt, prompt)
+  check("prompt quotes the real percentage",
+        "大约长了110%" in prompt, prompt)
+  check("prompt leads with the west trunk",
+        "西侧主干" in prompt, prompt)
+  check("prompt demands merging parallel runs",
+        "合并平行段" in prompt, prompt)
+  check("prompt demands aisle-centreline headers",
+        "过道中心线" in prompt, prompt)
+  check("prompt demands deleting redundant ties/branches",
+        "删掉多余的 tie" in prompt, prompt)
+  check("prompt says local trimming alone is not enough",
+        "局部修修补补是不够的" in prompt and "147 mm" in prompt, prompt)
+  check("prompt still names the per-service lengths",
+        "各服务当前长度" in prompt
+        and "chw 169575 mm" in prompt
+        and "先缩最长的服务" in prompt, prompt)
+  check("prompt still forbids a rewrite",
+        "禁止重写整个文件" in prompt, prompt)
+  check("prompt still demands a re-gate",
+        "/tmp/sep_gate.py" in prompt and "/tmp/conn_gate.py" in prompt,
+        prompt)
+
+
+def test_length_shortfall_line():
+  print("final report states '长度未达标' with measured numbers when the "
+        "route is still >40% over (run 22+)")
+  gt = _smoke_task_ground_truth()
+  # Run-21 shape: 426,934 mm vs L_opt 260,602 (+63.8%), limit 364,843.
+  line = serve._length_shortfall_line({"length_mm": 426934}, gt)
+  check("run-21 shape states the shortfall", "长度未达标" in line, line)
+  check("shortfall quotes the current total", "426934" in line, line)
+  check("shortfall quotes the optimal", "260602" in line, line)
+  check("shortfall quotes the overrun percent", "64%" in line, line)
+  check("shortfall quotes the +40% limit", "364843" in line, line)
+  check("shortfall quotes the remaining overrun", "62091" in line, line)
+  check("within target gives no line",
+        serve._length_shortfall_line({"length_mm": 350000}, gt) == "")
+  check("at the limit gives no line",
+        serve._length_shortfall_line({"length_mm": 364842}, gt) == "")
+  check("unknown length gives no line",
+        serve._length_shortfall_line({"length_mm": None}, gt) == "")
+  check("unknown L_opt gives no line",
+        serve._length_shortfall_line({"length_mm": 426934}, None) == "")
 
 
 async def test_length_round_skipped_at_low_ratio():
@@ -4022,10 +4321,15 @@ async def main():
   test_conn_gate_total_length()
   test_conn_gate_objecttype_rules_run21()
   test_conn_gate_run21_fixture()
+  test_conn_gate_run17_fixture()
+  test_conn_gate_objecttype_normalized()
   await test_track_best_length_tiebreak()
   await test_length_round_triggers()
   await test_final_message_carries_post_round_numbers()
+  await test_length_shortfall_in_final_report()
   await test_length_prompt_names_longest_service()
+  test_length_prompt_structural()
+  test_length_shortfall_line()
   await test_length_round_skipped_at_low_ratio()
   await test_length_round_needs_l_opt()
   await test_length_round_reverts_on_regression()
