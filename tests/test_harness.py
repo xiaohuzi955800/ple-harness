@@ -32,9 +32,46 @@ class FakeSession:
     # In-memory files for read_file/write_file. output/solution.py is a
     # real (non-stub) submission by default, so the empty-submission
     # guard stays quiet in tests that are not about it; the guard test
-    # replaces it with the stub.
+    # replaces it with the stub. It is long enough to pass delivery
+    # validation's minimum-size check (a real generator is several KB;
+    # the task stub is 536 bytes).
     self.files = {
-        "output/solution.py": b"# the agent's solution\nprint('real')\n",
+        "output/solution.py": (
+            b"import ifcopenshell\n"
+            b"import sys\n"
+            b"\n"
+            b"# A real model builder: declares millimetre units, builds one\n"
+            b"# cable-carrier segment per row from literal coordinates, and\n"
+            b"# writes a single IFC4 file. The numbers below are the\n"
+            b"# drawing ground truth, copied in as literals so the script\n"
+            b"# runs alone in an empty directory.\n"
+            b"\n"
+            b"ROWS = [3000, 6000, 8400, 11400, 13800, 16800]\n"
+            b"TRAY = (683, 127)  # width x height in millimetres\n"
+            b"BUSWAY = (128, 147)\n"
+            b"CHW_OD = 114.3  # bare outside diameter\n"
+            b"CHW_INSULATED = 168.3  # outside diameter over insulation\n"
+            b"HALL = (27000, 21000)  # width x depth in millimetres\n"
+            b"ENTRY = (0, 10500)  # service entry on the west wall\n"
+            b"\n"
+            b"\n"
+            b"def build(path):\n"
+            b"    model = ifcopenshell.file(schema='IFC4')\n"
+            b"    project = model.create_entity(\n"
+            b"        'IfcProject', GlobalId=ifcopenshell.guid.new(),\n"
+            b"        Name='DataHallProject')\n"
+            b"    length_unit = model.create_entity(\n"
+            b"        'IfcSIUnit', UnitType='LENGTHUNIT', Prefix='MILLI',\n"
+            b"        Name='METRE')\n"
+            b"    project.UnitsInContext = model.create_entity(\n"
+            b"        'IfcUnitAssignment', Units=[length_unit])\n"
+            b"    model.write(path)\n"
+            b"\n"
+            b"\n"
+            b"if __name__ == '__main__':\n"
+            b"    out = sys.argv[1] if len(sys.argv) > 1 else 'output/model.ifc'\n"
+            b"    build(out)\n"
+        ),
     }
 
   def time_left(self):
@@ -80,6 +117,11 @@ class FakeAgent:
   # (the run-12 defect: solution.py opens ground_truth.json at runtime).
   standalone_result = "STANDALONE_EXIT:0\nSTANDALONE_IFC:OK"
   standalone_tail = "(no log)"
+  # Canned segment count for _is_empty_model: the number of
+  # route-segment entities the model is pretended to have. Non-empty by
+  # default (55), so existing solve() tests pass delivery validation; a
+  # test can set it to 0 to simulate the run-19 slab-only model.
+  segments_result = "SEGMENTS:55"
   # Canned resume replies: when set, resume() pops one per call instead
   # of inventing "fixed summary (N)". An empty string simulates a fix
   # round killed by an endpoint error (run 16: the fix round died on a
@@ -158,6 +200,11 @@ class FakeAgent:
     if "tail -5 /tmp/standalone" in command:
       # The log tail the standalone check reads when it fails.
       return FakeAgent.standalone_tail
+    if "SEGMENTS:" in command:
+      # _is_empty_model counts route-segment entities in the task
+      # container; the canned count stands in for the run. Never
+      # consumes a gate output.
+      return FakeAgent.segments_result
     if FakeAgent.bash_outputs:
       return FakeAgent.bash_outputs.pop(0)
     return "exit code 0\nIFC_GATE: SKIP (no .ifc files under output/)"
@@ -165,7 +212,8 @@ class FakeAgent:
   @classmethod
   def reset(cls, scripts=None, fail_roles=None, bash_outputs=None,
             standalone_result=None, standalone_tail=None,
-            resume_texts=None, solution_hashes=None):
+            resume_texts=None, solution_hashes=None,
+            segments_result=None):
     cls.instances = []
     cls.scripts = dict(scripts or {})
     cls.fail_roles = set(fail_roles or ())
@@ -180,6 +228,8 @@ class FakeAgent:
         else "STANDALONE_EXIT:0\nSTANDALONE_IFC:OK")
     cls.standalone_tail = (
         standalone_tail if standalone_tail is not None else "(no log)")
+    cls.segments_result = (
+        segments_result if segments_result is not None else "SEGMENTS:55")
 
   @classmethod
   def roles(cls):
@@ -633,6 +683,8 @@ def test_prompts():
   check("worker hard rule",
         "exact check with the exact flags" in prompt)
   check("no pip install", "do not try pip install" in prompt)
+  check("no hard rules without routing",
+        "【最高优先级硬规则" not in prompt, prompt[:200])
   check("IFC guide present",
         "express_rules=True" in prompt and "WR1" in prompt)
   check("IFC snippet present",
@@ -762,8 +814,9 @@ async def test_gates_run_in_parallel_and_merge():
         "75 clashes" in worker.resumes[0], worker.resumes[0])
   check("CONN gaps reached the worker",
         "only 1 segment" in worker.resumes[0], worker.resumes[0])
-  check("fix prompt demands gate numbers",
-        "quote the gate numbers" in worker.resumes[0], worker.resumes[0])
+  check("fix prompt is the gate-report prompt (run 19)",
+        "当前门禁结果如下" in worker.resumes[0]
+        and "不要重写整个文件" in worker.resumes[0], worker.resumes[0])
   check("verifier saw both gate failures",
         "Separation gate: FAIL" in FakeAgent.first("verifier").context
         and "Connectivity gate: FAIL"
@@ -1075,6 +1128,15 @@ def test_routing_prompts():
   worker = serve.Agent(session, role="worker")
   prompt = worker.system_prompt("")
   check("routing guide present", "one header per row" in prompt)
+  check("worker hard rules lead the prompt (run 19)",
+        prompt.startswith("【最高优先级硬规则")
+        and "最终交付物是 output/solution.py" in prompt)
+  check("worker hard rule: self-contained script",
+        "禁止 open() 任何外部文件" in prompt)
+  check("worker hard rule: gate scripts only",
+        "/tmp/sep_gate.py" in prompt and "/tmp/conn_gate.py" in prompt)
+  check("worker hard rule: fix only the named coordinates",
+        "只改对应坐标" in prompt)
   check("busway class rule", "never IfcElectricDistributionBoard" in prompt)
   check("routing.json contract", "output/routing.json" in prompt)
   check("ground truth prompt",
@@ -2715,8 +2777,11 @@ async def test_best_model_survives_inconclusive_round():
   worker = FakeAgent.first("worker")
   check("fix-round prompt is a numbered checklist",
         "1. " in worker.resumes[0], worker.resumes[0])
-  check("fix-round prompt re-injects the riser rule",
-        "TOP face" in worker.resumes[0], worker.resumes[0])
+  check("fix-round prompt is the gate-report prompt (run 19 spec)",
+        "当前门禁结果如下" in worker.resumes[0]
+        and "不要重写整个文件" in worker.resumes[0]
+        and "空目录运行 solution.py" in worker.resumes[0],
+        worker.resumes[0])
   check("best-model restore logged",
         any("restoring the best" in log for log in session.logs),
         session.logs)
@@ -2886,6 +2951,249 @@ def test_sep_gate_starts_inside():
           and "CHW-Branch-CRAH-A01 ends at y=" not in out, out)
 
 
+async def test_is_empty_model():
+  print("empty-model detection counts route segments (run 19)")
+  session = FakeSession(21600)
+  session.instruction = "Route the cable tray, busway and chilled water."
+  worker = FakeAgent(session, role="worker")
+  FakeAgent.reset(segments_result="SEGMENTS:0")
+  check("0 segments is empty",
+        await serve._is_empty_model(worker, "output/model.ifc"))
+  FakeAgent.reset(segments_result="SEGMENTS:2")
+  check("2 segments is empty",
+        await serve._is_empty_model(worker, "output/model.ifc"))
+  FakeAgent.reset(segments_result="SEGMENTS:3")
+  check("3 segments is not empty",
+        not await serve._is_empty_model(worker, "output/model.ifc"))
+  FakeAgent.reset(segments_result="SEGMENTS:55")
+  check("55 segments is not empty",
+        not await serve._is_empty_model(worker, "output/model.ifc"))
+  FakeAgent.reset(segments_result="garbage output, no marker")
+  check("unparseable output is empty (conservative)",
+        await serve._is_empty_model(worker, "output/model.ifc"))
+
+  class RaisingAgent(FakeAgent):
+    async def bash(self, command, timeout_sec=120):
+      raise RuntimeError("container down")
+
+  raising = RaisingAgent(session, role="worker")
+  check("bash failure is empty (conservative)",
+        await serve._is_empty_model(raising, "output/model.ifc"))
+
+
+def test_empty_model_check_real_ifc():
+  print("the empty-model one-liner counts real IFC files")
+  try:
+    import ifcopenshell  # noqa: F401
+  except ImportError:
+    print("  skipped: ifcopenshell not installed")
+    return
+  import subprocess
+  import tempfile
+
+  with tempfile.TemporaryDirectory() as tmp:
+    five = os.path.join(tmp, "five.ifc")
+    _build_test_ifc(five, [
+        ("IfcCableCarrierSegment", "CableTray-1", 683, 127, 1000,
+         5000, 3000, 2600),
+        ("IfcCableCarrierSegment", "CableTray-2", 683, 127, 1000,
+         5000, 6000, 2600),
+        ("IfcCableCarrierSegment", "Busway-1", 128, 147, 1000,
+         5000, 3000, 2900),
+        ("IfcPipeSegment", "CHW-1", 168, 168, 1000, 5000, 3000, 2984),
+        ("IfcPipeSegment", "CHW-2", 168, 168, 1000, 5000, 6000, 2984),
+    ])
+    two = os.path.join(tmp, "two.ifc")
+    _build_test_ifc(two, [
+        ("IfcCableCarrierSegment", "CableTray-1", 683, 127, 1000,
+         5000, 3000, 2600),
+        ("IfcPipeSegment", "CHW-1", 168, 168, 1000, 5000, 3000, 2984),
+    ])
+    slab = os.path.join(tmp, "slab.ifc")
+    _build_test_ifc(slab, [
+        ("IfcSlab", "Slab", 27000, 21000, 300, 13500, 10500, -300),
+    ])
+    missing = os.path.join(tmp, "missing.ifc")
+
+    def run(path):
+      # The exact production one-liner from serve._EMPTY_MODEL_CHECK,
+      # with only the interpreter swapped for this environment's (the
+      # task container runs it as `python3`).
+      cmd = serve._EMPTY_MODEL_CHECK.format(path=path).replace(
+          "python3", sys.executable, 1)
+      res = subprocess.run(cmd, shell=True, capture_output=True,
+                           text=True, timeout=120)
+      return res.stdout.strip()
+
+    check("5 segments -> SEGMENTS:5", run(five) == "SEGMENTS:5",
+          run(five))
+    check("2 segments -> SEGMENTS:2", run(two) == "SEGMENTS:2",
+          run(two))
+    check("slab only -> SEGMENTS:0", run(slab) == "SEGMENTS:0",
+          run(slab))
+    check("missing file -> no SEGMENTS line",
+          "SEGMENTS:" not in run(missing), run(missing))
+    # The run-7 fixture model (a real agent model) is far from empty.
+    run7 = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "fixtures",
+        "run7-model", "output", "model.ifc")
+    check("run-7 model is not empty",
+          run(run7).startswith("SEGMENTS:")
+          and int(run(run7).split(":")[1]) > 3, run(run7))
+
+
+async def test_validate_delivery():
+  print("delivery validation binds solution.py to the model (run 19)")
+  session = FakeSession(21600)
+  session.instruction = "Route the cable tray, busway and chilled water."
+  worker = FakeAgent(session, role="worker")
+  # All checks pass: real solution.py + standalone PASS + 55 segments.
+  FakeAgent.reset()
+  ok, reason = await serve._validate_delivery(worker, session, True)
+  check("real deliverable passes", ok and reason == "", reason)
+  # Non-routing tasks have no solution.py contract.
+  ok, reason = await serve._validate_delivery(worker, session, False)
+  check("non-routing always passes", ok, reason)
+  # Missing solution.py.
+  session2 = FakeSession(21600)
+  session2.instruction = "Route the cable tray, busway and chilled water."
+  del session2.files["output/solution.py"]
+  worker2 = FakeAgent(session2, role="worker")
+  FakeAgent.reset()
+  ok, reason = await serve._validate_delivery(worker2, session2, True)
+  check("missing solution.py fails", not ok and "missing" in reason,
+        reason)
+  # Still the stub.
+  session3 = FakeSession(21600)
+  session3.instruction = "Route the cable tray, busway and chilled water."
+  session3.files["output/solution.py"] = (
+      b'"""Submission stub - replace this whole file.\n'
+      b'raise SystemExit("dc_model submission stub was never replaced:'
+      b' no model was authored.")\n"""')
+  worker3 = FakeAgent(session3, role="worker")
+  FakeAgent.reset()
+  ok, reason = await serve._validate_delivery(worker3, session3, True)
+  check("stub fails", not ok and "stub" in reason, reason)
+  # Too short to be a real builder (but not the stub).
+  session4 = FakeSession(21600)
+  session4.instruction = "Route the cable tray, busway and chilled water."
+  session4.files["output/solution.py"] = b"print('hi')\n"
+  worker4 = FakeAgent(session4, role="worker")
+  FakeAgent.reset()
+  ok, reason = await serve._validate_delivery(worker4, session4, True)
+  check("tiny script fails", not ok and "too short" in reason, reason)
+  # Standalone failure (run 12).
+  FakeAgent.reset(
+      standalone_result="STANDALONE_EXIT:1\nSTANDALONE_IFC:MISSING")
+  ok, reason = await serve._validate_delivery(worker, session, True)
+  check("non-standalone fails",
+        not ok and "does not run alone" in reason, reason)
+  # Empty model (run 19, step 34).
+  FakeAgent.reset(segments_result="SEGMENTS:0")
+  ok, reason = await serve._validate_delivery(worker, session, True)
+  check("empty model fails", not ok and "empty model" in reason, reason)
+  FakeAgent.reset(segments_result="SEGMENTS:2")
+  ok, reason = await serve._validate_delivery(worker, session, True)
+  check("2 segments fails", not ok and "empty model" in reason, reason)
+
+
+async def test_track_best_after_fix_round():
+  print("track_best sees the post-fix model, and solve() restores it "
+        "when the final round is inconclusive (run 19)")
+  session = FakeSession(21600)
+  session.instruction = "Route the cable tray, busway and chilled water."
+  unit_pass = (
+      "exit code 0\nUNIT output/model.ifc: scale x1.000,"
+      " millimetre unit declared: True\n"
+      "UNIT_GATE: PASS (1 file(s), scale x1.0, millimetre units)")
+  ifc_pass = "exit code 0\nIFC_GATE: PASS (1 file(s), 0 EXPRESS violations)"
+  conn_pass = (
+      "exit code 0\nCONN tray: 1 connected component(s)\n"
+      "CONN busway: 1 connected component(s)\n"
+      "CONN chw: 1 connected component(s)\n"
+      "CONN_GATE: PASS")
+  unit_skip = "exit code 0\nUNIT_GATE: SKIP (no .ifc files under output/)"
+  ifc_skip = "exit code 0\nIFC_GATE: SKIP (no .ifc files under output/)"
+  sep_skip = "exit code 0\nSEP_GATE: SKIP (no .ifc files under output/)"
+  conn_skip = "exit code 0\nCONN_GATE: SKIP (no .ifc files under output/)"
+
+  def sep_fail(n):
+    return (
+        f"exit code 0\nSEP collisions: {n}\n"
+        f"SEP FAIL: {n} clashes (boxes overlapping > 2 mm on all axes)\n"
+        "SEP_GATE: FAIL")
+
+  FakeAgent.reset(
+      scripts={
+          "planner": ["p"],
+          "worker": ["worker summary"],
+          "verifier": ["FAIL: 100 clashes", "FAIL: 50 clashes", "PASS"],
+      },
+      bash_outputs=[
+          # Round 1: SEP 100, CONN PASS (defects 100).
+          unit_pass, ifc_pass, sep_fail(100), conn_pass,
+          # Post-fix 1 measurement: SEP 50, CONN PASS (defects 50) —
+          # the best model, tracked immediately after the fix round.
+          unit_pass, ifc_pass, sep_fail(50), conn_pass,
+          # Post-fix 2 measurement: inconclusive — every gate SKIPs.
+          unit_skip, ifc_skip, sep_skip, conn_skip,
+          # End-of-solve best restore re-runs the gates on the restored
+          # best model (50 again).
+          unit_pass, ifc_pass, sep_fail(50), conn_pass,
+      ],
+  )
+  real = serve.Agent
+  serve.Agent = FakeAgent
+  try:
+    result = await serve.solve(session)
+  finally:
+    serve.Agent = real
+  worker = FakeAgent.first("worker")
+  check("two fix rounds used", len(worker.resumes) == 2, worker.resumes)
+  check("fix-round prompt is the gate-report prompt",
+        "当前门禁结果如下" in worker.resumes[0], worker.resumes[0])
+  check("best-model restore logged",
+        any("restoring the best" in log for log in session.logs),
+        session.logs)
+  check("submitted verdict is the restored 50-clash model",
+        "50 clashes" in result, repr(result))
+
+
+async def test_validate_delivery_blocks_empty_at_solve_end():
+  print("delivery validation at solve() end falls back on an empty model")
+  session = FakeSession(21600)
+  session.instruction = "Route the cable tray, busway and chilled water."
+  unit_pass = (
+      "exit code 0\nUNIT output/model.ifc: scale x1.000,"
+      " millimetre unit declared: True\n"
+      "UNIT_GATE: PASS (1 file(s), scale x1.0, millimetre units)")
+  ifc_pass = "exit code 0\nIFC_GATE: PASS (1 file(s), 0 EXPRESS violations)"
+  sep_pass = "exit code 0\nSEP collisions: 0\nSEP_GATE: PASS"
+  conn_pass = "exit code 0\nCONN_GATE: PASS"
+  FakeAgent.reset(
+      scripts={
+          "planner": ["p"],
+          "worker": ["worker summary"],
+          "verifier": ["PASS"],
+      },
+      bash_outputs=[unit_pass, ifc_pass, sep_pass, conn_pass],
+      segments_result="SEGMENTS:0",
+  )
+  real = serve.Agent
+  serve.Agent = FakeAgent
+  try:
+    result = await serve.solve(session)
+  finally:
+    serve.Agent = real
+  check("fallback report returned, not a pass",
+        "Delivery validation failed" in result, repr(result))
+  check("reason names the empty model",
+        "fewer than 3 route segments" in result, repr(result))
+  check("fallback replaced the script",
+        "Last-resort model" in session.files["output/solution.py"].decode(),
+        session.files["output/solution.py"][:200])
+
+
 async def main():
   await test_long_task_pass_first_try()
   await test_gaps_then_fix_then_pass()
@@ -2946,6 +3254,11 @@ async def main():
   test_sep_gate_slab_diagnostic()
   test_sep_gate_starts_inside()
   test_routing_fix_guidance()
+  await test_is_empty_model()
+  test_empty_model_check_real_ifc()
+  await test_validate_delivery()
+  await test_track_best_after_fix_round()
+  await test_validate_delivery_blocks_empty_at_solve_end()
   print("ALL TESTS PASSED")
 
 

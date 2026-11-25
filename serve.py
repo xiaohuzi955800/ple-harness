@@ -222,6 +222,23 @@ re-ran it after the fix.
 with what is there.
 """
 
+# Highest-priority delivery rules for the routing worker's system prompt
+# (run 19: the agent built models with /tmp scripts and never wrote
+# output/solution.py, so the run submitted the fallback). They are
+# prepended in Agent.system_prompt for routing workers only — the
+# deliverable contract (solution.py, ground_truth.json, the gate
+# scripts) is routing-specific, and non-routing workers must not see it
+# (test_routing_prompts guards that).
+WORKER_HARD_RULES = """【最高优先级硬规则 - 必须严格遵守】
+1. 你的最终交付物是 output/solution.py，不是 model.ifc。
+2. solution.py 必须完全自包含：所有数字写成字面量，运行时禁止 open() 任何外部文件（包括 ground_truth.json）。
+3. 写完 solution.py 后，必须立刻在空目录测试它能否独立生成 model.ifc。
+4. 只有当独立生成的 model.ifc 通过门禁后，才允许进入下一阶段。
+5. 禁止自己手写碰撞检查脚本。必须调用 /tmp/sep_gate.py 和 /tmp/conn_gate.py，并在回复中引用它们输出的具体数字。
+6. 如果门禁报了具体碰撞位置，修复时只改对应坐标，禁止重写整个文件。
+
+"""
+
 WORKER = SYSTEM.replace(
     "\nWhen the work is done,", EVIDENCE + "\nWhen the work is done,"
 )
@@ -1186,6 +1203,11 @@ class Agent:
     )
     instr = self.session.instruction.lower()
     is_routing = any(k in instr for k in ROUTING_KEYWORDS)
+    if is_routing and self.role == "worker":
+      # The hard rules lead the prompt: the deliverable is the generator
+      # script, and run 19 was lost because the worker built models with
+      # /tmp scripts and never wrote output/solution.py.
+      prompt = WORKER_HARD_RULES + prompt
     if "ifc" in instr or is_routing:
       # Routing tasks produce IFC models, so they need the validation
       # snippet even when the instruction never says "IFC".
@@ -4757,6 +4779,94 @@ async def _standalone_check(worker: Agent) -> str:
       f"Standalone run output: {out.strip()[-300:]}\nLog tail: {tail}")
 
 
+# A real route has dozens of segments; fewer than 3 route-segment
+# entities means the model is (almost) empty — on run 19 the agent's
+# placement test wrote only the slab, and the separation gate printed
+# SEP_GATE: PASS with 0 collisions, because a model with no route
+# segments cannot clash. The threshold is 3, not 0, so a model with a
+# single feeder still counts as empty.
+_MIN_ROUTE_SEGMENTS = 3
+
+# A real solution.py is several kilobytes (the fallback is 8,686 bytes,
+# agent solutions are 11–17 KB); the task stub is 536 bytes. Anything
+# shorter than this cannot be a model builder.
+_MIN_SOLUTION_BYTES = 1000
+
+# One-liner run in the task container: counts the route-segment entities
+# in the IFC file. The path is interpolated (it is always the fixed
+# "output/model.ifc" from _validate_delivery, never agent input).
+_EMPTY_MODEL_CHECK = (
+    "python3 -c \"import ifcopenshell;"
+    " m = ifcopenshell.open('{path}');"
+    " print('SEGMENTS:' + str(sum(len(m.by_type(t)) for t in"
+    " ('IfcCableCarrierSegment', 'IfcPipeSegment', 'IfcCableSegment'))))\"")
+
+
+async def _is_empty_model(worker: Agent, ifc_path: str) -> bool:
+  """Whether the model at ifc_path has (almost) no route segments.
+
+  Opens the IFC file in the task container and counts the route-segment
+  entities (cable-carrier / pipe / cable segments). Fewer than
+  _MIN_ROUTE_SEGMENTS is empty: a slab-only model scores 0 clashes and
+  passes the separation gate, so 0 clashes there is a vacuous pass, not
+  a good model (run 19, step 34). Any failure to read or parse the file
+  counts as empty — an unreadable model must not be submitted as if it
+  were good.
+  """
+  try:
+    out = await worker.bash(
+        _EMPTY_MODEL_CHECK.format(path=ifc_path), timeout_sec=120)
+  except Exception:  # pylint: disable=broad-exception-caught
+    return True
+  for line in out.splitlines():
+    if line.startswith("SEGMENTS:"):
+      try:
+        return int(line.split(":", 1)[1].strip()) < _MIN_ROUTE_SEGMENTS
+      except ValueError:
+        return True
+  return True
+
+
+async def _validate_delivery(
+    worker: Agent, session: taskbridge.Session, is_routing: bool,
+) -> tuple[bool, str]:
+  """Binds the deliverable to the model: is output/solution.py a real,
+  standalone, non-empty submission?
+
+  Checks, in order: (1) output/solution.py exists; (2) it is not the
+  task stub (no STUB_MARKER, at least _MIN_SOLUTION_BYTES long); (3) the
+  existing _standalone_check passes — the grader copies ONLY solution.py
+  into an empty directory, so a script that opens another file dies
+  before scoring (run 12); (4) the model it produced is not empty
+  (_is_empty_model — run 19's slab-only model passed the separation
+  gate with 0 clashes). Non-routing tasks have no solution.py contract
+  and always pass. Returns (True, "") or (False, reason).
+  """
+  if not is_routing:
+    return True, ""
+  try:
+    raw = await session.read_file("output/solution.py")
+    content = raw.decode("utf-8", "replace") if isinstance(raw, bytes) else str(raw)
+  except Exception:  # pylint: disable=broad-exception-caught
+    return False, "output/solution.py is missing"
+  if STUB_MARKER in content:
+    return False, "output/solution.py is still the task stub"
+  if len(content) < _MIN_SOLUTION_BYTES:
+    return False, (
+        f"output/solution.py is only {len(content)} bytes — too short"
+        " to be a real model builder")
+  standalone_gap = await _standalone_check(worker)
+  if standalone_gap:
+    return False, (
+        "output/solution.py does not run alone in a clean directory: "
+        + clip(standalone_gap, 300))
+  if await _is_empty_model(worker, "output/model.ifc"):
+    return False, (
+        "output/model.ifc has fewer than"
+        f" {_MIN_ROUTE_SEGMENTS} route segments (empty model)")
+  return True, ""
+
+
 async def _empty_submission_guard(
     session: taskbridge.Session, is_routing: bool,
     ground_truth: dict | None, force: bool = False,
@@ -4943,6 +5053,9 @@ async def solve(session: taskbridge.Session) -> str:
   best_scores = None  # best score vector across all conclusive gate runs
   snapshot_exists = False  # whether /tmp/prev_output holds the pre-fix model
   needs_final_gate_pass = False  # the last action was a fix round
+  gates_fresh = False  # the post-fix measurement below already gated
+  # this exact model; the next verify round reuses it instead of
+  # re-running four identical (deterministic) gate runs
   fix_rounds_used = 0  # fix rounds actually run (for the post-loop repair)
   reverted_info = None  # (pre-fix vector, post-fix vector) of a revert,
   # so the final summary can say the model was restored (run 15: the
@@ -4955,14 +5068,20 @@ async def solve(session: taskbridge.Session) -> str:
       if left is not None and left < MIN_VERIFY_SEC:
         break
       await session.log(f"verify phase: round {round_no + 1}")
-      # Run all four deterministic gates in parallel FIRST, every round,
-      # whether or not the verifier passes: the verifier judges with their
-      # numbers in hand instead of judging blind. A gate that never runs
-      # cannot teach the agent — on run 8 the connectivity gate ran 0 times
-      # because the separation gate kept failing and the old chain
-      # short-circuited, so the entry was never checked.
-      last_gate_gaps, last_gate_verdict, scores = await _run_all_gates(
-          worker, is_routing)
+      if gates_fresh:
+        # The post-fix measurement below already gated this exact model;
+        # reuse it — the gates are deterministic, so re-running them
+        # would return identical numbers.
+        gates_fresh = False
+      else:
+        # Run all four deterministic gates in parallel FIRST, every round,
+        # whether or not the verifier passes: the verifier judges with their
+        # numbers in hand instead of judging blind. A gate that never runs
+        # cannot teach the agent — on run 8 the connectivity gate ran 0 times
+        # because the separation gate kept failing and the old chain
+        # short-circuited, so the entry was never checked.
+        last_gate_gaps, last_gate_verdict, scores = await _run_all_gates(
+            worker, is_routing)
       # Regression guard: the fix round just run made the model worse.
       # Restore the snapshot (the pre-fix model) and re-measure it, so the
       # submitted model is the best measured, not the last written.
@@ -5050,23 +5169,21 @@ async def solve(session: taskbridge.Session) -> str:
       snapshot_exists = "SNAPSHOT_OK" in snap_out
       prev_scores = scores
       needs_final_gate_pass = True
-      # Numbered checklist, not a blob: on run 17 the verifier named the
-      # riser fix exactly and both fix rounds still died before any agent
-      # saw it; when a round does run, the agent must work the items one
-      # by one, edit only the endpoint named (a full rewrite loses fixes),
-      # and re-run the gate scripts. The riser-face and slab rules are
-      # re-injected here because the work phase proved they do not survive
-      # a rewrite on their own. _fix_round_resume retries the round when
-      # it changes nothing (run 17: both rounds died after 0 steps).
+      # The fix-round prompt names the gate results and forbids a full
+      # rewrite: on run 17 the verifier named the riser fix exactly and
+      # both fix rounds still died before any agent saw it; when a round
+      # does run, the agent must work the numbered items one by one and
+      # re-prove the model standalone + gated. The riser-face and slab
+      # rules live in ROUTING_GUIDE (the worker's system prompt), not
+      # here. _fix_round_resume retries the round when it changes
+      # nothing (run 17: both rounds died after 0 steps).
       summary = await _fix_round_resume(
           worker,
           regression_note
-          + "An independent check of your deliverables found these gaps. Fix each numbered item below, one by one. "
-          "For each item, edit ONLY the endpoint or line named — do not rewrite output/solution.py from scratch; a full rewrite loses fixes. "
-          "After the edits, re-run python3 /tmp/sep_gate.py and python3 /tmp/conn_gate.py and quote the new clash count and component counts in your summary. "
-          "Remember: every joint ends at the FACE of the box it joins — a drop/riser base is the header's TOP face (for CHW, -300 + 168.3 = -132), never the header's base (-300) or centreline; a CRAH inside its header's band needs no horizontal branch (delete it); and no segment except the slab may occupy z -300..0. "
-          "Report each numbered item as fixed, with the numbers that prove it. Your new summary must quote the gate numbers below (clash count, separation, entry distance, coverage) verbatim and must not claim anything the gates deny:\n"
+          + "当前门禁结果如下（必须针对这些具体问题修改）：\n"
           + _number_checklist(gaps)
+          + "\n请只修改 solution.py 中导致上述问题的坐标/尺寸，不要重写整个文件。\n"
+          "修改完成后，必须重新在空目录运行 solution.py，并再次调用门禁脚本验证。",
       )
       fix_rounds_used += 1
       if not summary:
@@ -5075,6 +5192,17 @@ async def solve(session: taskbridge.Session) -> str:
         # round attaches the fresh verdict. Keeping it would leave a
         # stale section above the new one (run 16: SEP 157 over SEP 34).
         summary = _strip_verdict(session.final_message)
+      # Measure the post-fix model now: _track_best must see every model
+      # a fix round produces, not only the ones a later round happens to
+      # measure (run 19: the verify loop never ran, so nothing was ever
+      # tracked). The next verify round reuses this measurement — the
+      # gates are deterministic — instead of re-running them.
+      await session.log("fix round done; measuring the post-fix model")
+      last_gate_gaps, last_gate_verdict, scores = await _run_all_gates(
+          worker, is_routing)
+      best_scores = await _track_best(worker, scores, best_scores)
+      gates_fresh = True
+      needs_final_gate_pass = False
   except openai.OpenAIError as exc:
     # A transient endpoint failure after the summary exists is not fatal:
     # the summary (plus the last gate verdict, attached to
@@ -5153,13 +5281,18 @@ async def solve(session: taskbridge.Session) -> str:
   # consecutive rounds, and an inconclusive round erases its memory, so
   # the submitted model can still be worse than the best-measured one.
   # Restore the best snapshot and re-measure it, so the submitted model
-  # is the best measured, not the last written.
-  if (best_scores is not None and scores is not None
-          and _is_regression(best_scores, scores)):
+  # is the best measured, not the last written. Restore also when the
+  # submitted model was never conclusively measured at all (run 19: the
+  # verify loop never ran) — the best snapshot is then the only measured
+  # model. When the submitted model already is the best, there is
+  # nothing to restore.
+  if (best_scores is not None
+          and (scores is None or _is_regression(best_scores, scores))):
     await session.log(
         "submitted model is worse than the best-measured model;"
         " restoring the best")
-    best_restored_info = (best_scores, scores)
+    if scores is not None:
+      best_restored_info = (best_scores, scores)
     await worker.bash("rm -rf output && cp -r /tmp/best_output output")
     last_gate_gaps, last_gate_verdict, scores = await _run_all_gates(
         worker, is_routing)
@@ -5210,6 +5343,21 @@ async def solve(session: taskbridge.Session) -> str:
   guard = await _empty_submission_guard(session, is_routing, ground_truth)
   if guard is not None:
     return guard
+  # Delivery binding: a real solution.py is not yet a good model.
+  # Validate the deliverable itself — standalone + non-empty — and fall
+  # back with the reason stated honestly when it fails (run 19: a
+  # slab-only model passed the separation gate with 0 clashes; a script
+  # that cannot run alone scores 0.0, run 12).
+  delivery_ok, delivery_reason = await _validate_delivery(
+      worker, session, is_routing)
+  if not delivery_ok:
+    await session.log(f"delivery validation failed: {delivery_reason}")
+    guard = await _empty_submission_guard(
+        session, is_routing, ground_truth, force=True)
+    if guard is not None:
+      report = guard + "\n\nDelivery validation failed: " + delivery_reason
+      session.final_message = report
+      return report
   return summary
 
 
