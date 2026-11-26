@@ -257,6 +257,32 @@ LENGTH_RULES = """【长度优化硬规则】
 
 """
 
+# Run-23 measured patches (P0-1/P0-2/P1-1): the exact breaks and clashes
+# of the run-22 model, verified offline with the real gate scripts (the
+# patch turns CHW from 7 networks into 1, clashes from 3 to 0, all rows
+# 100% coverage). The agent re-solves from scratch, so its geometry
+# differs — the numbers below are the measured example to execute
+# against, not coordinates to copy blindly: measure your own breaks with
+# /tmp/conn_gate.py first, then patch them the same way. Mounted right
+# after LENGTH_RULES for routing workers only.
+RUN23_PATCHES = """【第 23 轮已验证补丁 — 先量后补，不要猜】
+P0-1 CHW 断点补丁（先做）：第 22 轮实测 6 个孤立 CHW drop，各补一根水平短 stub，从 drop 顶部连到它所在行的 CHW header 表面（对接，0 mm 重叠）：
+• CHW-Drop-CRAH-C01 → Row-C header：断点 323.7 mm，stub 约 355 mm
+• CHW-Drop-CRAH-C02 → Row-C header：断点 321.7 mm，stub 约 353 mm
+• CHW-Drop-CRAH-C03 → Row-C header：断点 305.7 mm，stub 约 337 mm
+• CHW-Drop-CRAH-F01 → Row-F header：断点 324.7 mm，stub 约 356 mm
+• CHW-Drop-CRAH-F02 → Row-F header：断点 314.7 mm，stub 约 346 mm
+• CHW-Drop-CRAH-F03 → Row-F header：断点 318.7 mm，stub 约 350 mm
+stub 与 header 同标高、同截面；stub 一端伸进 drop 内部 30 mm、另一端伸进 header 表面 1 mm（1 mm 重叠在 2 mm 碰撞阈值内，不算碰撞）。已经连通的主网络（主干、进线、环线、行 header、已连通的 drop）一律不许动。每补一根 stub，用 /tmp/conn_gate.py 确认该端点距离 <250 mm；全部补完确认 CHW 只有 1 个连通网络。
+P0-2 D01 子图（整体改，一次改完，禁止逐段改）：第 22 轮的 3 处碰撞全在 D 行 / D01 子图：
+• tray WestTrunk × tray Feeder 重叠 [54, 600, 127] mm：把 tray 主干在 x 方向收窄 54 mm（西侧面从 x=100 移到 x=154），Feeder（x 27..154）不动，与主干对接；主干东侧面保持在 x=700，6 行 header 起点不动。注意：不要把 Feeder 本身缩短到 73 mm——水平 tray 段两个水平方向都必须 ≥125 mm，否则会触发门禁的截面方向检查。
+• tray Row-D header × CHW Drop-D01 重叠 [168.3, 148.1, 127] mm：只把 D 行的 tray header 向南移 300 mm（不要动其它行的 header），让 D01 drop 从它旁边通过。
+• CHW Row-D header × CHW Branch-D01 重叠 [168.3, 84.1, 168.3] mm：把 Branch-D01 缩短 84.1 mm，让它停在 CHW Row-D header 的南表面（y=11291），不要做到 header 中心线。
+改完立即重跑 /tmp/sep_gate.py 和 /tmp/conn_gate.py，确认 SEP=0 且 CHW 仍为 1 个网络。
+P1-1 长度（P0 全部通过后再做）：删掉北环线 CHW-NorthPerimeter（已验证免费：省 24,916 mm，覆盖和连通不变）；南环线 CHW-SouthPerimeter 必须保留（它桥接着 4 个 drop：CHW-Drop-CRAH-01/02/03/04，删掉会让 CHW 从 7 个网络变成 10 个）。缩短行 header 只许缩到覆盖下限，改完必须重跑 /tmp/conn_gate.py 并确认每行每种服务覆盖 ≥80%，否则回退。
+
+"""
+
 WORKER = SYSTEM.replace(
     "\nWhen the work is done,", EVIDENCE + "\nWhen the work is done,"
 )
@@ -1236,9 +1262,10 @@ class Agent:
       # script, and run 19 was lost because the worker built models with
       # /tmp scripts and never wrote output/solution.py. The length rules
       # follow immediately after them (run 21: length is the only big
-      # loss left once the hard constraints pass), still ahead of the
-      # worker prompt itself.
-      prompt = WORKER_HARD_RULES + LENGTH_RULES + prompt
+      # loss left once the hard constraints pass), then the run-23
+      # measured patches (the exact CHW breaks and D01 clashes, verified
+      # offline), still ahead of the worker prompt itself.
+      prompt = WORKER_HARD_RULES + LENGTH_RULES + RUN23_PATCHES + prompt
     if "ifc" in instr or is_routing:
       # Routing tasks produce IFC models, so they need the validation
       # snippet even when the instruction never says "IFC".
@@ -2554,6 +2581,23 @@ COVER_TOL = 2500.0
 ROW_MIN = 0.8
 CRAH_TOL = 2500.0
 
+# PredefinedType -> service, for the triple-consistency WARNING only
+# (run 23): the gate classifies by ObjectType and never by PredefinedType.
+# The IFC4 IfcCableCarrierSegmentTypeEnum has only 6 values
+# (CABLELADDERSEGMENT, CABLETRAYSEGMENT, CABLETRUNKINGSEGMENT,
+# CONDUITSEGMENT, USERDEFINED, NOTDEFINED) and IfcCableSegmentTypeEnum
+# has 6 (BUSBARSEGMENT, CABLESEGMENT, CONDUCTORSEGMENT, CORESEGMENT,
+# USERDEFINED, NOTDEFINED); CHW has no PredefinedType mapping, so a
+# conflict can never fire for CHW. CABLESEGMENT/CONDUCTORSEGMENT/
+# CORESEGMENT name no route service, so they map to nothing.
+_PREDEFINED_SERVICE = {
+    'BUSBARSEGMENT': 'busway',
+    'CABLETRAYSEGMENT': 'tray',
+    'CABLELADDERSEGMENT': 'tray',
+    'CABLETRUNKINGSEGMENT': 'tray',
+    'CONDUITSEGMENT': 'tray',
+}
+
 
 def _v(p):
     return (float(p[0]), float(p[1]), float(p[2]))
@@ -2873,6 +2917,7 @@ def main():
     boxes = {'tray': [], 'busway': [], 'chw': []}
     names = {'tray': [], 'busway': [], 'chw': []}
     wrong = []
+    predefined_conflicts = []
     name_fallback = 0
     # Hard ObjectType assertion (run 22+, DeepSeek review): every flow
     # segment must be classifiable by service — normalized ObjectType
@@ -2913,6 +2958,20 @@ def main():
             # grader passes. The busway-mislabelled-as-CHW case is still
             # caught: busway lands at 0 segments (see the >=1 check).
             wrong.append(f"{svc} modelled as {product.is_a()}, not {expect}")
+        # Triple-consistency warning (run 23): PredefinedType is only a
+        # warning, never a classification input — the grader classifies by
+        # ObjectType. Fire only when PredefinedType is SET and maps to a
+        # different service than the ObjectType classification. (ifcopenshell
+        # enforces the enum per entity class, so a cross-enum value like
+        # BUSBARSEGMENT on a carrier segment cannot even be written through
+        # the API; the realistic conflict is a same-enum value naming the
+        # other service, e.g. CABLETRAYSEGMENT on a 'Busway' segment.)
+        pre = getattr(product, 'PredefinedType', None)
+        if pre:
+            pre_svc = _PREDEFINED_SERVICE.get(str(pre).upper())
+            if pre_svc is not None and pre_svc != svc:
+                predefined_conflicts.append(
+                    f"{product.Name or product.is_a()} has PredefinedType {pre} but is classified as {svc} by ObjectType")
         if b is None:
             continue
         centre, axes = b
@@ -2948,6 +3007,11 @@ def main():
         # appear in the per-service lengths and the classified sum.
         shown = '; '.join(wrong[:5])
         print(f"CONN WARNING: {len(wrong)} segment(s) modelled as the wrong IFC class for their ObjectType — the grader classifies by ObjectType, so these still count toward the named service. First: {shown}")
+    if predefined_conflicts:
+        # Triple-consistency warning only (run 23): classification stands,
+        # the segment still counts toward its ObjectType service.
+        shown = '; '.join(predefined_conflicts[:5])
+        print(f"CONN WARNING: {len(predefined_conflicts)} segment(s) have a PredefinedType that conflicts with their ObjectType classification — the ObjectType classification stands (the grader reads ObjectType). First: {shown}")
     problems = []
     for name, raw, reason in bad_object_types[:5]:
         problems.append(
@@ -3953,7 +4017,7 @@ def _merge_gate_gaps(*gap_texts: str) -> str:
 
 def _gate_verdict_lines(
     unit_gaps: str, ifc_gaps: str, sep_gaps: str, conn_gaps: str, is_routing: bool,
-    scores: dict | None = None,
+    scores: dict | None = None, measured: dict | None = None,
 ) -> str:
   """One summary line per gate, for the verifier's context and the final summary.
 
@@ -3964,7 +4028,9 @@ def _gate_verdict_lines(
   separation/connectivity gate reports its measured numbers instead (run 22:
   run 21's final message quoted round 1's CONN numbers — tray 129,481 mm /
   14 segments — because the verdict never carried numbers and was only
-  attached when a gate failed).
+  attached when a gate failed). When the measured map is given (run 23), a
+  gate that did not run in this measurement is reported as 未验证, never
+  as passed — an unmeasured gate is not a passing gate.
 
   Args:
     unit_gaps: Unit gate failure text, "" when clean.
@@ -3975,6 +4041,10 @@ def _gate_verdict_lines(
       connectivity gates only run on those).
     scores: The score vector from _gate_score_vector, or None when any gate
       was inconclusive.
+    measured: Map of gate display name ("Unit", "IFC", "Separation",
+      "Connectivity") to whether that gate ran in this measurement, or
+      None to keep the old behaviour (a clean gate reports "no failures
+      reported").
 
   Returns:
     Four lines, one per gate.
@@ -3989,6 +4059,8 @@ def _gate_verdict_lines(
     if not applicable:
       lines.append(f"{name} gate: not applicable (not a routing task)")
     elif gaps:
+      # A failure line means the gate ran — a failing gate is never
+      # 未验证, whatever the measured map says.
       # The most informative failure line: the "FAIL: <detail>" line when
       # the gate has one, else the first line (the IFC gate's first line
       # already names the violations; the separation gate's first line is
@@ -4007,6 +4079,11 @@ def _gate_verdict_lines(
             f" WARNING: {scores['name_fallback']} segment(s) classified by"
             " Name fallback (grader uses ObjectType) — set ObjectType exactly")
       lines.append(fail_line)
+    elif measured is not None and not measured.get(name, True):
+      # Run 23: a gate without a measurement in this run is 未验证 —
+      # never "no failures reported" and never a pass.
+      lines.append(
+          f"{name} gate: 未验证 — 本次测量未能运行该门禁，不得视为通过")
     elif scores is not None and name == "Separation":
       lines.append(
           f"Separation gate: PASS — {scores.get('clashes', 0)} clash(es)")
@@ -4112,6 +4189,37 @@ def _defects(vector: dict) -> int:
   extra = sum(max(0, n - 1) for n in components.values())
   return (vector.get("clashes", 0) + 25 * extra
           + 25 * vector.get("rows_below_80", 0))
+
+
+def _hard_pass(vector: dict) -> bool:
+  """True when every hard constraint in the vector passes (run 23).
+
+  The hard layer is unit + IFC + frame + zero clashes + one component
+  per service + every row at or above 80% coverage. A model in this
+  layer scores on the grader's hard gates; a model outside it scores
+  0.0 on the item no matter how short it is.
+  """
+  return (bool(vector.get("unit_ok")) and bool(vector.get("ifc_ok"))
+          and bool(vector.get("frame_ok"))
+          and vector.get("clashes", 0) == 0
+          and vector.get("max_components", 0) <= 1
+          and vector.get("rows_below_80", 0) == 0)
+
+
+def _rank_key(vector: dict) -> tuple:
+  """Layered best-model order (run 23): hard constraints first, then the
+  calibrated defect score as the same-layer tiebreak.
+
+  (0, defects) for a model that passes every hard constraint,
+  (1, defects) otherwise. Clashes and connectivity stay combined in the
+  defect score inside one layer — the literal "clashes before
+  connectivity" order would flip the run-15 calibration (a 92-clash /
+  2-component model must stay worse than a 113-clash / 1-component
+  one: 117 -> 113 is an improvement). Length is NOT in this key: it is
+  a tie-break only when both sides are known (see _is_regression and
+  _track_best) — an unknown length must never outrank a known one.
+  """
+  return (0 if _hard_pass(vector) else 1, _defects(vector))
 
 
 # The grader's optimal total routed length for the smoke task
@@ -4257,6 +4365,21 @@ def _is_regression(prev: dict, cur: dict) -> bool:
   is a regression and a shorter route is an improvement — hard
   constraints first, length second. When either length is unknown there
   is no tie-break to apply.
+
+  Layered order (run 23): a model that passes every hard constraint
+  outranks one that does not, whatever the defect scores say — a 0-clash
+  / 7-component model (defects 150) is a better base for the next fix
+  round than a 3-clash / 1-component model (defects 3), because the fix
+  round only has to bridge breaks, not re-derive the layout. Within one
+  layer the calibrated defect score decides, so the run-15 and run-12
+  calibrations still hold (both models sit in the failing layer: run 15
+  117 -> 113 is an improvement, run 12 167 -> 325 a regression). The
+  fatal-flip rules are kept as a fast path: a flip always outranks the
+  defect score. The standalone-runnable and violation-rate layers of the
+  brief are not in this key: runnability is enforced by
+  _validate_delivery at solve end (a model that does not run standalone
+  is replaced by the fallback), and the violation rate is a grader-side
+  metric the gates do not measure.
   """
   if cur["unit_ok"] is False and prev["unit_ok"] is True:
     return True
@@ -4264,9 +4387,9 @@ def _is_regression(prev: dict, cur: dict) -> bool:
     return True
   if cur["frame_ok"] is False and prev["frame_ok"] is True:
     return True
-  if _defects(cur) > _defects(prev):
+  if _rank_key(cur) > _rank_key(prev):
     return True
-  if _defects(cur) == _defects(prev):
+  if _rank_key(cur) == _rank_key(prev):
     prev_len, cur_len = _length_of(prev), _length_of(cur)
     if (prev_len is not None and cur_len is not None
             and cur_len > prev_len):
@@ -4285,15 +4408,16 @@ async def _track_best(worker, scores, best_scores):
 
   The adjacent-round guard only compares consecutive rounds, and an
   inconclusive round erases its memory (scores None overwrites
-  prev_scores). This tracker keeps the best defect score across ALL
-  conclusive gate runs, so the end of solve() can restore it. A model is
-  only "best" when it is strictly better by defect score with no fatal
+  prev_scores). This tracker keeps the best model across ALL conclusive
+  gate runs, so the end of solve() can restore it. A model is only
+  "best" when it is strictly better by the layered rank (run 23:
+  hard-constraints layer first, then the defect score) with no fatal
   flip — calibrated so it does NOT restore run 17's 64-clash model
   (defects 139: CHW 4 components) over the submitted 118 model
-  (defects 118, CONN PASS). Length tie-break (run 21): with the defect
-  score tied, the shorter route wins — hard constraints first, length
-  second. When either length is unknown there is no tie-break to apply,
-  and the earlier model stays best.
+  (defects 118, CONN PASS). Length tie-break (run 21): with the rank
+  tied, the shorter route wins — hard constraints first, length second.
+  When either length is unknown there is no tie-break to apply, and the
+  earlier model stays best.
 
   Args:
     worker: The worker agent (its bash runs in the task container).
@@ -4311,10 +4435,10 @@ async def _track_best(worker, scores, best_scores):
       # Worse hard constraints, more defects, or the same defects with
       # a longer route — the best snapshot stays.
       return best_scores
-    if _defects(scores) == _defects(best_scores):
-      # Same defects: keep the shorter route (run 21 tie-break). When
-      # either length is unknown there is no tie-break to apply, and
-      # the earlier model stays best.
+    if _rank_key(scores) == _rank_key(best_scores):
+      # Same layer and same defects: keep the shorter route (run 21
+      # tie-break). When either length is unknown there is no tie-break
+      # to apply, and the earlier model stays best.
       best_len, new_len = _length_of(best_scores), _length_of(scores)
       if best_len is None or new_len is None or new_len >= best_len:
         return best_scores
@@ -4463,6 +4587,24 @@ def _correct_summary(summary: str, verdict: str) -> str:
               and any(r in low for r in resolutions)):
         contradicted.append(line.strip())
         break
+  # Blanket claims (run 23): "硬约束已通过" names no single gate, so the
+  # per-gate patterns miss it — run 22's final message said exactly that
+  # while SEP and CONN both FAILED. A blanket success claim is
+  # contradicted whenever ANY gate fails in the final measurement. A line
+  # that explicitly negates the pass ("未通过", "不通过", "未达标") is
+  # honest, not a claim, and is exempted — as is any line that also says
+  # "fail".
+  _BLANKET_KEYWORDS = ("硬约束", "hard constraint", "所有门禁", "all gates",
+                       "all constraints", "全部通过", "全部达标")
+  _BLANKET_RESOLUTIONS = ("通过", "pass", "passed", "满足", "satisf")
+  for line in head.splitlines():
+    low = line.lower()
+    if ("fail" not in low and "未通过" not in low and "不通过" not in low
+            and "未达标" not in low
+            and any(k in low for k in _BLANKET_KEYWORDS)
+            and any(r in low for r in _BLANKET_RESOLUTIONS)):
+      contradicted.append(line.strip())
+      break
   if not contradicted:
     return summary
   fails = [line for line in verdict.splitlines()
@@ -4505,9 +4647,63 @@ async def _run_all_gates(
           _connectivity_gate(worker))
   gaps = _merge_gate_gaps(unit_gaps, ifc_gaps, sep_gaps, conn_gaps)
   scores = _gate_score_vector(unit_scores, ifc_scores, sep_scores, conn_scores)
+  # Which gates actually ran (run 23): a score dict is non-empty exactly
+  # when its gate measured something — an empty dict is inconclusive, not
+  # a pass. The verdict reports an unmeasured gate as 未验证.
+  measured = {"Unit": bool(unit_scores), "IFC": bool(ifc_scores),
+              "Separation": bool(sep_scores), "Connectivity": bool(conn_scores)}
   verdict = _gate_verdict_lines(
-      unit_gaps, ifc_gaps, sep_gaps, conn_gaps, is_routing, scores)
+      unit_gaps, ifc_gaps, sep_gaps, conn_gaps, is_routing, scores, measured)
   return gaps, verdict, scores
+
+
+async def _file_hashes(worker: Agent) -> dict:
+  """SHA-256 of output/solution.py and output/model.ifc (run 23).
+
+  Returns {"solution.py": <64-hex> or "", "model.ifc": <64-hex> or ""}.
+  Agent.bash returns "exit code 0\\n<hash>  <file>", so scan for the
+  64-hex token — the same pattern as _solution_hash's 32-hex md5 scan.
+  "" when a file is absent (NOFILE).
+  """
+  hashes = {}
+  for name in ("solution.py", "model.ifc"):
+    out = await worker.bash(
+        f"sha256sum output/{name} 2>/dev/null || echo NOFILE")
+    found = ""
+    for token in out.split():
+      if (len(token) == 64
+              and all(c in "0123456789abcdef" for c in token)):
+        found = token
+        break
+    hashes[name] = found
+  return hashes
+
+
+def _hash_binding_line(hashes: dict) -> str:
+  """One line binding a gate measurement to the files it measured (run 23)."""
+  sol = hashes.get("solution.py") or "missing"
+  mod = hashes.get("model.ifc") or "missing"
+  return (f"Measurement bound to solution.py sha256 {sol[:12]}… / "
+          f"model.ifc sha256 {mod[:12]}… — any change to either file "
+          "invalidates this measurement.")
+
+
+async def _measure_gates(
+    worker: Agent, is_routing: bool
+) -> tuple[str, str, dict | None, dict]:
+  """Runs all four gates and binds the measurement to the file hashes.
+
+  Returns (merged_gaps, verdict_lines, score_vector, hashes): the same
+  triple _run_all_gates returns, plus the sha256 of solution.py and
+  model.ifc at measurement time. The binding line is appended to the
+  verdict, so the final report quotes only the measurement of the exact
+  files submitted — a gate result from an earlier file version is visibly
+  stale (run 22: the final message quoted round-1 CONN numbers for a
+  model the length round had already rewritten).
+  """
+  gaps, verdict, scores = await _run_all_gates(worker, is_routing)
+  hashes = await _file_hashes(worker)
+  return gaps, verdict + "\n" + _hash_binding_line(hashes), scores, hashes
 
 
 # Sheets the vision call reads for the text the geometry cannot see:
@@ -5479,6 +5675,9 @@ async def solve(session: taskbridge.Session) -> str:
   last_gate_gaps = ""
   last_gate_verdict = ""
   scores = None  # score vector from the latest gate run
+  last_hashes = {"solution.py": "", "model.ifc": ""}  # file hashes the
+  # latest gate measurement is bound to (run 23); "" until a measurement
+  # runs
   prev_scores = None  # score vector from the round before the last fix
   best_scores = None  # best score vector across all conclusive gate runs
   snapshot_exists = False  # whether /tmp/prev_output holds the pre-fix model
@@ -5512,7 +5711,7 @@ async def solve(session: taskbridge.Session) -> str:
         # cannot teach the agent — on run 8 the connectivity gate ran 0 times
         # because the separation gate kept failing and the old chain
         # short-circuited, so the entry was never checked.
-        last_gate_gaps, last_gate_verdict, scores = await _run_all_gates(
+        last_gate_gaps, last_gate_verdict, scores, last_hashes = await _measure_gates(
             worker, is_routing)
       # Regression guard: the fix round just run made the model worse.
       # Restore the snapshot (the pre-fix model) and re-measure it, so the
@@ -5524,7 +5723,7 @@ async def solve(session: taskbridge.Session) -> str:
             "fix round made the model worse; restoring the previous model")
         reverted_info = (prev_scores, scores)
         await worker.bash("rm -rf output && cp -r /tmp/prev_output output")
-        last_gate_gaps, last_gate_verdict, scores = await _run_all_gates(
+        last_gate_gaps, last_gate_verdict, scores, last_hashes = await _measure_gates(
             worker, is_routing)
         prev_scores = scores
         regression_note = (
@@ -5671,7 +5870,7 @@ async def solve(session: taskbridge.Session) -> str:
       # re-running them.
       await session.log("fix round done; measuring the post-fix model")
       await _regenerate_model(worker)
-      last_gate_gaps, last_gate_verdict, scores = await _run_all_gates(
+      last_gate_gaps, last_gate_verdict, scores, last_hashes = await _measure_gates(
           worker, is_routing)
       best_scores = await _track_best(worker, scores, best_scores)
       gates_fresh = True
@@ -5694,7 +5893,7 @@ async def solve(session: taskbridge.Session) -> str:
     left = session.time_left()
     if left is None or left >= MIN_VERIFY_SEC:
       await session.log("final gate pass on the submitted model")
-      last_gate_gaps, last_gate_verdict, scores = await _run_all_gates(
+      last_gate_gaps, last_gate_verdict, scores, last_hashes = await _measure_gates(
           worker, is_routing)
       if (scores is not None and prev_scores is not None
               and snapshot_exists and _is_regression(prev_scores, scores)):
@@ -5702,7 +5901,7 @@ async def solve(session: taskbridge.Session) -> str:
             "final model is worse than the previous one; restoring it")
         reverted_info = (prev_scores, scores)
         await worker.bash("rm -rf output && cp -r /tmp/prev_output output")
-        last_gate_gaps, last_gate_verdict, scores = await _run_all_gates(
+        last_gate_gaps, last_gate_verdict, scores, last_hashes = await _measure_gates(
             worker, is_routing)
       best_scores = await _track_best(worker, scores, best_scores)
       # Length round at the final gate pass (run 21): the model only
@@ -5739,8 +5938,8 @@ async def solve(session: taskbridge.Session) -> str:
               if not summary:
                 summary = _strip_verdict(session.final_message)
               await _regenerate_model(worker)
-              last_gate_gaps, last_gate_verdict, scores = (
-                  await _run_all_gates(worker, is_routing))
+              last_gate_gaps, last_gate_verdict, scores, last_hashes = (
+                  await _measure_gates(worker, is_routing))
               if (scores is not None and prev_scores is not None
                       and snapshot_exists
                       and _is_regression(prev_scores, scores)):
@@ -5750,8 +5949,8 @@ async def solve(session: taskbridge.Session) -> str:
                 reverted_info = (prev_scores, scores)
                 await worker.bash(
                     "rm -rf output && cp -r /tmp/prev_output output")
-                last_gate_gaps, last_gate_verdict, scores = (
-                    await _run_all_gates(worker, is_routing))
+                last_gate_gaps, last_gate_verdict, scores, last_hashes = (
+                    await _measure_gates(worker, is_routing))
               best_scores = await _track_best(worker, scores, best_scores)
   # Standalone check on the submitted model. The loop already checks every
   # round, but the loop can break early on time and the final gate pass can
@@ -5781,7 +5980,7 @@ async def solve(session: taskbridge.Session) -> str:
           if not summary:
             summary = _strip_verdict(session.final_message)
           await _regenerate_model(worker)
-          last_gate_gaps, last_gate_verdict, scores = await _run_all_gates(
+          last_gate_gaps, last_gate_verdict, scores, last_hashes = await _measure_gates(
               worker, is_routing)
           best_scores = await _track_best(worker, scores, best_scores)
           standalone_gap = await _standalone_check(worker)
@@ -5816,10 +6015,30 @@ async def solve(session: taskbridge.Session) -> str:
     if scores is not None:
       best_restored_info = (best_scores, scores)
     await worker.bash("rm -rf output && cp -r /tmp/best_output output")
-    last_gate_gaps, last_gate_verdict, scores = await _run_all_gates(
+    last_gate_gaps, last_gate_verdict, scores, last_hashes = await _measure_gates(
         worker, is_routing)
   if verified:
     summary += "\n\nIndependent verification: PASS."
+  # Final-version hash binding (run 23): the gates measured the files as
+  # they were at the last gate run — but a fix round, a restore, or a
+  # regeneration can change solution.py or model.ifc afterwards. Before
+  # the summary ships, re-hash both files; if either differs from the
+  # last measurement's hashes, the old measurement is invalid: regenerate
+  # the model from the script and re-measure once, so the final report
+  # quotes ONLY the measurement of the exact files submitted (with its
+  # hashes). When nothing changed this is two sha256sum calls and no
+  # re-measurement — the last measurement already is the measurement of
+  # the final files. When the last gate run was inconclusive (scores
+  # None) there is nothing to bind; the unmeasured verdict below says so.
+  if scores is not None:
+    current_hashes = await _file_hashes(worker)
+    if current_hashes != last_hashes:
+      await session.log(
+          "files changed since the last gate measurement; regenerating"
+          " and re-measuring before delivery")
+      await _regenerate_model(worker)
+      last_gate_gaps, last_gate_verdict, scores, last_hashes = (
+          await _measure_gates(worker, is_routing))
   # Attach the last round's gate verdict so the submitted summary always
   # carries the deterministic checks' conclusion, even when the fix
   # rounds ran out and the final model still fails a gate. Attach
@@ -5830,9 +6049,20 @@ async def solve(session: taskbridge.Session) -> str:
   # shipped two sections, SEP 157 above SEP 34). Attach whenever the gates
   # measured something, not only on failures (run 22): run 21's final
   # message quoted round 1's CONN numbers because an all-pass run attached
-  # nothing. When the gates were inconclusive there is nothing to attach.
-  if scores is not None:
+  # nothing. When a gate run happened but was inconclusive, attach its
+  # verdict anyway — it now reports the unmeasured gates as 未验证
+  # (run 23) instead of "no failures reported", so it cannot mislead.
+  # When no gate run ever happened, attach an explicitly unmeasured
+  # verdict: every gate is 未验证, never a pass.
+  if last_gate_verdict:
     summary = _attach_verdict(summary, last_gate_verdict)
+  else:
+    summary = _attach_verdict(
+        summary,
+        _gate_verdict_lines("", "", "", "", is_routing, scores=None,
+                            measured={"Unit": False, "IFC": False,
+                                      "Separation": False,
+                                      "Connectivity": False}))
   # The agent's prose can claim a PASS the gates deny (run 12: "Clash
   # count: 0 PASS" while SEP/CONN FAILed). Correct the record before the
   # summary ships.

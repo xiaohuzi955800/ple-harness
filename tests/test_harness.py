@@ -136,6 +136,15 @@ class FakeAgent:
   # solve() tests never trigger a fix-round retry.
   solution_hashes = None
   _hash_counter = 0
+  # Canned sha256sum outputs for _file_hashes (run 23): when set, each
+  # call pops one 64-hex hash in call order (solution.py, then model.ifc,
+  # per _measure_gates call; the final hash check calls them again in
+  # the same order). When unset, each file returns one STABLE hash, so
+  # the final hash check sees no change and never triggers a re-measure
+  # — existing solve() tests keep their canned gate-output counts. A
+  # test that must exercise the stale-measurement path sets file_hashes
+  # so the final check's hashes differ from the measurement's.
+  file_hashes = None
 
   def __init__(
       self,
@@ -199,6 +208,21 @@ class FakeAgent:
         FakeAgent._hash_counter += 1
         h = f"{FakeAgent._hash_counter:032x}"
       return f"exit code 0\n{h}  output/solution.py"
+    if "sha256sum" in command:
+      # _file_hashes (run 23): the final-version hash binding. Production
+      # bash returns "exit code 0\\n<sha256>  output/<file>". A canned
+      # list pops one hash per call, in call order; otherwise each file
+      # returns one stable hash (solution.py "a"*64, model.ifc "b"*64),
+      # so the final hash check sees no change and existing solve() tests
+      # never trigger a re-measure.
+      if FakeAgent.file_hashes:
+        h = FakeAgent.file_hashes.pop(0)
+      elif "model.ifc" in command:
+        h = "b" * 64
+      else:
+        h = "a" * 64
+      name = "model.ifc" if "model.ifc" in command else "solution.py"
+      return f"exit code 0\n{h}  output/{name}"
     if command.startswith("python3 output/solution.py"):
       # _regenerate_model: re-runs solution.py before a post-fix gate
       # measurement (run 22). Pretend it worked; never consumes a canned
@@ -225,7 +249,7 @@ class FakeAgent:
   def reset(cls, scripts=None, fail_roles=None, bash_outputs=None,
             standalone_result=None, standalone_tail=None,
             resume_texts=None, solution_hashes=None,
-            segments_result=None):
+            segments_result=None, file_hashes=None):
     cls.instances = []
     cls.scripts = dict(scripts or {})
     cls.fail_roles = set(fail_roles or ())
@@ -234,6 +258,8 @@ class FakeAgent:
         list(resume_texts) if resume_texts is not None else None)
     cls.solution_hashes = (
         list(solution_hashes) if solution_hashes is not None else None)
+    cls.file_hashes = (
+        list(file_hashes) if file_hashes is not None else None)
     cls._hash_counter = 0
     cls.standalone_result = (
         standalone_result if standalone_result is not None
@@ -285,10 +311,21 @@ async def test_long_task_pass_first_try():
         FakeAgent.first("verifier").context.startswith("worker summary"))
   check("verifier got gate verdict",
         "Deterministic gate results" in FakeAgent.first("verifier").context
-        and "IFC gate: no failures reported"
+        and "IFC gate: 未验证"
         in FakeAgent.first("verifier").context)
+  # Run 23: the gates never ran here (no .ifc files — SKIP), so the final
+  # message reports them as 未验证 instead of "no failures reported",
+  # and binds the verdict to the file hashes.
   check("result",
-        result == "worker summary\n\nIndependent verification: PASS.",
+        result == ("worker summary\n\nIndependent verification: PASS."
+                   "\n\nDeterministic gates:\n"
+                   "Unit gate: 未验证 — 本次测量未能运行该门禁，不得视为通过\n"
+                   "IFC gate: 未验证 — 本次测量未能运行该门禁，不得视为通过\n"
+                   "Separation gate: not applicable (not a routing task)\n"
+                   "Connectivity gate: not applicable (not a routing task)\n"
+                   "Measurement bound to solution.py sha256 aaaaaaaaaaaa… / "
+                   "model.ifc sha256 bbbbbbbbbbbb… — any change to either "
+                   "file invalidates this measurement."),
         repr(result))
 
 
@@ -311,8 +348,18 @@ async def test_gaps_then_fix_then_pass():
   worker = FakeAgent.first("worker")
   check("one fix round", len(worker.resumes) == 1, worker.resumes)
   check("gaps passed to worker", "missing units" in worker.resumes[0])
+  # Run 23: the final message also carries the (unmeasured) verdict
+  # section after the verification line.
   check("result",
-        result == "fixed summary (1)\n\nIndependent verification: PASS.",
+        result == ("fixed summary (1)\n\nIndependent verification: PASS."
+                   "\n\nDeterministic gates:\n"
+                   "Unit gate: 未验证 — 本次测量未能运行该门禁，不得视为通过\n"
+                   "IFC gate: 未验证 — 本次测量未能运行该门禁，不得视为通过\n"
+                   "Separation gate: not applicable (not a routing task)\n"
+                   "Connectivity gate: not applicable (not a routing task)\n"
+                   "Measurement bound to solution.py sha256 aaaaaaaaaaaa… / "
+                   "model.ifc sha256 bbbbbbbbbbbb… — any change to either "
+                   "file invalidates this measurement."),
         repr(result))
 
 
@@ -326,7 +373,16 @@ async def test_short_task_skips_plan_and_verify():
   finally:
     serve.Agent = real
   check("only worker", FakeAgent.roles() == ["worker"], FakeAgent.roles())
-  check("result", result == "worker summary", repr(result))
+  # Run 23: no gate run ever happened (verification skipped), so the
+  # final message reports every applicable gate as 未验证 — with no
+  # binding line, because no measurement exists to bind.
+  check("result",
+        result == ("worker summary\n\nDeterministic gates:\n"
+                   "Unit gate: 未验证 — 本次测量未能运行该门禁，不得视为通过\n"
+                   "IFC gate: 未验证 — 本次测量未能运行该门禁，不得视为通过\n"
+                   "Separation gate: not applicable (not a routing task)\n"
+                   "Connectivity gate: not applicable (not a routing task)"),
+        repr(result))
 
 
 async def test_planner_failure():
@@ -347,7 +403,9 @@ async def test_planner_failure():
   check("failure logged",
         any("plan phase failed" in t for t in session.logs),
         session.logs)
-  check("result has PASS note", result.endswith("PASS."), repr(result))
+  check("result has PASS note",
+        # Run 23: the verdict section follows the verification line.
+        "Independent verification: PASS." in result, repr(result))
 
 
 async def test_verifier_failure():
@@ -363,7 +421,18 @@ async def test_verifier_failure():
   finally:
     serve.Agent = real
   check("no fix round", len(FakeAgent.first("worker").resumes) == 0)
-  check("result", result == "worker summary", repr(result))
+  # Run 23: the gates ran (SKIP — no .ifc files) and were inconclusive,
+  # so the final message reports them as 未验证.
+  check("result",
+        result == ("worker summary\n\nDeterministic gates:\n"
+                   "Unit gate: 未验证 — 本次测量未能运行该门禁，不得视为通过\n"
+                   "IFC gate: 未验证 — 本次测量未能运行该门禁，不得视为通过\n"
+                   "Separation gate: not applicable (not a routing task)\n"
+                   "Connectivity gate: not applicable (not a routing task)\n"
+                   "Measurement bound to solution.py sha256 aaaaaaaaaaaa… / "
+                   "model.ifc sha256 bbbbbbbbbbbb… — any change to either "
+                   "file invalidates this measurement."),
+        repr(result))
 
 
 async def test_max_fix_rounds():
@@ -383,7 +452,17 @@ async def test_max_fix_rounds():
         FakeAgent.roles().count("verifier") == 3, FakeAgent.roles())
   check("two fix rounds",
         len(FakeAgent.first("worker").resumes) == 2)
-  check("result", result == "fixed summary (2)", repr(result))
+  # Run 23: the final message also carries the (unmeasured) verdict.
+  check("result",
+        result == ("fixed summary (2)\n\nDeterministic gates:\n"
+                   "Unit gate: 未验证 — 本次测量未能运行该门禁，不得视为通过\n"
+                   "IFC gate: 未验证 — 本次测量未能运行该门禁，不得视为通过\n"
+                   "Separation gate: not applicable (not a routing task)\n"
+                   "Connectivity gate: not applicable (not a routing task)\n"
+                   "Measurement bound to solution.py sha256 aaaaaaaaaaaa… / "
+                   "model.ifc sha256 bbbbbbbbbbbb… — any change to either "
+                   "file invalidates this measurement."),
+        repr(result))
 
 
 def test_verdict():
@@ -1981,7 +2060,10 @@ async def test_planner_skipped_with_ground_truth():
         "A 3000" in FakeAgent.first("worker").plan
         and "B 6000" in FakeAgent.first("worker").plan)
   check("result verified",
-        result.endswith("Independent verification: PASS."), repr(result))
+        # Run 23: the verification line is followed by the verdict
+        # section, so the result no longer ends with it.
+        "Independent verification: PASS." in result
+        and "Deterministic gates:" in result, repr(result))
 
 
 def test_conn_gate_ground_truth():
@@ -4249,6 +4331,449 @@ async def test_fix_round_prompt_revert_rule():
         "Independent verification: PASS." in result, repr(result))
 
 
+# ---------------------------------------------------------------------------
+# Run-23 tests: measured CHW/D01 patches, final-version hash binding,
+# blanket-claim correction, unmeasured-gate reporting, layered ranking,
+# triple-consistency warning, run-22 fixtures.
+# ---------------------------------------------------------------------------
+
+def test_run23_patch_prompts():
+  print("run-23 measured patches in the routing worker prompt (P0-1/P0-2/P1-1)")
+  session = FakeSession(21600)
+  session.instruction = "Route the cable tray, busway and chilled water in the data hall."
+  worker = serve.Agent(session, role="worker")
+  prompt = worker.system_prompt("")
+  # P0-1: the exact break table (names + distances).
+  check("stub table names the C01 drop and its break",
+        "CHW-Drop-CRAH-C01" in prompt and "323.7" in prompt, prompt)
+  check("stub table names the F03 drop and its break",
+        "CHW-Drop-CRAH-F03" in prompt and "318.7" in prompt, prompt)
+  check("stub rule: butt joint, main network untouched",
+        "对接" in prompt and "一律不许动" in prompt, prompt)
+  check("stub rule: verify each endpoint under 250 mm",
+        "<250 mm" in prompt, prompt)
+  # P0-2: the three D01 clash pairs with overlaps, whole-subgraph rule.
+  check("D01 trunk/feeder clash named with overlap",
+        "[54, 600, 127]" in prompt, prompt)
+  check("D01 tray-header/drop clash named with overlap",
+        "[168.3, 148.1, 127]" in prompt, prompt)
+  check("D01 branch clash named with the face it must end at",
+        "[168.3, 84.1, 168.3]" in prompt and "11291" in prompt, prompt)
+  check("D01 fixed as a whole, never one segment alone",
+        "整体改" in prompt and "禁止逐段改" in prompt, prompt)
+  check("feeder must not be shortened below 125 mm",
+        "125 mm" in prompt, prompt)
+  # P1-1: north deletion free, south kept, header cuts re-measured.
+  check("north perimeter deletion named with its saving",
+        "CHW-NorthPerimeter" in prompt and "24,916" in prompt, prompt)
+  check("south perimeter kept with its 4 bridged drops",
+        "CHW-SouthPerimeter" in prompt and "CHW-Drop-CRAH-01" in prompt,
+        prompt)
+  check("header cuts need a CONN re-measure at 80%",
+        "≥80%" in prompt, prompt)
+  # Mounting: after the length rules, routing workers only.
+  check("patches come after the length rules",
+        prompt.index("【长度优化硬规则") < prompt.index("第 23 轮已验证补丁"))
+  check("hard rules still lead the prompt",
+        prompt.startswith("【最高优先级硬规则"))
+  session2 = FakeSession(21600)
+  session2.instruction = "Design a steel frame."
+  worker2 = serve.Agent(session2, role="worker")
+  check("no run-23 patches without routing",
+        "第 23 轮已验证补丁" not in worker2.system_prompt(""))
+
+
+def test_layered_ranking():
+  print("layered best-model ranking: hard constraints first, defects "
+        "inside a layer (run 23)")
+  hard_pass = {"unit_ok": True, "ifc_ok": True, "frame_ok": True,
+               "clashes": 0, "max_components": 1, "rows_below_80": 0,
+               "components": {"tray": 1, "busway": 1, "chw": 1},
+               "length_mm": 500000}
+  check("hard-passing model is in layer 0 with 0 defects",
+        serve._hard_pass(hard_pass)
+        and serve._rank_key(hard_pass) == (0, 0), hard_pass)
+  failing_3_clashes = {**hard_pass, "clashes": 3, "length_mm": 300000}
+  check("3-clash model is in the failing layer",
+        not serve._hard_pass(failing_3_clashes)
+        and serve._rank_key(failing_3_clashes) == (1, 3),
+        failing_3_clashes)
+  # The layer outranks the defect score: a hard-passing model beats a
+  # failing one even when the failing one is shorter.
+  check("hard-pass beats failing despite a longer route",
+        not serve._is_regression(failing_3_clashes, hard_pass))
+  check("failing is a regression from hard-pass despite a shorter route",
+        serve._is_regression(hard_pass, failing_3_clashes))
+  # A failing model with 0 defects (unit flipped) is still a regression
+  # from a hard-passing model — the old defect-only rule called this a
+  # tie and let the longer route decide.
+  unit_failed = {**hard_pass, "unit_ok": False}
+  check("unit failure outranks the length tie-break",
+        serve._is_regression(hard_pass, unit_failed))
+  # Inside one layer the defect score still decides, so the run-15 and
+  # run-12 calibrations keep their verdicts (both models sit in the
+  # failing layer).
+  run15_prev = {"unit_ok": True, "ifc_ok": True, "frame_ok": True,
+                "clashes": 92, "max_components": 2, "rows_below_80": 0,
+                "components": {"tray": 1, "busway": 1, "chw": 2}}
+  run15_cur = {"unit_ok": True, "ifc_ok": True, "frame_ok": True,
+               "clashes": 113, "max_components": 1, "rows_below_80": 0,
+               "components": {"tray": 1, "busway": 1, "chw": 1}}
+  check("run-15 still accepted (117 -> 113, same layer)",
+        serve._rank_key(run15_prev) == (1, 117)
+        and serve._rank_key(run15_cur) == (1, 113)
+        and not serve._is_regression(run15_prev, run15_cur))
+  run12_prev = {"unit_ok": True, "ifc_ok": True, "frame_ok": True,
+                "clashes": 92, "max_components": 4, "rows_below_80": 0,
+                "components": {"tray": 1, "busway": 1, "chw": 4}}
+  run12_cur = {"unit_ok": True, "ifc_ok": True, "frame_ok": True,
+               "clashes": 0, "max_components": 8, "rows_below_80": 0,
+               "components": {"tray": 7, "busway": 1, "chw": 8}}
+  check("run-12 still reverts (167 -> 325, same layer)",
+        serve._rank_key(run12_prev) == (1, 167)
+        and serve._rank_key(run12_cur) == (1, 325)
+        and serve._is_regression(run12_prev, run12_cur))
+  # Clashes and connectivity stay combined in the defect score inside a
+  # layer: 0 clashes / 7 components (defects 150) is worse than 3
+  # clashes / 1 component (defects 3) — the literal "clashes before
+  # connectivity" order would flip this.
+  many_components = {**hard_pass, "clashes": 0, "max_components": 7,
+                     "components": {"tray": 1, "busway": 1, "chw": 7}}
+  check("0 clashes / 7 components is worse than 3 clashes / 1 component",
+        serve._is_regression(failing_3_clashes, many_components))
+
+
+async def test_track_best_layered():
+  print("track_best prefers a hard-passing model over a failing one with "
+        "a lower defect score (run 23)")
+  session = FakeSession(21600)
+  worker = FakeAgent(session, role="worker")
+  # Failing model, 0 defects (unit flipped), shorter route.
+  failing = {"unit_ok": False, "ifc_ok": True, "frame_ok": True,
+             "clashes": 0, "max_components": 1, "rows_below_80": 0,
+             "components": {"tray": 1, "busway": 1, "chw": 1},
+             "length_mm": 300000}
+  # Hard-passing model, 0 defects, longer route.
+  passing = {"unit_ok": True, "ifc_ok": True, "frame_ok": True,
+             "clashes": 0, "max_components": 1, "rows_below_80": 0,
+             "components": {"tray": 1, "busway": 1, "chw": 1},
+             "length_mm": 500000}
+  best = await serve._track_best(worker, failing, None)
+  check("failing model becomes best first", best == failing, best)
+  best = await serve._track_best(worker, passing, best)
+  check("hard-passing model replaces it despite the longer route",
+        best == passing, best)
+  best = await serve._track_best(worker, failing, best)
+  check("failing model never replaces the hard-passing best",
+        best == passing, best)
+
+
+def test_correct_summary_blanket_claim():
+  print("final-message correction catches blanket hard-constraint claims "
+        "(run 23)")
+  verdict = ("Unit gate: no failures reported\n"
+             "IFC gate: no failures reported\n"
+             "Separation gate: FAIL — 3 clashes\n"
+             "Connectivity gate: FAIL — chw: 7 disconnected components")
+  # Run 22's exact failure: "硬约束已通过" while SEP and CONN both FAIL.
+  summary = ("硬约束已通过，模型满足全部要求。\n\nDeterministic gates:\n"
+             + verdict)
+  corrected = serve._correct_summary(summary, verdict)
+  check("blanket claim corrected",
+        "\n\nCORRECTION:" in corrected
+        and "硬约束已通过" in corrected, corrected)
+  check("failing gate lines quoted",
+        "Separation gate: FAIL" in corrected
+        and "Connectivity gate: FAIL" in corrected, corrected)
+  # The English form is caught too.
+  english = ("All hard constraints passed.\n\nDeterministic gates:\n"
+             + verdict)
+  check("english blanket claim corrected",
+        "\n\nCORRECTION:" in serve._correct_summary(english, verdict)
+        and "All hard constraints passed." in
+        serve._correct_summary(english, verdict),
+        serve._correct_summary(english, verdict))
+  # A clean verdict needs no correction even with the blanket claim.
+  clean = ("Unit gate: no failures reported\n"
+           "IFC gate: no failures reported\n"
+           "Separation gate: no failures reported\n"
+           "Connectivity gate: no failures reported")
+  check("clean verdict unchanged",
+        serve._correct_summary("硬约束已通过。", clean) == "硬约束已通过。")
+  # An explicit negation is honest, not a claim.
+  negated = ("硬约束未通过，仍需修复。\n\nDeterministic gates:\n" + verdict)
+  check("negated claim left alone",
+        serve._correct_summary(negated, verdict) == negated,
+        serve._correct_summary(negated, verdict))
+
+
+def test_gate_verdict_unmeasured():
+  print("gate verdict reports unmeasured gates as 未验证, never as passed "
+        "(run 23)")
+  verdict = serve._gate_verdict_lines(
+      "", "", "", "", True, scores=None,
+      measured={"Unit": False, "IFC": False, "Separation": False,
+                "Connectivity": False})
+  check("every gate is 未验证 when nothing measured",
+        verdict.count("未验证") == 4, verdict)
+  check("no gate claims no failures reported",
+        "no failures reported" not in verdict, verdict)
+  partial = serve._gate_verdict_lines(
+      "", "", "", "", True,
+      scores={"clashes": 0, "segments": {}, "lengths_mm": {},
+              "length_mm": 0, "name_fallback": 0},
+      measured={"Unit": True, "IFC": True, "Separation": True,
+                "Connectivity": False})
+  check("measured gates report normally, unmeasured is 未验证",
+        "Separation gate: PASS" in partial
+        and "Connectivity gate: 未验证" in partial, partial)
+  # A failing gate is never masked as 未验证: gaps win over the map.
+  failing = serve._gate_verdict_lines(
+      "", "", "SEP FAIL: 3 clashes", "", True, scores=None,
+      measured={"Unit": True, "IFC": True, "Separation": False,
+                "Connectivity": True})
+  check("a failing gate still reports FAIL",
+        "Separation gate: FAIL" in failing, failing)
+  # Without the measured map the old behaviour is unchanged.
+  old = serve._gate_verdict_lines("", "", "", "", True)
+  check("no measured map keeps the old wording",
+        old.count("no failures reported") == 4, old)
+  # Non-routing tasks: SEP/CONN stay not applicable, Unit/IFC 未验证.
+  nonrouting = serve._gate_verdict_lines(
+      "", "", "", "", False, scores=None,
+      measured={"Unit": False, "IFC": False, "Separation": False,
+                "Connectivity": False})
+  check("non-routing gates stay not applicable",
+        "Separation gate: not applicable" in nonrouting
+        and "Connectivity gate: not applicable" in nonrouting
+        and "Unit gate: 未验证" in nonrouting, nonrouting)
+
+
+async def test_file_hashes_binding():
+  print("gate measurements are bound to the solution.py / model.ifc "
+        "hashes (run 23)")
+  session = FakeSession(21600)
+  session.instruction = "Route the cable tray, busway and chilled water."
+  worker = FakeAgent(session, role="worker")
+  hashes = await serve._file_hashes(worker)
+  check("solution.py hash is the stable fake hash",
+        hashes == {"solution.py": "a" * 64, "model.ifc": "b" * 64}, hashes)
+  line = serve._hash_binding_line(hashes)
+  check("binding line quotes both truncated hashes",
+        "aaaaaaaaaaaa" in line and "bbbbbbbbbb" in line, line)
+  FakeAgent.reset(bash_outputs=[*_clean_gate_outputs(461817)])
+  gaps, verdict, scores, bound = await serve._measure_gates(
+      worker, True)
+  check("measured scores are the gate scores",
+        scores is not None and scores.get("length_mm") == 461817, scores)
+  check("verdict carries the binding line",
+        "Measurement bound to solution.py sha256 aaaaaaaaaaaa" in verdict
+        and "model.ifc sha256 bbbbbbbbbbbb" in verdict, verdict)
+  check("binding returns the same hashes",
+        bound == hashes, bound)
+
+
+async def test_stale_measurement_remeasures():
+  print("final hash check regenerates and re-measures when the files "
+        "changed since the last gate run (run 23)")
+  import json
+  session = FakeSession(21600)
+  session.instruction = "Route the cable tray, busway and chilled water."
+  session.files["ground_truth.json"] = json.dumps(
+      _smoke_task_ground_truth()).encode()
+
+  def clean_split(tray_mm, busway_mm, chw_mm):
+    """Canned all-pass gate outputs with per-service lengths, so the
+    verdict quotes the total (same shape as
+    test_final_message_carries_post_round_numbers)."""
+    unit_pass = (
+        "exit code 0\nUNIT output/model.ifc: scale x1.000,"
+        " millimetre unit declared: True\n"
+        "UNIT_GATE: PASS (1 file(s), scale x1.0, millimetre units)")
+    ifc_pass = "exit code 0\nIFC_GATE: PASS (1 file(s), 0 EXPRESS violations)"
+    sep_pass = "exit code 0\nSEP collisions: 0\nSEP_GATE: PASS"
+    conn_pass = (
+        "exit code 0\nCONN tray: 1 connected component(s)\n"
+        "CONN busway: 1 connected component(s)\n"
+        "CONN chw: 1 connected component(s)\n"
+        f"CONN tray: 1 segment(s), {tray_mm} mm total\n"
+        f"CONN busway: 1 segment(s), {busway_mm} mm total\n"
+        f"CONN chw: 1 segment(s), {chw_mm} mm total\n"
+        f"CONN total: {tray_mm + busway_mm + chw_mm} mm routed\n"
+        "CONN_GATE: PASS")
+    return [unit_pass, ifc_pass, sep_pass, conn_pass]
+
+  # Hashes in call order: measurement (A), final check (B, different),
+  # re-measurement (C). The re-measurement's numbers must be the ones
+  # quoted in the final report.
+  FakeAgent.reset(
+      scripts={
+          "worker": ["worker summary"],
+          "verifier": ["PASS"],
+      },
+      bash_outputs=[
+          # Round 1: clean gates, route 350,000 mm (ratio 1.343 — no
+          # length round, so the verifier PASS ends the loop).
+          *clean_split(150000, 100000, 100000),
+          # Re-measurement after the hash change: 340,000 mm.
+          *clean_split(140000, 100000, 100000),
+      ],
+      file_hashes=["a" * 64, "b" * 64,
+                   "c" * 64, "d" * 64,
+                   "e" * 64, "f" * 64],
+  )
+  real = serve.Agent
+  serve.Agent = FakeAgent
+  try:
+    result = await serve.solve(session)
+  finally:
+    serve.Agent = real
+  check("final message quotes the re-measured total, not round 1",
+        "total 340000 mm" in result and "350000" not in result,
+        repr(result))
+  check("final message binds the re-measurement to the new hashes",
+        "solution.py sha256 eeeeeeeeeeee" in result
+        and "model.ifc sha256 ffffffffffff" in result, repr(result))
+  check("exactly one verdict section, the latest",
+        result.count("Deterministic gates:") == 1, repr(result))
+
+
+def _run23_conn_gate_fixture(segments, predefined=None):
+  """Runs the CONN gate on a small synthetic model built by
+  _build_test_ifc; `predefined` maps a segment name to a PredefinedType
+  to set after the build. Returns the gate's stdout+stderr."""
+  import json
+  import subprocess
+  import tempfile
+  with tempfile.TemporaryDirectory() as tmp:
+    outdir = os.path.join(tmp, "good", "output")
+    os.makedirs(outdir)
+    _build_test_ifc(os.path.join(outdir, "model.ifc"), segments)
+    if predefined:
+      import ifcopenshell
+      model = ifcopenshell.open(os.path.join(outdir, "model.ifc"))
+      for product in model.by_type("IfcFlowSegment"):
+        if product.Name in predefined:
+          product.PredefinedType = predefined[product.Name]
+      model.write(os.path.join(outdir, "model.ifc"))
+    json.dump({
+        'entry': [200, 3360, 0],
+        'rows': [{'name': 'A', 'start': [1100, 3360, 0], 'end': [2000, 3360, 0]}],
+        'crahs': [],
+    }, open(os.path.join(tmp, "good", "ground_truth.json"), "w"))
+    script = os.path.join(tmp, "conn_gate.py")
+    with open(script, "w") as f:
+      f.write(serve.CONN_GATE_SCRIPT)
+    r = subprocess.run([sys.executable, script], cwd=os.path.join(tmp, "good"),
+                       capture_output=True, text=True)
+    return r.stdout + r.stderr
+
+
+def _run23_good_segments():
+  """One connected segment per service plus a drop (the shape of
+  test_conn_gate_total_length's good model, without its ground-truth
+  rows beyond A)."""
+  return [
+      ('IfcCableCarrierSegment', 'CableTray-1', 1800, 600, 300, 1100, 3360, 2600, 'CableTray'),
+      ('IfcCableCarrierSegment', 'CableTray-2', 600, 1640, 300, 2000, 4180, 2600, 'CableTray'),
+      ('IfcCableCarrierSegment', 'Busway-1', 1800, 600, 300, 1100, 3960, 2600, 'Busway'),
+      ('IfcCableCarrierSegment', 'Busway-2', 600, 1640, 300, 2000, 4780, 2600, 'Busway'),
+      ('IfcPipeSegment', 'CHW-1', 1800, 600, 300, 1100, 2760, 2600, 'CHW'),
+      ('IfcPipeSegment', 'CHW-2', 600, 2240, 300, 2000, 3880, 2600, 'CHW'),
+      ('IfcPipeSegment', 'CHW-Drop-1', 300, 300, 1600, 2000, 5000, 1000, 'CHW'),
+  ]
+
+
+def test_conn_gate_predefined_warning():
+  print("triple-consistency warning: silent when PredefinedType agrees or "
+        "is unset, fires on conflict, never changes classification (run 23)")
+  try:
+    import ifcopenshell  # noqa: F401
+  except ImportError:
+    print("  skipped: ifcopenshell not installed")
+    return
+  segs = _run23_good_segments()
+  out = _run23_conn_gate_fixture(segs)
+  check("no warning when PredefinedType is unset (all current models)",
+        "PredefinedType" not in out, out)
+  check("unset model passes CONN", "CONN_GATE: PASS" in out, out)
+  # Agreeing PredefinedType: tray segment, CABLETRAYSEGMENT. Silent.
+  out = _run23_conn_gate_fixture(
+      segs, predefined={"CableTray-1": "CABLETRAYSEGMENT"})
+  check("no warning when PredefinedType agrees with ObjectType",
+        "PredefinedType" not in out, out)
+  check("agreeing model passes CONN", "CONN_GATE: PASS" in out, out)
+  # Conflicting PredefinedType: busway segment carrying the tray enum.
+  # (ifcopenshell enforces the enum per entity class, so a cross-enum
+  # value like BUSBARSEGMENT cannot be written through the API; the
+  # realistic conflict is a same-enum value naming the other service.)
+  out = _run23_conn_gate_fixture(
+      segs, predefined={"Busway-1": "CABLETRAYSEGMENT"})
+  check("conflicting PredefinedType warns",
+        "CONN WARNING:" in out
+        and "PredefinedType CABLETRAYSEGMENT" in out
+        and "classified as busway" in out, out)
+  check("warning does not change classification: busway still counted",
+        "CONN busway: 2 segment(s)" in out, out)
+  check("warning does not fail the gate",
+        "CONN_GATE: PASS" in out, out)
+
+
+def test_conn_gate_run22_fixture():
+  print("gates on the real run-22 model: SEP 3 / CONN FAIL (7 CHW "
+        "networks); the run-23 P0 patch measures SEP 0 / CONN PASS "
+        "(1 network)")
+  try:
+    import ifcopenshell  # noqa: F401
+  except ImportError:
+    print("  skipped: ifcopenshell not installed")
+    return
+  import shutil
+  import subprocess
+  import tempfile
+
+  def run_gate(workdir, name):
+    script = os.path.join(workdir, name)
+    with open(script, "w") as f:
+      f.write(serve.SEP_GATE_SCRIPT if name == "sep_gate.py"
+              else serve.CONN_GATE_SCRIPT)
+    r = subprocess.run([sys.executable, script], cwd=workdir,
+                       capture_output=True, text=True)
+    return r.stdout + r.stderr
+
+  base = os.path.join(
+      os.path.dirname(os.path.abspath(__file__)), "fixtures")
+  with tempfile.TemporaryDirectory() as tmp:
+    workdir = os.path.join(tmp, "run22")
+    shutil.copytree(os.path.join(base, "run22-model"), workdir)
+    sep_out = run_gate(workdir, "sep_gate.py")
+    check("unpatched run-22 model has 3 clashes",
+          "SEP collisions: 3" in sep_out, sep_out)
+    check("unpatched run-22 model fails SEP",
+          "SEP_GATE: FAIL" in sep_out, sep_out)
+    conn_out = run_gate(workdir, "conn_gate.py")
+    check("unpatched run-22 model fails CONN",
+          "CONN_GATE: FAIL" in conn_out, conn_out)
+    check("unpatched run-22 CHW has 7 components",
+          "CONN chw: 7 connected component(s)" in conn_out, conn_out)
+    check("unpatched run-22 total is 459806 mm",
+          "CONN total: 459806 mm routed" in conn_out, conn_out)
+    patched = os.path.join(tmp, "run22-patched")
+    shutil.copytree(os.path.join(base, "run22-model-patched"), patched)
+    sep_out = run_gate(patched, "sep_gate.py")
+    check("P0-patched model has 0 clashes",
+          "SEP collisions: 0" in sep_out, sep_out)
+    check("P0-patched model passes SEP",
+          "SEP_GATE: PASS" in sep_out, sep_out)
+    conn_out = run_gate(patched, "conn_gate.py")
+    check("P0-patched model passes CONN",
+          "CONN_GATE: PASS" in conn_out, conn_out)
+    check("P0-patched CHW has 1 component",
+          "CONN chw: 1 connected component(s)" in conn_out, conn_out)
+    check("P0-patched total is 461817 mm",
+          "CONN total: 461817 mm routed" in conn_out, conn_out)
+
+
 async def main():
   await test_long_task_pass_first_try()
   await test_gaps_then_fix_then_pass()
@@ -4335,6 +4860,15 @@ async def main():
   await test_length_round_reverts_on_regression()
   await test_length_round_at_final_gate_pass()
   await test_fix_round_prompt_revert_rule()
+  test_run23_patch_prompts()
+  test_layered_ranking()
+  await test_track_best_layered()
+  test_correct_summary_blanket_claim()
+  test_gate_verdict_unmeasured()
+  await test_file_hashes_binding()
+  await test_stale_measurement_remeasures()
+  test_conn_gate_predefined_warning()
+  test_conn_gate_run22_fixture()
   print("ALL TESTS PASSED")
 
 
