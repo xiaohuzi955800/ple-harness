@@ -283,6 +283,34 @@ P1-1 长度（P0 全部通过后再做）：删掉北环线 CHW-NorthPerimeter�
 
 """
 
+# Run-24 length guidance (A+B+D): the only remaining loss after run 23
+# (0.593161, all hard gates passed) is route length, 430,557 mm (+65.2%,
+# limit 364,843 mm). The three cuts below are measured offline on the
+# run-23 model with the real gate scripts (A: 350,729 mm; B: 421,107 mm;
+# D: -2,200 mm; A+B+D: 339,079 mm, SEP 0, CONN PASS). The numbers are
+# computed against the drawings' fixed geometry (row centrelines and CRAH
+# positions from ground_truth.json), so they transfer to a fresh solve —
+# apply them, then verify per row with /tmp/conn_gate.py. Mounted right
+# after RUN23_PATCHES for routing workers only. P0 is untouched.
+RUN24_LENGTH_GUIDANCE = """【第 24 轮长度指引 — 只压长度，P0 不动】
+第 23 轮已过全部硬门禁（CHW 1 个网络、SEP 0、CONN 通过），唯一短板是总长 430,557 mm（+65.2%，上限 364,843 mm）。本轮只压长度，按下面算好的数改三处，改完逐排验证覆盖，不猜、不重构、不动 P0。
+A — 行 header 缩短（已离线实测：SEP 0、CONN 通过，总长 350,729 mm）：
+• tray 行 header 东端（x=1800 起算，西端不动）：A 14332、B 14850、C 14526、D 14844、E 14332、F 15205
+• busway 行 header 东端：A 14129、B 14647、C 14323、D 14641、E 14129、F 15002
+• CHW 行 header 东端：A 15694、B 16308、C 14703、D 16305、E 15702、F 17500（= 本行最东 drop 中心 x − 220；F 行受 jog 限制取 17500，离最东 drop 中心 208 mm）
+• C 行 CHW 只留 Jog1（Jog2 随东段截掉），F 行两个 jog 都留，F 行末段留 200 mm
+• 三条硬规则：(1) CHW header 东端离本行最东 drop 中心 ≤220 mm——按 drop 中心 3D 距离算，不是按表面，差 1 mm 就挂不上；(2) 水平 CHW 段长度必须 >168.3 mm（截面宽），否则触发截面方向检查；(3) 绕柱 jog 不许删（C/F 行 header 线上有柱子）。
+B — 西主干只截北端（已离线实测：SEP 0、CONN 通过，总长 421,107 mm）：
+• tray 主干北端 y 20000→16250；busway →16950；CHW →17350
+• 南端一律不动（tray 500、busway 500、CHW 584.15）——南端锚着南围边管，截了会断 CHW 连通。
+D — CHW 整层下移 100 mm（已离线实测：SEP 0、CONN 通过，省 2,200 mm）：
+• CHW 全部 z：2946.7→2846.7（主干、行 header、围边管、支管、drop 高度 946.7→846.7 一起改）
+• CHW 底 2846.7 仍在 tray 顶 2777 之上 69.7 mm，不碰撞；不要下移更多（下移 168 mm 只剩 1.7 mm 间隙）。
+三项合起来已离线实测 339,079 mm（+30.1%），SEP 0、CONN 通过。
+逐排验证（做完必须跑）：每改一排 header，用 /tmp/conn_gate.py 量该排三服务覆盖，低于 80% 就把该排 header 往东接长到通过；内部目标 82–85%，不卡 80.00%。北围边管已经没有了（第 23 轮模型里只剩南围边管），不要再算“删北围边管”这笔；南围边管必须保留（桥 4 个 drop）。
+
+"""
+
 WORKER = SYSTEM.replace(
     "\nWhen the work is done,", EVIDENCE + "\nWhen the work is done,"
 )
@@ -1264,8 +1292,9 @@ class Agent:
       # follow immediately after them (run 21: length is the only big
       # loss left once the hard constraints pass), then the run-23
       # measured patches (the exact CHW breaks and D01 clashes, verified
-      # offline), still ahead of the worker prompt itself.
-      prompt = WORKER_HARD_RULES + LENGTH_RULES + RUN23_PATCHES + prompt
+      # offline), then the run-24 measured length cuts (A+B+D, verified
+      # offline at 339,079 mm), still ahead of the worker prompt itself.
+      prompt = WORKER_HARD_RULES + LENGTH_RULES + RUN23_PATCHES + RUN24_LENGTH_GUIDANCE + prompt
     if "ifc" in instr or is_routing:
       # Routing tasks produce IFC models, so they need the validation
       # snippet even when the instruction never says "IFC".

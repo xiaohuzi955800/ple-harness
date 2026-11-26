@@ -4383,6 +4383,114 @@ def test_run23_patch_prompts():
         "第 23 轮已验证补丁" not in worker2.system_prompt(""))
 
 
+def test_run24_length_guidance():
+  print("run-24 length guidance in the routing worker prompt (A+B+D)")
+  session = FakeSession(21600)
+  session.instruction = "Route the cable tray, busway and chilled water in the data hall."
+  worker = serve.Agent(session, role="worker")
+  prompt = worker.system_prompt("")
+  # A: the header east-end table (computed, measured offline).
+  check("A tray east ends named",
+        "A 14332" in prompt and "F 15205" in prompt, prompt)
+  check("A busway east ends named",
+        "A 14129" in prompt and "F 15002" in prompt, prompt)
+  check("A CHW east ends named with the 220 mm rule",
+        "A 15694" in prompt and "F 17500" in prompt
+        and "≤220 mm" in prompt, prompt)
+  check("A jog rules: C keeps Jog1 only, F keeps both, 200 mm end piece",
+        "只留 Jog1" in prompt and "两个 jog 都留" in prompt
+        and "末段留 200 mm" in prompt, prompt)
+  # The three hard rules of A.
+  check("A rule 1: drop-centre 3D distance, not the face",
+        "按 drop 中心 3D 距离算" in prompt, prompt)
+  check("A rule 2: horizontal CHW segment longer than 168.3 mm",
+        ">168.3 mm" in prompt, prompt)
+  check("A rule 3: column jogs must not be deleted",
+        "绕柱 jog 不许删" in prompt, prompt)
+  # B: north-end trims only, south ends frozen.
+  check("B trunk north ends named",
+        "16250" in prompt and "16950" in prompt and "17350" in prompt,
+        prompt)
+  check("B south ends frozen with the reason",
+        "南端一律不动" in prompt and "南围边管" in prompt, prompt)
+  # D: CHW layer lowered 100 mm, with the clearance arithmetic.
+  check("D CHW z lowered to 2846.7 with drop heights",
+        "2946.7→2846.7" in prompt and "946.7→846.7" in prompt, prompt)
+  check("D clearance over the tray top quoted",
+        "69.7 mm" in prompt and "2777" in prompt, prompt)
+  # Combined measured result and the per-row verification rule.
+  check("A+B+D combined measured total quoted",
+        "339,079 mm" in prompt, prompt)
+  check("per-row verification: re-measure, lengthen east on failure",
+        "往东接长到通过" in prompt and "82–85%" in prompt, prompt)
+  # The north-perimeter correction: already gone, never counted again.
+  check("north perimeter already gone, not counted again",
+        "北围边管已经没有了" in prompt, prompt)
+  check("south perimeter kept with its 4 bridged drops",
+        "南围边管必须保留" in prompt and "桥 4 个 drop" in prompt, prompt)
+  # Mounting: after the run-23 patches, routing workers only, and the
+  # verifier (which re-runs the gates) does not get worker guidance.
+  check("guidance comes after the run-23 patches",
+        prompt.index("第 23 轮已验证补丁") < prompt.index("第 24 轮长度指引"))
+  check("hard rules still lead the prompt",
+        prompt.startswith("【最高优先级硬规则"))
+  session2 = FakeSession(21600)
+  session2.instruction = "Design a steel frame."
+  worker2 = serve.Agent(session2, role="worker")
+  check("no run-24 guidance without routing",
+        "第 24 轮长度指引" not in worker2.system_prompt(""))
+  verifier = serve.Agent(session, role="verifier")
+  check("verifier does not get worker length guidance",
+        "第 24 轮长度指引" not in verifier.system_prompt(""))
+
+
+def test_run24_offline_variants():
+  print("run-24 offline variants measured with the real gates (A/B/D)")
+  try:
+    import ifcopenshell  # noqa: F401
+  except ImportError:
+    print("  skipped: ifcopenshell not installed")
+    return
+  import re
+  import shutil
+  import subprocess
+  import tempfile
+
+  fixtures = os.path.join(os.path.dirname(__file__), "fixtures")
+  cases = [("solution_A3.py", 350729), ("solution_Bn.py", 421107),
+           ("solution_ABD.py", 339079), ("solution_D.py", 428357)]
+  for fname, expected_total in cases:
+    with tempfile.TemporaryDirectory() as tmp:
+      outdir = os.path.join(tmp, "output")
+      os.makedirs(outdir)
+      shutil.copy(os.path.join(fixtures, "run24-ground-truth.json"),
+                  os.path.join(tmp, "ground_truth.json"))
+      r = subprocess.run(
+          [sys.executable, os.path.join(fixtures, "run24-variants", fname),
+           os.path.join(outdir, "model.ifc")],
+          cwd=tmp, capture_output=True, text=True)
+      check(f"{fname} regenerates cleanly", r.returncode == 0,
+            (r.stdout + r.stderr)[-500:])
+      for gate_name, script_attr in (("sep", "SEP_GATE_SCRIPT"),
+                                     ("conn", "CONN_GATE_SCRIPT")):
+        script = os.path.join(tmp, gate_name + "_gate.py")
+        with open(script, "w") as f:
+          f.write(getattr(serve, script_attr))
+        g = subprocess.run([sys.executable, script], cwd=tmp,
+                           capture_output=True, text=True)
+        out = g.stdout + g.stderr
+        if gate_name == "sep":
+          check(f"{fname} SEP 0 collisions", "SEP collisions: 0" in out, out)
+          check(f"{fname} SEP passes", "SEP_GATE: PASS" in out, out)
+        else:
+          check(f"{fname} CONN passes", "CONN_GATE: PASS" in out, out)
+          check(f"{fname} total {expected_total} mm",
+                f"CONN total: {expected_total} mm routed" in out, out)
+          covs = [int(m) for m in re.findall(r"coverage (\d+)%", out)]
+          check(f"{fname} every row >= 80% (min {min(covs) if covs else '?'})",
+                covs and min(covs) >= 80, out)
+
+
 def test_layered_ranking():
   print("layered best-model ranking: hard constraints first, defects "
         "inside a layer (run 23)")
@@ -4861,6 +4969,8 @@ async def main():
   await test_length_round_at_final_gate_pass()
   await test_fix_round_prompt_revert_rule()
   test_run23_patch_prompts()
+  test_run24_length_guidance()
+  test_run24_offline_variants()
   test_layered_ranking()
   await test_track_best_layered()
   test_correct_summary_blanket_claim()
