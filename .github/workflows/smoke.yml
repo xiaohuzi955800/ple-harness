@@ -16,7 +16,20 @@
 # and lives outside the repo; nothing in the job echoes it.
 #
 # Cost: one smoke run is roughly 30–90 min of the free 2000 Linux
-# minutes/month on lin's GitHub account.
+# minutes/month on lin's GitHub account. Infra retries (below) can add
+# up to ~40 min on a bad day.
+#
+# Infra retry (2026-11-27, after 3 consecutive infra failures: 2x kit
+# git clone 300 s timeouts + 1x runner lost communication): the kit's
+# _stage_git does a local `git clone --no-checkout` of the submission
+# repo with a hard 300 s timeout (kit/artifacts.py GIT_SEC = 300, not
+# configurable). When the runner's git transport hangs, both the kit
+# check step and the eval step fail with "git clone took longer than
+# 300 s". The two steps below retry ONLY on that exact error (up to 2
+# retries, 300 s wait between attempts). Any other failure — including
+# agent failures — fails immediately with no retry. Runner loss kills
+# the whole job and cannot be retried in-workflow; that still needs a
+# manual re-dispatch.
 name: PLE smoke test
 
 on:
@@ -63,17 +76,50 @@ jobs:
         # With a local gemini/ model_api this never reports "ready to
         # submit" — that is expected. It still builds the serve image
         # and smoke-tests the harness, which is what we want here.
+        # Retries ONLY on the kit git clone timeout (see header comment).
         continue-on-error: true
         run: |
+          set +e
           cd kit
-          "$HOME/.local/bin/uv" run python -m kit check ../ --env-file "$RUNNER_TEMP/local.env"
+          attempt=1
+          max_attempts=3
+          while [ "$attempt" -le "$max_attempts" ]; do
+            echo "=== kit check attempt $attempt/$max_attempts ==="
+            "$HOME/.local/bin/uv" run python -m kit check ../ --env-file "$RUNNER_TEMP/local.env" 2>&1 | tee /tmp/kit-check.log
+            rc="${PIPESTATUS[0]}"
+            if [ "$rc" -eq 0 ]; then exit 0; fi
+            if grep -q "git clone took longer than 300" /tmp/kit-check.log && [ "$attempt" -lt "$max_attempts" ]; then
+              echo "kit git clone timeout detected (attempt $attempt), waiting 300s before retry..."
+              sleep 300
+              attempt=$((attempt + 1))
+            else
+              exit "$rc"
+            fi
+          done
 
       - name: Run one dev task
+        # Retries ONLY on the kit git clone timeout (see header comment).
+        # Agent failures fail immediately with no retry.
         run: |
+          set +e
           cd kit
-          "$HOME/.local/bin/uv" run python eval/run.py ../ \
-            --tasks '${{ inputs.task }}' \
-            --env-file "$RUNNER_TEMP/local.env" --trials 1 --out "$RUNNER_TEMP/runs/smoke"
+          attempt=1
+          max_attempts=3
+          while [ "$attempt" -le "$max_attempts" ]; do
+            echo "=== eval attempt $attempt/$max_attempts ==="
+            "$HOME/.local/bin/uv" run python eval/run.py ../ \
+              --tasks '${{ inputs.task }}' \
+              --env-file "$RUNNER_TEMP/local.env" --trials 1 --out "$RUNNER_TEMP/runs/smoke" 2>&1 | tee /tmp/eval.log
+            rc="${PIPESTATUS[0]}"
+            if [ "$rc" -eq 0 ]; then exit 0; fi
+            if grep -q "git clone took longer than 300" /tmp/eval.log && [ "$attempt" -lt "$max_attempts" ]; then
+              echo "kit git clone timeout detected (attempt $attempt), waiting 300s before retry..."
+              sleep 300
+              attempt=$((attempt + 1))
+            else
+              exit "$rc"
+            fi
+          done
 
       - name: Restore submission.yaml
         if: always()
