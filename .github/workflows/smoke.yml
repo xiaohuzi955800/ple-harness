@@ -19,17 +19,20 @@
 # minutes/month on lin's GitHub account. Infra retries (below) can add
 # up to ~40 min on a bad day.
 #
-# Infra retry (2026-11-27, after 3 consecutive infra failures: 2x kit
-# git clone 300 s timeouts + 1x runner lost communication): the kit's
-# _stage_git does a local `git clone --no-checkout` of the submission
-# repo with a hard 300 s timeout (kit/artifacts.py GIT_SEC = 300, not
-# configurable). When the runner's git transport hangs, both the kit
-# check step and the eval step fail with "git clone took longer than
-# 300 s". The two steps below retry ONLY on that exact error (up to 2
-# retries, 300 s wait between attempts). Any other failure — including
-# agent failures — fails immediately with no retry. Runner loss kills
-# the whole job and cannot be retried in-workflow; that still needs a
-# manual re-dispatch.
+# Root cause (2026-11-27, found by investigation run25-infra-investigation-2):
+# actions/checkout@v4 defaults to a depth-1 SHALLOW clone, and the kit's
+# _stage_git then runs `git clone --no-checkout --filter=blob:none` against
+# that shallow source. Git answers with a recursive fetch cascade (each
+# nested fetch spawns another fetch, each warning "filtering not recognized
+# by server, ignoring") that never finishes; the kit's hard 300 s timeout
+# (kit/artifacts.py GIT_SEC = 300) is what kills it. Evidence: the files
+# step took 91 s (run 6) -> 285 s (run 23) -> 301 s (runs 24, 25, 25c);
+# locally, the staged clone from a shallow source hangs (kit's own
+# git_output: timeout at 20 s) while from a full source it takes 0.5 s.
+# Fix: fetch-depth 0 (full clone) below — the staged clone from a full
+# source takes <1 s. The 60 s probe step is the fail-fast guard for any
+# future clone hang; retries are a safety net only (max 1 per stage).
+# Runner loss kills the whole job and cannot be retried in-workflow.
 name: PLE smoke test
 
 on:
@@ -50,6 +53,11 @@ jobs:
     timeout-minutes: 360
     steps:
       - uses: actions/checkout@v4
+        # Full clone on purpose: a depth-1 shallow checkout makes the kit's
+        # _stage_git staged clone hang forever (recursive fetch cascade).
+        # The repo is ~3 MB / 28 commits; a full clone costs <1 s.
+        with:
+          fetch-depth: 0
 
       - name: Clone the official kit
         run: git clone --depth 1 https://github.com/google-research/ple kit
@@ -72,25 +80,57 @@ jobs:
           printf 'HF_TOKEN=%s\n' '${{ secrets.HF_TOKEN }}' >> "$RUNNER_TEMP/local.env"
           chmod 600 "$RUNNER_TEMP/local.env"
 
+      - name: Probe git clone health (60 s fail-fast)
+        # Same job, before kit check: a probe in a separate job would land
+        # on another runner and prove nothing about this runner. Runs the
+        # kit's exact staged-clone command against the checkout; healthy
+        # takes <1 s, so 60 s is a 60-120x margin. On failure the job
+        # stops here instead of burning 300 s x 3 in kit check.
+        run: |
+          set +e
+          export LC_ALL=C GIT_TERMINAL_PROMPT=0 GIT_OPTIONAL_LOCKS=0
+          probe_dir="$(mktemp -d "$RUNNER_TEMP/probe-staged-XXXXXX")"
+          timeout -s KILL 60 git clone --no-checkout --no-local \
+            --config=remote.origin.fetch=+refs/remotes/origin/*:refs/remotes/github/* \
+            --filter=blob:none \
+            --upload-pack="git -c uploadpack.allowFilter=true upload-pack" \
+            -- "$GITHUB_WORKSPACE" "$probe_dir/staged" 2>&1 | tee "$RUNNER_TEMP/probe-staged.log"
+          rc="${PIPESTATUS[0]}"
+          rm -rf "$probe_dir"
+          if [ "$rc" -ne 0 ]; then
+            echo "git clone probe failed (rc=$rc) — runner git cannot clone the staged tree; failing fast before kit check."
+            exit "$rc"
+          fi
+          echo "git clone probe OK"
+
       - name: kit check (build + smoke-test the harness)
         # With a local gemini/ model_api this never reports "ready to
         # submit" — that is expected. It still builds the serve image
         # and smoke-tests the harness, which is what we want here.
-        # Retries ONLY on the kit git clone timeout (see header comment).
+        # Retries ONLY on the kit git clone timeout (see header comment),
+        # at most once per stage. A timed-out clone leaves a fetch
+        # cascade behind (subprocess.run kills only the direct child),
+        # so clean it up before retrying.
+        id: kit-check
         continue-on-error: true
         run: |
           set +e
           cd kit
           attempt=1
-          max_attempts=3
+          max_attempts=2
           while [ "$attempt" -le "$max_attempts" ]; do
             echo "=== kit check attempt $attempt/$max_attempts ==="
             "$HOME/.local/bin/uv" run python -m kit check ../ --env-file "$RUNNER_TEMP/local.env" 2>&1 | tee /tmp/kit-check.log
             rc="${PIPESTATUS[0]}"
             if [ "$rc" -eq 0 ]; then exit 0; fi
             if grep -q "git clone took longer than 300" /tmp/kit-check.log && [ "$attempt" -lt "$max_attempts" ]; then
-              echo "kit git clone timeout detected (attempt $attempt), waiting 300s before retry..."
-              sleep 300
+              echo "kit git clone timeout detected (attempt $attempt), cleaning up the leftover fetch cascade, waiting 600s before retry..."
+              src_pat="ple-harness/ple-harness"
+              flt_pat="--filter=blob:none --stdin"
+              pkill -f "$src_pat" 2>/dev/null || true
+              pkill -f "$flt_pat" 2>/dev/null || true
+              sleep 5
+              sleep 600
               attempt=$((attempt + 1))
             else
               exit "$rc"
@@ -100,11 +140,17 @@ jobs:
       - name: Run one dev task
         # Retries ONLY on the kit git clone timeout (see header comment).
         # Agent failures fail immediately with no retry.
+        # Blocked when kit check actually failed (its outcome, not its
+        # conclusion: continue-on-error forces the conclusion to success).
+        # A timeout string here can only come from the pre-agent build
+        # phase (the agent starts after the build), so a retry never
+        # re-runs agent work.
+        if: steps.kit-check.outcome == 'success'
         run: |
           set +e
           cd kit
           attempt=1
-          max_attempts=3
+          max_attempts=2
           while [ "$attempt" -le "$max_attempts" ]; do
             echo "=== eval attempt $attempt/$max_attempts ==="
             "$HOME/.local/bin/uv" run python eval/run.py ../ \
@@ -113,8 +159,13 @@ jobs:
             rc="${PIPESTATUS[0]}"
             if [ "$rc" -eq 0 ]; then exit 0; fi
             if grep -q "git clone took longer than 300" /tmp/eval.log && [ "$attempt" -lt "$max_attempts" ]; then
-              echo "kit git clone timeout detected (attempt $attempt), waiting 300s before retry..."
-              sleep 300
+              echo "kit git clone timeout detected (attempt $attempt), cleaning up the leftover fetch cascade, waiting 600s before retry..."
+              src_pat="ple-harness/ple-harness"
+              flt_pat="--filter=blob:none --stdin"
+              pkill -f "$src_pat" 2>/dev/null || true
+              pkill -f "$flt_pat" 2>/dev/null || true
+              sleep 5
+              sleep 600
               attempt=$((attempt + 1))
             else
               exit "$rc"
@@ -124,6 +175,19 @@ jobs:
       - name: Restore submission.yaml
         if: always()
         run: mv -f submission.yaml.orig submission.yaml
+
+      - name: Collect diagnostics (always)
+        # Even when the build fails and there are no run artifacts, keep
+        # the logs: previously a failed job uploaded 0 artifacts.
+        # Copy one file at a time: a single multi-source cp would copy
+        # nothing at all if any one source file is missing.
+        if: always()
+        run: |
+          mkdir -p "$RUNNER_TEMP/runs/smoke"
+          for f in /tmp/kit-check.log /tmp/eval.log "$RUNNER_TEMP/probe-staged.log" "$HOME/.cache/plebench/lin-ple-harness/build.log"; do
+            cp "$f" "$RUNNER_TEMP/runs/smoke/" 2>/dev/null || true
+          done
+          ls -la "$RUNNER_TEMP/runs/smoke/"
 
       - name: Upload run results and artifacts
         if: always()
