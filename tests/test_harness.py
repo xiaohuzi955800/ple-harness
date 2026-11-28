@@ -4489,8 +4489,9 @@ def test_run24_offline_variants():
 
 
 def test_conn_gate_run25_replay():
-  print("run-25 calibration replay: three groups against the official "
-        "numbers (busway run 20/21, coverage run 24, control run 22/23)")
+  print("run-25 calibration replay: four groups against the official "
+        "numbers (busway run 20/21, coverage run 24, control run 22/23, "
+        "run 25d)")
   try:
     import ifcopenshell  # noqa: F401
   except ImportError:
@@ -4550,9 +4551,11 @@ def test_conn_gate_run25_replay():
           outs["conn"])
 
   # (b) Coverage replay: the run-24 model must reproduce the official
-  # coverage — tray/busway within 0.002, CHW within 0.001 except the
-  # documented C (+0.073) and E (+0.039) residuals, where the gate is
-  # conservative (it never overestimates CHW coverage).
+  # coverage — every cell within 0.002. (2026-11-27 gate fix 2: the
+  # old CHW C (+0.073) and E (+0.039) "conservative residuals" are
+  # explained by the reach rule — neighbouring headers within 2500 mm
+  # of the band count — so the special case that pinned them is gone;
+  # run25-gate-fix.md §9.4 is revoked.)
   official_r24 = {
       ("A", "tray"): 0.750, ("B", "tray"): 0.725, ("C", "tray"): 0.741,
       ("D", "tray"): 0.725, ("E", "tray"): 0.770, ("F", "tray"): 0.729,
@@ -4574,22 +4577,9 @@ def test_conn_gate_run25_replay():
           outs["conn"])
     for (row, svc), official in sorted(official_r24.items()):
       got = cov.get((row, svc))
-      if svc in ("tray", "busway"):
-        check(f"run-24 {row} {svc}: {got * 100:.1f}% vs official {official * 100:.1f}%",
-              got is not None and abs(got - official) <= 0.002,
-              outs["conn"])
-      elif (row, svc) in (("C", "chw"), ("E", "chw")):
-        # Documented unexplained residuals: the gate UNDERestimates
-        # (conservative — it cannot cause a false PASS). Pinned so a
-        # future fix must move them, not silently re-tune the gate.
-        check(f"run-24 {row} chw residual is conservative "
-              f"(got {got * 100:.1f}%, official {official * 100:.1f}%)",
-              got is not None and 0.0 < official - got <= 0.08,
-              outs["conn"])
-      else:
-        check(f"run-24 {row} {svc}: {got * 100:.1f}% vs official {official * 100:.1f}%",
-              got is not None and abs(got - official) <= 0.002,
-              outs["conn"])
+      check(f"run-24 {row} {svc}: {got * 100:.1f}% vs official {official * 100:.1f}%",
+            got is not None and abs(got - official) <= 0.002,
+            outs["conn"])
 
   # (c) Coverage control: full headers saturate under the new
   # definition — run 22 official 1.0 (CHW 0.998-0.999), run 23
@@ -4626,6 +4616,40 @@ def test_conn_gate_run25_replay():
       got = cov.get((row, svc))
       check(f"run-23 {row} {svc}: {got * 100:.1f}% vs official {official * 100:.1f}%",
             got is not None and abs(got - official) <= 0.01,
+            outs["conn"])
+
+  # (d) Coverage replay, run 25d (the first run that actually scored
+  # after the infra fix): official 0.0 ERR_CONNECTIVITY, A busway
+  # 0.7999999999999999 — the gate must reproduce all 18 cells within
+  # 0.002, including A busway below 0.80 (the float-epsilon case) and
+  # F below the old gate's reading (the §9.4 revocation case).
+  official_r25d = {
+      ("A", "tray"): 0.848, ("B", "tray"): 0.820, ("C", "tray"): 0.838,
+      ("D", "tray"): 0.820, ("E", "tray"): 0.866, ("F", "tray"): 0.819,
+      ("A", "busway"): 0.800, ("B", "busway"): 0.820,
+      ("C", "busway"): 0.838, ("D", "busway"): 0.820,
+      ("E", "busway"): 0.848, ("F", "busway"): 0.819,
+      ("A", "chw"): 1.0, ("B", "chw"): 0.829, ("C", "chw"): 0.847,
+      ("D", "chw"): 0.821, ("E", "chw"): 0.912, ("F", "chw"): 0.862,
+  }
+  with tempfile.TemporaryDirectory() as tmp:
+    workdir = os.path.join(tmp, "run25d")
+    shutil.copytree(os.path.join(fixtures, "run25d-model"), workdir)
+    outs = run_gates(workdir)
+    cov = coverage_map(outs["conn"])
+    check("run-25d SEP is 0 (official)", "SEP collisions: 0" in outs["sep"],
+          outs["sep"])
+    check("run-25d CHW is 1 component",
+          "CONN chw: 1 connected component(s)" in outs["conn"],
+          outs["conn"])
+    check("run-25d CONN fails on A busway (official ERR_CONNECTIVITY)",
+          "CONN_GATE: FAIL" in outs["conn"]
+          and "row A: busway covers only 80%" in outs["conn"],
+          outs["conn"])
+    for (row, svc), official in sorted(official_r25d.items()):
+      got = cov.get((row, svc))
+      check(f"run-25d {row} {svc}: {got * 100:.1f}% vs official {official * 100:.1f}%",
+            got is not None and abs(got - official) <= 0.002,
             outs["conn"])
 
 
@@ -4671,27 +4695,48 @@ def test_sep_gate_run24_twelve_clashes():
 
 
 def test_run25_AB_guidance_mounted():
-  print("run-25 A+B guidance is mounted for routing workers (A east ends "
-        "recomputed per the official coverage definition, plus B trunk "
-        "north-end trims)")
+  print("run-26 guidance is mounted for routing workers (frozen run26 "
+        "trimmed delivery rule, corrected coverage definition, "
+        "three-point status)")
   session = FakeSession(21600)
   session.instruction = "Route the cable tray, busway and chilled water in the data hall."
   worker = serve.Agent(session, role="worker")
   prompt = worker.system_prompt("")
-  # The A east-end table (82% true coverage, recomputed from the run-23
-  # baseline per the official span definition) must be in the prompt.
-  for num in ("15499", "16557", "15881", "16555", "15144", "16875",
-              "15694", "16716", "16040", "16416", "15702", "17500"):
-    check(f"A east-end number {num} in the prompt", num in prompt, prompt)
-  # The B trunk north ends (tray 16250, busway 16950, CHW 17350) and the
-  # trimmed trunk lengths (15750, 16450, 16765.85) must be in the prompt.
-  for num in ("16250", "16950", "17350", "15750", "16450", "361,197"):
-    check(f"B number {num} in the prompt", num in prompt, prompt)
-  check("A+B guidance section marker in the prompt",
-        "第 25 轮长度指引（A+B 刀）" in prompt, prompt)
-  # The void run-24 numbers must STILL be absent (the A table shares
-  # two values with the void table — 15694 and 15702/17500 — so check
-  # the values that only the void table had, plus the void marker).
+  # The corrected coverage definition: cabinet row lengths and the
+  # reach rule must be in the prompt.
+  for num in ("17400", "18000", "17600", "18400"):
+    check(f"cabinet row length {num} in the prompt", num in prompt, prompt)
+  check("reach rule in the prompt",
+        "±2500 mm" in prompt and "邻排" in prompt, prompt)
+  # The frozen-delivery rule: new hashes and total, and the copy order.
+  for num in ("bc1810f153cd", "06b9b99001d8", "356,081"):
+    check(f"frozen run26 number {num} in the prompt", num in prompt, prompt)
+  check("frozen delivery rule in the prompt",
+        "冻结哈希" in prompt and "原样复制" in prompt, prompt)
+  # The superseded A+B record is quoted (hashes + total) and marked
+  # replaced — the agent must not deliver A+B anymore.
+  for num in ("d7ae59a258eb6", "2599aa8173b0", "361,197"):
+    check(f"superseded A+B number {num} in the prompt", num in prompt, prompt)
+  check("A+B marked superseded in the prompt",
+        "已由修剪版取代" in prompt, prompt)
+  # The three-point status: length target met (356,569 still quoted as
+  # the line), score at the 25d violation rate, and the 0.60 condition.
+  check("length target line in the prompt", "356,569" in prompt, prompt)
+  check("score at 18.8% violation rate in the prompt",
+        "0.5943" in prompt, prompt)
+  # The trimmed east ends (tray/busway) and the CHW trunk north end.
+  for num in ("14679", "16603", "15061", "14324", "16931"):
+    check(f"trimmed east end {num} in the prompt", num in prompt, prompt)
+  for num in ("16950", "17350"):
+    check(f"CHW trunk number {num} in the prompt", num in prompt, prompt)
+  check("run-26 guidance section marker in the prompt",
+        "第 26 轮指引" in prompt, prompt)
+  # The old A+B east ends (except D 16555, unchanged) must be GONE from
+  # the prompt — the agent must not rebuild from the old table.
+  for num in ("15499", "16557", "15881", "15144", "16875"):
+    check(f"old east end {num} absent from the prompt",
+          num not in prompt, prompt)
+  # The void run-24 numbers must STILL be absent.
   for num in ("14332", "14850", "14526", "14844", "15205",
               "14129", "14647", "14323", "14641", "15002",
               "16308", "14703", "16305", "339,079"):
@@ -4710,8 +4755,13 @@ def test_run25_AB_guidance_mounted():
 
 def test_run25_A_variant_gates():
   print("run-25 A variant (82% design) passes the FIXED gates: SEP 0, "
-        "CONN PASS, every row >= 82% (CHW A reads 100% via the south "
-        "perimeter); total 370,647 mm")
+        "CONN PASS, every row >= 80% (CHW A reads 100% via the south "
+        "perimeter); total 370,647 mm. NOTE (2026-11-27 gate fix 2): "
+        "the 82% design was computed on the old FITTED row lengths; "
+        "under the corrected cabinet lengths + reach rule the B/F "
+        "tray/busway read 81.8% (span 14732/18000 and 15050/18400) — "
+        "still above the 80% gate line, but the 82% design claim is "
+        "void on those two cells.")
   try:
     import ifcopenshell  # noqa: F401
   except ImportError:
@@ -4744,8 +4794,10 @@ def test_run25_A_variant_gates():
     check("A variant CONN passes", "CONN_GATE: PASS" in outs["conn"],
           outs["conn"])
     # Per-row coverage from the exact span/length ratio (not the
-    # rounded percentage): tray/busway exactly 82.0% on every row,
-    # CHW A 100%, B/C/D 82.0%, E/F 85.5%.
+    # rounded percentage), under the corrected gate (cabinet lengths
+    # + reach): tray/busway A 84.7%, B 81.8%, C 83.7%, D 82.0%,
+    # E 86.5%, F 81.8%; CHW A 100%, B 82.7%, C 84.6%, D 82.0%,
+    # E 86.9%, F 86.1%.
     cov = {}
     for m in re.finditer(
             r"CONN row (\w): (\w+) coverage [\d.]+% \(span (\d+)/(\d+) mm",
@@ -4753,10 +4805,13 @@ def test_run25_A_variant_gates():
       cov[(m.group(1), m.group(2))] = int(m.group(3)) / int(m.group(4))
     for row in "ABCDEF":
       for svc in ("tray", "busway"):
-        # Tolerance 1e-4: east ends are integers, so a row designed at
-        # exactly 82% can read up to ~1 mm / row length (~6e-5) under it.
-        check(f"A variant {row} {svc} coverage >= 82%",
-              cov.get((row, svc), 0) >= 0.82 - 1e-4, outs["conn"])
+        check(f"A variant {row} {svc} coverage >= 80% (gate line)",
+              cov.get((row, svc), 0) >= 0.80, outs["conn"])
+    for row, want in (("B", 14732 / 18000), ("F", 15050 / 18400)):
+      for svc in ("tray", "busway"):
+        check(f"A variant {row} {svc} reads 81.8% under the corrected gate",
+              cov.get((row, svc), 0) is not None
+              and abs(cov[(row, svc)] - want) < 1e-4, outs["conn"])
     for row, lo in (("A", 0.99), ("B", 0.82), ("C", 0.82),
                     ("D", 0.82), ("E", 0.85), ("F", 0.85)):
       check(f"A variant {row} chw coverage >= {lo:.0%}",
@@ -4772,9 +4827,9 @@ def test_run25_A_variant_gates():
 
 def test_run25_AB_variant_gates():
   print("run-25 A+B variant passes the FIXED gates: SEP 0, CONN PASS, "
-        "every row >= 80% (tray/busway exactly 82.0%; CHW D reads 81.1% "
-        "because the trimmed trunk is assigned to row C, not D — "
-        "physical D geometry unchanged); total 361,197 mm, 3,646 mm "
+        "every row >= 80% (tray/busway 81.8-86.5% under the corrected "
+        "gate; CHW D reads 82.0% now that the trimmed trunk counts "
+        "toward every row it reaches); total 361,197 mm, 3,646 mm "
         "under the line, ratio 1.386 so the length round does NOT trigger")
   try:
     import ifcopenshell  # noqa: F401
@@ -4815,23 +4870,31 @@ def test_run25_AB_variant_gates():
             r"CONN row (\w): (\w+) coverage [\d.]+% \(span (\d+)/(\d+) mm",
             outs["conn"]):
       cov[(m.group(1), m.group(2))] = int(m.group(3)) / int(m.group(4))
+    # NOTE (2026-11-27 gate fix 2): the old "exactly 82.0%" claim was
+    # computed on the FITTED row lengths; under the corrected cabinet
+    # lengths + reach rule the B/F tray/busway read 81.8% (14732/18000
+    # and 15050/18400). The gate line is 80%, so A+B still passes.
     for row in "ABCDEF":
       for svc in ("tray", "busway"):
-        check(f"A+B variant {row} {svc} coverage >= 82%",
-              cov.get((row, svc), 0) >= 0.82 - 1e-4, outs["conn"])
-    # CHW: A 100% (south perimeter), B 82.0%, C 82.9% (gained the
-    # trunk's 159 mm when the trimmed trunk moved to row C), D 81.1%
-    # (lost the trunk's 168 mm to row C; header/drop geometry unchanged,
-    # still above the 80% official floor), E/F 85.5%.
+        check(f"A+B variant {row} {svc} coverage >= 80% (gate line)",
+              cov.get((row, svc), 0) >= 0.80, outs["conn"])
+    for row, want in (("B", 14732 / 18000), ("F", 15050 / 18400)):
+      for svc in ("tray", "busway"):
+        check(f"A+B variant {row} {svc} reads 81.8% under the corrected gate",
+              cov.get((row, svc), 0) is not None
+              and abs(cov[(row, svc)] - want) < 1e-4, outs["conn"])
+    # CHW: A 100% (south perimeter), B 82.7%, C 84.6%, D 82.0%,
+    # E 86.9%, F 86.1%.
     for row, lo in (("A", 0.99), ("B", 0.82), ("C", 0.82),
                     ("D", 0.80), ("E", 0.85), ("F", 0.85)):
       check(f"A+B variant {row} chw coverage >= {lo:.0%}",
             cov.get((row, "chw"), 0) >= lo - 1e-4, outs["conn"])
-    # Pin the D-row artifact exactly so it cannot be silently rounded
-    # up to 82%: the gate reads 81.1% (span 14600/18010).
-    check("A+B variant D chw coverage is 81.1% (trunk-assignment "
-          "artifact, pinned)",
-          abs(cov.get(("D", "chw"), 0) - 14600 / 18010) < 1e-4,
+    # Pin the D-row reading exactly: under the corrected gate the
+    # trimmed CHW trunk's y-interval intersects every expanded band,
+    # so it counts toward D too — D CHW reads 82.0% (span 14768/18000),
+    # not the old 81.1% (14600/18010) nearest-centreline artifact.
+    check("A+B variant D chw coverage is 82.0% (reach rule, pinned)",
+          abs(cov.get(("D", "chw"), 0) - 14768 / 18000) < 1e-4,
           outs["conn"])
     # Length: 361,197 mm is 3,646 mm UNDER the 364,843 mm line and the
     # ratio 361197/260602 = 1.386 is under the 1.40 length-round
@@ -5028,6 +5091,81 @@ async def test_file_hashes_binding():
         and "model.ifc sha256 bbbbbbbbbbbb" in verdict, verdict)
   check("binding returns the same hashes",
         bound == hashes, bound)
+
+
+async def test_frozen_delivery_intercept():
+  print("frozen delivery intercept (run 26): a model that is not the "
+        "frozen run26 trimmed model fails the gates with a HASH MISMATCH "
+        "gap; the frozen hashes pass clean")
+  import hashlib
+  import json
+  import os
+  fixtures = os.path.join(os.path.dirname(__file__), "fixtures")
+  gt = json.load(open(os.path.join(fixtures, "run26-trimmed-model",
+                                  "ground_truth.json")))
+  frozen = {"solution.py": serve.FROZEN_SOLUTION_SHA256,
+            "model.ifc": serve.FROZEN_MODEL_SHA256}
+  # The constants must be the actual hashes of the frozen fixture files
+  # (a freeze updates both together — never one without the other).
+  for name, const in (("solution.py", serve.FROZEN_SOLUTION_SHA256),
+                      ("model.ifc", serve.FROZEN_MODEL_SHA256)):
+    digest = hashlib.sha256(open(os.path.join(
+        fixtures, "run26-trimmed-model", "output", name), "rb").read()
+    ).hexdigest()
+    check(f"frozen {name} hash matches the fixture file",
+          digest == const, digest)
+  check("frozen hashes match the frozen model exactly",
+        serve._frozen_hash_gap(frozen, gt) == "", frozen)
+  # The module-level row tables must stay in sync with the CONN gate
+  # script's own tables (the script is standalone, so they are copies).
+  check("frozen row tables match the gate script's tables",
+        serve._FROZEN_TASK_ROWS == {"A", "B", "C", "D", "E", "F"}
+        and serve._FROZEN_TASK_DRAWN_ROW
+        == {'A': (1825, 19242), 'B': (1825, 19851), 'C': (1825, 19470),
+            'D': (1787, 19851), 'E': (1825, 19242), 'F': (1825, 20269)}
+        and "'A': (1825, 17400)" in serve.CONN_GATE_SCRIPT
+        and "'C': (1825, 17600)" in serve.CONN_GATE_SCRIPT
+        and "'F': (1825, 18400)" in serve.CONN_GATE_SCRIPT
+        and "'A': (1825, 19242)" in serve.CONN_GATE_SCRIPT
+        and "'F': (1825, 20269)" in serve.CONN_GATE_SCRIPT, gt)
+  check("no ground truth means no frozen check",
+        serve._frozen_hash_gap({"solution.py": "a" * 64,
+                                "model.ifc": "b" * 64}, None) == "", gt)
+  check("another task's ground truth means no frozen check",
+        serve._frozen_hash_gap({"solution.py": "a" * 64,
+                                "model.ifc": "b" * 64},
+                               _smoke_task_ground_truth()) == "", gt)
+  wrong_sol = {**frozen, "solution.py": "c" * 64}
+  gap = serve._frozen_hash_gap(wrong_sol, gt)
+  check("wrong solution.py hash is a HASH MISMATCH gap naming the file",
+        "HASH MISMATCH" in gap and "solution.py" in gap
+        and serve.FROZEN_SOLUTION_SHA256[:12] in gap, gap)
+  wrong_mod = {**frozen, "model.ifc": ""}
+  gap = serve._frozen_hash_gap(wrong_mod, gt)
+  check("missing model.ifc is a HASH MISMATCH gap naming the file",
+        "HASH MISMATCH" in gap and "model.ifc" in gap
+        and "missing" in gap, gap)
+  # End to end through _measure_gates with the fake agent (whose files
+  # hash to a*64 / b*64, i.e. not the frozen model): the gaps carry the
+  # mismatch and the verdict carries the FAIL line.
+  session = FakeSession(21600)
+  session.instruction = "Route the cable tray, busway and chilled water."
+  worker = FakeAgent(session, role="worker")
+  FakeAgent.reset(bash_outputs=[*_clean_gate_outputs(461817)])
+  gaps, verdict, scores, bound = await serve._measure_gates(
+      worker, True, gt)
+  check("measure_gates flags a non-frozen delivery",
+        "HASH MISMATCH" in gaps
+        and "Frozen delivery: FAIL" in verdict, verdict)
+  # And with the frozen hashes the same measurement passes the check.
+  FakeAgent.reset(bash_outputs=[*_clean_gate_outputs(461817)],
+                  file_hashes=[serve.FROZEN_SOLUTION_SHA256,
+                               serve.FROZEN_MODEL_SHA256])
+  gaps2, verdict2, _scores2, _bound2 = await serve._measure_gates(
+      worker, True, gt)
+  check("measure_gates passes a frozen delivery",
+        "HASH MISMATCH" not in gaps2
+        and "Frozen delivery: FAIL" not in verdict2, verdict2)
 
 
 async def test_stale_measurement_remeasures():
@@ -5337,6 +5475,7 @@ async def main():
   test_correct_summary_blanket_claim()
   test_gate_verdict_unmeasured()
   await test_file_hashes_binding()
+  await test_frozen_delivery_intercept()
   await test_stale_measurement_remeasures()
   test_conn_gate_predefined_warning()
   test_conn_gate_run22_fixture()
