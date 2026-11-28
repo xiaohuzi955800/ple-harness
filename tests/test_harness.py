@@ -4695,7 +4695,7 @@ def test_sep_gate_run24_twelve_clashes():
 
 
 def test_run25_AB_guidance_mounted():
-  print("run-27 guidance is mounted for routing workers (frozen run27 "
+  print("run-28 guidance is mounted for routing workers (frozen run27 "
         "trimmed delivery rule, corrected coverage definition, "
         "three-point status)")
   session = FakeSession(21600)
@@ -4740,8 +4740,10 @@ def test_run25_AB_guidance_mounted():
     check(f"trimmed tray/busway east end {num} in the prompt", num in prompt, prompt)
   for num in ("15914", "14923", "16600", "15922", "17708"):
     check(f"trimmed CHW east end {num} in the prompt", num in prompt, prompt)
-  check("run-27 guidance section marker in the prompt",
-        "第 27 轮指引" in prompt, prompt)
+  check("run-28 guidance section marker in the prompt",
+        "第 28 轮指引" in prompt, prompt)
+  check("no run-27 guidance section in the prompt",
+        "第 27 轮指引" not in prompt, prompt)
   check("no run-26 guidance section in the prompt",
         "第 26 轮指引" not in prompt, prompt)
   # The old A+B east ends (except D 16555, unchanged) must be GONE from
@@ -5221,6 +5223,67 @@ async def test_frozen_delivery_intercept():
         and "FROZEN CHECK SKIPPED" in verdict3, verdict3)
 
 
+async def test_frozen_model_injection():
+  print("frozen model injection (run 28): solve() copies the frozen "
+        "run27 trimmed files into the agent's workdir before the work "
+        "phase, verified by read-back hash — the run-27 agent tried "
+        "tests/fixtures/... in the container and got FileNotFoundError")
+  import hashlib
+  import json
+  import os
+  fixtures = os.path.join(os.path.dirname(__file__), "fixtures")
+  gt = json.load(open(os.path.join(fixtures, "run27-trimmed-model",
+                                  "ground_truth.json")))
+  session = FakeSession(21600)
+  session.instruction = "Route the cable tray, busway and chilled water."
+  ok = await serve._inject_frozen_model(session, gt)
+  check("injection succeeds for this task's ground truth", ok, session.logs)
+  for name, const in (("solution.py", serve.FROZEN_SOLUTION_SHA256),
+                      ("model.ifc", serve.FROZEN_MODEL_SHA256)):
+    key = "/app/frozen/" + name
+    check(f"frozen/{name} lands in the workdir with the fixture bytes",
+          session.files.get(key) == open(os.path.join(
+              fixtures, "run27-trimmed-model", "output", name),
+              "rb").read(), key)
+    check(f"injected frozen/{name} hashes to the frozen constant",
+          hashlib.sha256(session.files[key]).hexdigest() == const, key)
+  check("injection logs a verified success loudly",
+        any("FROZEN_INJECT" in log and "verified" in log
+            for log in session.logs), session.logs)
+  # The guidance and the gap text must point at the workdir copy, not
+  # at the repo path the container cannot see.
+  check("guidance tells the agent to copy from frozen/",
+        "cp frozen/solution.py output/solution.py"
+        in serve.RUN25_LENGTH_GUIDANCE_AB
+        and "frozen/model.ifc" in serve.RUN25_LENGTH_GUIDANCE_AB,
+        serve.RUN25_LENGTH_GUIDANCE_AB)
+  check("guidance warns the repo fixture path does not open",
+        "tests/fixtures/" in serve.RUN25_LENGTH_GUIDANCE_AB
+        and "打不开" in serve.RUN25_LENGTH_GUIDANCE_AB,
+        serve.RUN25_LENGTH_GUIDANCE_AB)
+  gap = serve._frozen_hash_gap(
+      {"solution.py": "c" * 64, "model.ifc": "d" * 64}, gt)
+  check("HASH MISMATCH gap points at the workdir frozen/ copy",
+        "frozen/solution.py" in gap
+        and "tests/fixtures/run27-trimmed-model/output/solution.py"
+        not in gap, gap)
+  # Another task's ground truth: no injection, and the skip is logged.
+  session2 = FakeSession(21600)
+  ok2 = await serve._inject_frozen_model(
+      session2, _smoke_task_ground_truth())
+  check("injection skips another task's ground truth",
+        ok2 is False
+        and "/app/frozen/solution.py" not in session2.files
+        and any("FROZEN_INJECT" in log and "skipped" in log
+                for log in session2.logs), session2.logs)
+  # No ground truth at all: same skip, no crash.
+  session3 = FakeSession(21600)
+  ok3 = await serve._inject_frozen_model(session3, None)
+  check("injection skips with no ground truth",
+        ok3 is False
+        and "/app/frozen/solution.py" not in session3.files, session3.logs)
+
+
 async def test_stale_measurement_remeasures():
   print("final hash check regenerates and re-measures when the files "
         "changed since the last gate run (run 23)")
@@ -5529,6 +5592,7 @@ async def main():
   test_gate_verdict_unmeasured()
   await test_file_hashes_binding()
   await test_frozen_delivery_intercept()
+  await test_frozen_model_injection()
   await test_stale_measurement_remeasures()
   test_conn_gate_predefined_warning()
   test_conn_gate_run22_fixture()

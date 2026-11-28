@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import json
 import os
 import posixpath
@@ -299,7 +300,7 @@ P1-1 长度（P0 全部通过后再做）：删掉北环线 CHW-NorthPerimeter�
 # A+B east-end table built on the fitted lengths is void on B/F, which
 # read 81.8%, not 82%, under the corrected gate.) P0 is untouched.
 
-RUN25_LENGTH_GUIDANCE_AB = """【第 27 轮指引 — 冻结 run27 修剪版模型原样交付】
+RUN25_LENGTH_GUIDANCE_AB = """【第 28 轮指引 — 冻结 run27 修剪版模型原样交付】
 覆盖按官方口径算（2026-11-27 校准：run 22/23/24/25d 共 72 格，最大误差
 0.0018）：每排每服务覆盖率 = 该服务所有线段（其 AABB y-区间与本排带
 ±2500 mm 相交）的 AABB x-区间并集（裁剪到 [排起点, 排起点+官方排长]）
@@ -313,9 +314,16 @@ A 85.2/85.2/100、B 82.4/82.4/82.4、C 84.2/84.2/84.2、
 D 82.6/82.6/82.3、E 85.2/85.2/85.9、F 82.2/82.2/86.8）：
 solution.py sha256 0eac0985bc73…、model.ifc sha256 ce503a75b252…。
 交付铁律：交付的 solution.py 与 model.ifc 必须与冻结哈希逐字节一致，
-不一致门禁直接判 FAIL、不许提交。原样复制
-tests/fixtures/run27-trimmed-model/output/ 里的两个文件，不要重写路由，
-不要从 solution.py 重新生成 model.ifc（GUID 每次不同，哈希对不上）。
+不一致门禁直接判 FAIL、不许提交。冻结的两个文件已经放在你的工作目录
+frozen/ 里（frozen/solution.py、frozen/model.ifc，开跑前由 harness 写入
+并核过哈希），照下面原样复制到 output/，不要重写路由，不要从
+solution.py 重新生成 model.ifc（GUID 每次不同，哈希对不上）：
+mkdir -p output && cp frozen/solution.py output/solution.py &&
+cp frozen/model.ifc output/model.ifc &&
+sha256sum output/solution.py output/model.ifc
+（须得 solution.py 0eac0985bc73…、model.ifc ce503a75b252…）。
+不要去 tests/fixtures/ 找冻结文件：那个目录在你的工作目录之外、打不开
+（上一轮 agent 去那里找报 FileNotFoundError，只好自己重画，白白丢了分）。
 冻结模型的构造（只作记录，不要照此重建）：由第 26 次官方 0.664124 的
 交付模型修剪而来——tray/busway header 东端 A 14679、B 16650、C 14679、
 D 16650、E 14679、F 16950（A/C/E 的 header 不决定任何排的跨度，缩了
@@ -4875,8 +4883,12 @@ def _hash_binding_line(hashes: dict) -> str:
 # tests/fixtures/run26-delivered-model/ (solution.py 10c25ec8…,
 # model.ifc abcd2de3… locally regenerated). The run27 trimmed model is
 # that delivered model cut down offline (tray/busway + CHW header east
-# ends only); it is what the agent must copy verbatim from
-# tests/fixtures/run27-trimmed-model/output/ (solution.py + model.ifc).
+# ends only); it is what the agent must copy verbatim — solve() copies
+# the two files into the agent's workdir at frozen/ before the work
+# phase (_inject_frozen_model), because the workdir is a task container
+# that cannot see this repo (run 27: the agent tried
+# tests/fixtures/run27-trimmed-model/output/ and got FileNotFoundError,
+# then re-derived the routing for 142 steps and scored 0.421404).
 # Re-running the frozen solution.py does NOT reproduce the frozen
 # model.ifc (ifcopenshell GUIDs are non-deterministic — local
 # regenerations hashed ea4759d3… / 93db4f3d…, never 2599aa81…), so the
@@ -4974,10 +4986,77 @@ def _frozen_hash_gap(hashes: dict, ground_truth: dict | None) -> str:
   return ("HASH MISMATCH — delivered files are not the frozen run27 "
           "trimmed model: "
           + "; ".join(bad) + ". Deliver the frozen model verbatim "
-          "(copy tests/fixtures/run27-trimmed-model/output/solution.py and "
-          "output/model.ifc); do not re-derive the routing and do not "
+          "(copy frozen/solution.py and frozen/model.ifc in your workdir "
+          "to output/); do not re-derive the routing and do not "
           "regenerate model.ifc from solution.py (GUIDs differ every "
           "run). This run cannot pass until the hashes match.")
+
+
+# Where the frozen run27 trimmed model lives in this repo (run 28): the
+# agent's workdir is a task container that cannot see the repo, so
+# solve() copies these two files into the workdir before the work phase.
+_FROZEN_FIXTURE_DIR = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "tests", "fixtures",
+    "run27-trimmed-model", "output")
+_FROZEN_INJECT_DIR = "frozen"  # workdir-relative; the guidance points here
+
+
+async def _inject_frozen_model(session: taskbridge.Session,
+                               ground_truth: dict | None) -> bool:
+  """Copies the frozen run27 trimmed model into the agent's workdir.
+
+  The workdir is a task container: it cannot see this repo, so the
+  guidance's old tests/fixtures/... path never resolved (run 27 root
+  cause — the agent tried it, got FileNotFoundError, re-derived the
+  routing for 142 steps and scored 0.421404). The two files land at
+  frozen/solution.py and frozen/model.ifc in the workdir, each verified
+  by reading it back and comparing sha256 with the frozen constant —
+  the same hashes _frozen_hash_gap checks at measurement time. A
+  failure is logged loudly and the run continues: the intercept still
+  guards delivery, it just cannot pass without the frozen files.
+
+  Returns True when both files are in the workdir with the frozen
+  hashes, else False.
+  """
+  reason = _frozen_skip_reason(ground_truth)
+  if reason:
+    await session.log(f"FROZEN_INJECT: skipped — {reason}")
+    return False
+  for name, frozen in (("solution.py", FROZEN_SOLUTION_SHA256),
+                       ("model.ifc", FROZEN_MODEL_SHA256)):
+    src = os.path.join(_FROZEN_FIXTURE_DIR, name)
+    try:
+      with open(src, "rb") as f:
+        data = f.read()
+    except OSError as exc:
+      await session.log(
+          f"FROZEN_INJECT: fixture {name} unreadable ({exc}); frozen "
+          "delivery unavailable")
+      return False
+    if hashlib.sha256(data).hexdigest() != frozen:
+      await session.log(
+          f"FROZEN_INJECT: fixture {name} does not match the frozen "
+          "hash; refusing to inject")
+      return False
+    dest = posixpath.join(session.workdir, _FROZEN_INJECT_DIR, name)
+    try:
+      await session.write_file(dest, data)
+      back = await session.read_file(dest)
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+      await session.log(
+          f"FROZEN_INJECT: could not write/read back frozen/{name} "
+          f"({type(exc).__name__}: {exc}); frozen delivery unavailable")
+      return False
+    if hashlib.sha256(back).hexdigest() != frozen:
+      await session.log(
+          f"FROZEN_INJECT: frozen/{name} read-back hash mismatch; "
+          "frozen delivery unavailable")
+      return False
+  await session.log(
+      "FROZEN_INJECT: frozen/solution.py and frozen/model.ifc are in "
+      "the workdir with the frozen hashes verified — deliver them "
+      "verbatim to output/ (see the run 28 guidance)")
+  return True
 
 
 async def _measure_gates(
@@ -5926,6 +6005,12 @@ async def solve(session: taskbridge.Session) -> str:
     # The agent's self-check must be the gate scripts themselves (run 15:
     # a hand-written clash script reported 0 while the gate measured 92).
     await _write_gate_scripts(session)
+    # The frozen model must be in the agent's workdir before the work
+    # phase: the workdir is a task container that cannot see this repo
+    # (run 27: the agent tried tests/fixtures/... and got
+    # FileNotFoundError, then re-derived the routing and scored
+    # 0.421404).
+    await _inject_frozen_model(session, ground_truth)
   plan = ""
   if ground_truth is not None:
     # The ground truth IS the plan's input: skip the planner entirely and
