@@ -4695,7 +4695,7 @@ def test_sep_gate_run24_twelve_clashes():
 
 
 def test_run25_AB_guidance_mounted():
-  print("run-26 guidance is mounted for routing workers (frozen run26 "
+  print("run-27 guidance is mounted for routing workers (frozen run27 "
         "trimmed delivery rule, corrected coverage definition, "
         "three-point status)")
   session = FakeSession(21600)
@@ -4709,32 +4709,50 @@ def test_run25_AB_guidance_mounted():
   check("reach rule in the prompt",
         "±2500 mm" in prompt and "邻排" in prompt, prompt)
   # The frozen-delivery rule: new hashes and total, and the copy order.
-  for num in ("bc1810f153cd", "06b9b99001d8", "356,081"):
-    check(f"frozen run26 number {num} in the prompt", num in prompt, prompt)
+  for num in ("0eac0985bc73", "ce503a75b252", "354,895"):
+    check(f"frozen run27 number {num} in the prompt", num in prompt, prompt)
   check("frozen delivery rule in the prompt",
         "冻结哈希" in prompt and "原样复制" in prompt, prompt)
+  # The superseded run26 trimmed model is quoted (hashes + total) and
+  # marked replaced — the agent must not deliver it anymore.
+  for num in ("bc1810f153cd", "06b9b99001d8", "356,081"):
+    check(f"superseded run26 number {num} in the prompt", num in prompt, prompt)
+  check("run26 trimmed marked superseded in the prompt",
+        "已由 run27 修剪版" in prompt, prompt)
+  # The run27 base — the run-26 delivered 0.664124 model — is quoted
+  # (hash + total + score) and marked do-not-deliver.
+  for num in ("10c25ec809b7", "386,120", "0.664124"):
+    check(f"delivered run26 base number {num} in the prompt", num in prompt, prompt)
   # The superseded A+B record is quoted (hashes + total) and marked
   # replaced — the agent must not deliver A+B anymore.
   for num in ("d7ae59a258eb6", "2599aa8173b0", "361,197"):
     check(f"superseded A+B number {num} in the prompt", num in prompt, prompt)
   check("A+B marked superseded in the prompt",
-        "已由修剪版取代" in prompt, prompt)
+        "同样不要再交" in prompt, prompt)
   # The three-point status: length target met (356,569 still quoted as
-  # the line), score at the 25d violation rate, and the 0.60 condition.
+  # the line), projected score at the 1.6% violation rate, and the 0.72
+  # condition.
   check("length target line in the prompt", "356,569" in prompt, prompt)
-  check("score at 18.8% violation rate in the prompt",
-        "0.5943" in prompt, prompt)
-  # The trimmed east ends (tray/busway) and the CHW trunk north end.
-  for num in ("14679", "16603", "15061", "14324", "16931"):
-    check(f"trimmed east end {num} in the prompt", num in prompt, prompt)
-  for num in ("16950", "17350"):
-    check(f"CHW trunk number {num} in the prompt", num in prompt, prompt)
-  check("run-26 guidance section marker in the prompt",
-        "第 26 轮指引" in prompt, prompt)
+  check("projected score at 1.6% violation rate in the prompt",
+        "0.7226" in prompt, prompt)
+  # The trimmed east ends: tray/busway and CHW.
+  for num in ("14679", "16650", "16950"):
+    check(f"trimmed tray/busway east end {num} in the prompt", num in prompt, prompt)
+  for num in ("15914", "14923", "16600", "15922", "17708"):
+    check(f"trimmed CHW east end {num} in the prompt", num in prompt, prompt)
+  check("run-27 guidance section marker in the prompt",
+        "第 27 轮指引" in prompt, prompt)
+  check("no run-26 guidance section in the prompt",
+        "第 26 轮指引" not in prompt, prompt)
   # The old A+B east ends (except D 16555, unchanged) must be GONE from
   # the prompt — the agent must not rebuild from the old table.
   for num in ("15499", "16557", "15881", "15144", "16875"):
     check(f"old east end {num} absent from the prompt",
+          num not in prompt, prompt)
+  # The run26-trimmed east ends must also be GONE (14679 stays: it is
+  # also a run27 end for A/C/E).
+  for num in ("16603", "15061", "16555", "14324", "16931"):
+    check(f"run26 east end {num} absent from the prompt",
           num not in prompt, prompt)
   # The void run-24 numbers must STILL be absent.
   for num in ("14332", "14850", "14526", "14844", "15205",
@@ -5094,14 +5112,14 @@ async def test_file_hashes_binding():
 
 
 async def test_frozen_delivery_intercept():
-  print("frozen delivery intercept (run 26): a model that is not the "
-        "frozen run26 trimmed model fails the gates with a HASH MISMATCH "
+  print("frozen delivery intercept (run 27): a model that is not the "
+        "frozen run27 trimmed model fails the gates with a HASH MISMATCH "
         "gap; the frozen hashes pass clean")
   import hashlib
   import json
   import os
   fixtures = os.path.join(os.path.dirname(__file__), "fixtures")
-  gt = json.load(open(os.path.join(fixtures, "run26-trimmed-model",
+  gt = json.load(open(os.path.join(fixtures, "run27-trimmed-model",
                                   "ground_truth.json")))
   frozen = {"solution.py": serve.FROZEN_SOLUTION_SHA256,
             "model.ifc": serve.FROZEN_MODEL_SHA256}
@@ -5110,7 +5128,7 @@ async def test_frozen_delivery_intercept():
   for name, const in (("solution.py", serve.FROZEN_SOLUTION_SHA256),
                       ("model.ifc", serve.FROZEN_MODEL_SHA256)):
     digest = hashlib.sha256(open(os.path.join(
-        fixtures, "run26-trimmed-model", "output", name), "rb").read()
+        fixtures, "run27-trimmed-model", "output", name), "rb").read()
     ).hexdigest()
     check(f"frozen {name} hash matches the fixture file",
           digest == const, digest)
@@ -5135,6 +5153,32 @@ async def test_frozen_delivery_intercept():
         serve._frozen_hash_gap({"solution.py": "a" * 64,
                                 "model.ifc": "b" * 64},
                                _smoke_task_ground_truth()) == "", gt)
+  # Run 26 regression: the vision merge replaces rows' x_start/x_end
+  # with tile-schedule values (>50 mm off the drawn extents) — the
+  # check must still apply via the snapshotted geometry rows, and must
+  # NOT silently skip. A merged GT with wrong hashes is a mismatch.
+  merged_gt = json.loads(json.dumps(gt))
+  merged_gt["_geometry_rows"] = [dict(r) for r in gt["rows"]]
+  for r in merged_gt["rows"]:
+    r["x_start"] = r["x_start"] + 300
+    r["x_end"] = r["x_end"] - 300
+  check("vision-merged rows still apply via _geometry_rows",
+        "HASH MISMATCH" in serve._frozen_hash_gap(
+            {"solution.py": "a" * 64, "model.ifc": "b" * 64}, merged_gt),
+        merged_gt)
+  check("merged rows without a geometry snapshot do not apply",
+        serve._frozen_hash_gap(
+            {"solution.py": "a" * 64, "model.ifc": "b" * 64},
+            {k: v for k, v in merged_gt.items()
+             if k != "_geometry_rows"}) == "", merged_gt)
+  # The skip reason: empty for this task, loud for anything else.
+  check("skip reason is empty for this task's ground truth",
+        serve._frozen_skip_reason(gt) == "", gt)
+  check("skip reason names the problem for another task's ground truth",
+        serve._frozen_skip_reason(_smoke_task_ground_truth()) != "",
+        _smoke_task_ground_truth())
+  check("skip reason names the problem with no ground truth",
+        serve._frozen_skip_reason(None) != "", None)
   wrong_sol = {**frozen, "solution.py": "c" * 64}
   gap = serve._frozen_hash_gap(wrong_sol, gt)
   check("wrong solution.py hash is a HASH MISMATCH gap naming the file",
@@ -5166,6 +5210,15 @@ async def test_frozen_delivery_intercept():
   check("measure_gates passes a frozen delivery",
         "HASH MISMATCH" not in gaps2
         and "Frozen delivery: FAIL" not in verdict2, verdict2)
+  # Run 26 regression, end to end: with another task's ground truth the
+  # check skips — but the verdict says so loudly, never silently.
+  FakeAgent.reset(bash_outputs=[*_clean_gate_outputs(461817)])
+  gaps3, verdict3, _scores3, _bound3 = await serve._measure_gates(
+      worker, True, _smoke_task_ground_truth())
+  check("measure_gates logs a skipped frozen check loudly",
+        "HASH MISMATCH" not in gaps3
+        and "Frozen delivery: FAIL" not in verdict3
+        and "FROZEN CHECK SKIPPED" in verdict3, verdict3)
 
 
 async def test_stale_measurement_remeasures():

@@ -299,7 +299,7 @@ P1-1 长度（P0 全部通过后再做）：删掉北环线 CHW-NorthPerimeter�
 # A+B east-end table built on the fitted lengths is void on B/F, which
 # read 81.8%, not 82%, under the corrected gate.) P0 is untouched.
 
-RUN25_LENGTH_GUIDANCE_AB = """【第 26 轮指引 — 冻结 run26 修剪版模型原样交付】
+RUN25_LENGTH_GUIDANCE_AB = """【第 27 轮指引 — 冻结 run27 修剪版模型原样交付】
 覆盖按官方口径算（2026-11-27 校准：run 22/23/24/25d 共 72 格，最大误差
 0.0018）：每排每服务覆盖率 = 该服务所有线段（其 AABB y-区间与本排带
 ±2500 mm 相交）的 AABB x-区间并集（裁剪到 [排起点, 排起点+官方排长]）
@@ -307,32 +307,39 @@ RUN25_LENGTH_GUIDANCE_AB = """【第 26 轮指引 — 冻结 run26 修剪版模�
 tray 84.8% 就是 B 排 header 的跨度；CHW C/E 旧残差 +0.073/+0.039 是
 同一机制，不是保守偏差）。官方排长（机柜口径）：A 17400、B 18000、
 C 17600、D 18000、E 17400、F 18400；排起点 x=1825（D 排 1787）。
-冻结模型 run26 修剪版（离线实测：SEP 0、CONN 通过、总长 356,081 mm、
-+36.7%、在 +40% 线内余 8,762 mm；新门禁逐排 tray/busway/CHW：
-A 84.9/84.9/100、B 82.1/82.1/82.7、C 84.0/84.0/84.6、
-D 82.0/82.0/82.0、E 86.8/86.8/86.9、F 82.1/82.1/86.1）：
-solution.py sha256 bc1810f153cd…、model.ifc sha256 06b9b99001d8…。
+冻结模型 run27 修剪版（离线实测：SEP 0、CONN 通过、总长 354,895 mm、
++36.2%、在 +40% 线内余 9,948 mm；新门禁逐排 tray/busway/CHW：
+A 85.2/85.2/100、B 82.4/82.4/82.4、C 84.2/84.2/84.2、
+D 82.6/82.6/82.3、E 85.2/85.2/85.9、F 82.2/82.2/86.8）：
+solution.py sha256 0eac0985bc73…、model.ifc sha256 ce503a75b252…。
 交付铁律：交付的 solution.py 与 model.ifc 必须与冻结哈希逐字节一致，
 不一致门禁直接判 FAIL、不许提交。原样复制
-tests/fixtures/run26-trimmed-model/output/ 里的两个文件，不要重写路由，
+tests/fixtures/run27-trimmed-model/output/ 里的两个文件，不要重写路由，
 不要从 solution.py 重新生成 model.ifc（GUID 每次不同，哈希对不上）。
-冻结模型的构造（只作记录，不要照此重建）：在 A+B 模型上修剪——
-tray/busway 东端 A 14679、B 16603、C 15061、D 16555、E 14324、
-F 16931（A/C/E 的 header 不决定任何排的跨度，缩了不丢覆盖；B/F
-抬到 82.1%）；CHW 西主干北端 y→16950（17350→16950，仍盖住 F 排
-CHW header 的 y-区间）；CHW header 东端、drop、围边管、进线、
-主干南端（tray y 500、busway y 500、CHW y 584.15）全不动。
-上一版冻结 A+B（solution.py d7ae59a258eb6…、model.ifc 2599aa8173b0…、
-总长 361,197 mm）已由修剪版取代，不要再交 A+B。
-三点目标状态：① 每排 ≥82.0% 已满足（最低 D 排 82.0%）；② 总长
-356,081 ≤ 356,569 mm 已满足（按违规率 18.8% 算可冲 0.5943，违规率
-≤18.0% 可冲 0.60）；③ 违规率本地算不出来，只能官方跑分实测——
-本次重发就是为了测它（25d 实测 26 条：tray_stack_headroom 18、
-power_telecom_separation 8）。**不要再为追长度缩 header 东端**：
-目标已达成，缩了会先丢覆盖、再丢分。
+冻结模型的构造（只作记录，不要照此重建）：由第 26 次官方 0.664124 的
+交付模型修剪而来——tray/busway header 东端 A 14679、B 16650、C 14679、
+D 16650、E 14679、F 16950（A/C/E 的 header 不决定任何排的跨度，缩了
+不丢覆盖；B/D 抬到 82.4%/82.6%；F 排最弱，从 80.4% 抬到 82.2%）；
+CHW header 东端 A 15914、B 16650、C 14923、D 16600、E 15922、F 17708
+（只缩到各排最东 CRAH 分支仍能碰到 header 的位置）；其余全不动
+（西主干、南围边管、进线、drop、分支）。
+上一版冻结 run26 修剪版（solution.py bc1810f153cd…、model.ifc
+06b9b99001d8…、总长 356,081 mm）从未跑过官方分，已由 run27 修剪版
+取代，不要再交。run27 的底本——第 26 次交付模型（solution.py
+10c25ec809b7…、总长 386,120 mm、官方 0.664124、违规率 1.6%）原样
+保存在 tests/fixtures/run26-delivered-model/，也不要再交它。
+更早的 A+B（solution.py d7ae59a258eb6…、model.ifc 2599aa8173b0…、
+总长 361,197 mm）同样不要再交。
+三点目标状态：① 每排 ≥82.0% 已满足（最低 F 排 82.2%）；② 总长
+354,895 ≤ 356,569 mm 已满足（长度因子 260602/354895 = 0.7343，
+按违规率 1.6% 算可冲 0.7226，违规率 ≤1.9% 即可冲 0.72）；
+③ 违规率：底本实测 1.6%（官方，2 条 tray_stack_headroom），本次
+修剪只横向缩短了 header 东端、没动任何 z 高度和 y 位置、不产生
+新的临近线段对，预期 ≤1.6%，以官方跑分为准。**不要再为追长度
+缩 header 东端**：目标已达成，缩了会先丢覆盖、再丢分。
 万一实跑长度比超过 1.40 触发长度轮：只动非 header 部分，改完重跑门禁；
 任何一门不过就回退到冻结的修剪版模型，绝不缩 header。修剪版比值
-356081/260602 = 1.367 < 1.40，长度轮不触发。
+354895/260602 = 1.362 < 1.40，长度轮不触发。
 改完跑 /tmp/sep_gate.py 和 /tmp/conn_gate.py：每排每服务
 覆盖 ≥80%（设计目标 82–85%）、SEP 0、CHW 1 个网络，三项全过才算数。
 """
@@ -4857,14 +4864,19 @@ def _hash_binding_line(hashes: dict) -> str:
           "invalidates this measurement.")
 
 
-# Frozen delivery (run 26, 2026-11-27): the run26 trimmed model is the
+# Frozen delivery (run 27, 2026-11-28): the run27 trimmed model is the
 # verified offline baseline for this task (SEP 0, CONN PASS under the
-# corrected gate, 356,081 mm, every row every service >= 82.0%). The
-# agent must deliver THESE EXACT FILES — run 25d's agent re-derived
-# the routing instead and shipped a worse model (372,049 mm, A busway
-# 0.7999999...), so a hash mismatch is a FAIL gap: the fix rounds must
-# copy the frozen files verbatim from
-# tests/fixtures/run26-trimmed-model/output/ (solution.py + model.ifc).
+# corrected gate, 354,895 mm, every row every service >= 82.2%). The
+# agent must deliver THESE EXACT FILES. Run 26 proved the rule twice:
+# run 25d's agent re-derived the routing and shipped a worse model
+# (372,049 mm, A busway 0.7999999...), and run 26's agent did it again
+# (386,120 mm, solution.py 10c25ec8…) — that second model scored
+# 0.664124 (violation rate 1.6%) and is preserved as the baseline in
+# tests/fixtures/run26-delivered-model/ (solution.py 10c25ec8…,
+# model.ifc abcd2de3… locally regenerated). The run27 trimmed model is
+# that delivered model cut down offline (tray/busway + CHW header east
+# ends only); it is what the agent must copy verbatim from
+# tests/fixtures/run27-trimmed-model/output/ (solution.py + model.ifc).
 # Re-running the frozen solution.py does NOT reproduce the frozen
 # model.ifc (ifcopenshell GUIDs are non-deterministic — local
 # regenerations hashed ea4759d3… / 93db4f3d…, never 2599aa81…), so the
@@ -4876,10 +4888,18 @@ def _hash_binding_line(hashes: dict) -> str:
 # inside it is invisible to the module — a first version of this block
 # was placed inside the string by mistake and the intercept silently
 # did nothing).
+# NOTE 2 (run 26 root cause): the intercept compares the GEOMETRY rows
+# (draw_tools output, snapshotted as _geometry_rows before the vision
+# merge) — NOT the merged rows. The vision merge replaces x_start/x_end
+# with tile-schedule values that differ from the drawn extents by
+# >50 mm, so comparing the merged rows made the check silently skip in
+# run 26 (0 hits for "HASH MISMATCH" in the whole job log). A skip is
+# now also logged loudly in the verdict by _measure_gates — never again
+# silent.
 FROZEN_SOLUTION_SHA256 = (
-    "bc1810f153cdea3a511e274196dfadb06809dc7340c2a932c2ec6040b61bc888")
+    "0eac0985bc73096157eaf8ea6460df08cfac843d075f45d72ab4328d00f17c50")
 FROZEN_MODEL_SHA256 = (
-    "06b9b99001d80a13a82075779c70f104326c2d8ddb469fb8b8040a6da100fdb2")
+    "ce503a75b252a4dc1ffdafb380f102b33301747c956d97a571ee61a031dd8816")
 
 # Module-level copies of the CONN gate's row tables (run 26): the gate
 # script is a standalone string executed by subprocess, so its
@@ -4893,27 +4913,54 @@ _FROZEN_TASK_DRAWN_ROW = {
 }
 
 
+def _frozen_applicable_rows(ground_truth: dict | None) -> list | None:
+  """Rows the frozen check compares against: the GEOMETRY rows
+  (draw_tools output) when _run_draw_tools attached them as
+  _geometry_rows, else the rows as-is. The vision merge replaces
+  x_start/x_end with tile-schedule values, which differ from the drawn
+  extents by >50 mm — comparing the merged rows silently disabled the
+  check in run 26. Returns None when there is no ground truth."""
+  if not ground_truth:
+    return None
+  return (ground_truth.get("_geometry_rows")
+          or ground_truth.get("rows") or [])
+
+
+def _frozen_skip_reason(ground_truth: dict | None) -> str:
+  """Why the frozen check does not apply ('' when it does). Never
+  silent: _measure_gates appends this to the verdict on routing tasks,
+  so a skipped check is visible in the trajectory and final message."""
+  if not ground_truth:
+    return "no ground truth available"
+  rows = _frozen_applicable_rows(ground_truth)
+  if (len(rows) != 6
+          or {r.get("name") for r in rows} != _FROZEN_TASK_ROWS):
+    return ("ground truth rows are not this task's 6 rows A-F "
+            f"(got {sorted(str(r.get('name')) for r in rows)})")
+  off = [r["name"] for r in rows
+         if r.get("name") not in _FROZEN_TASK_DRAWN_ROW
+         or abs(float(r.get("x_start", 0))
+                - _FROZEN_TASK_DRAWN_ROW[r["name"]][0]) > 50
+         or abs(float(r.get("x_end", 0))
+                - _FROZEN_TASK_DRAWN_ROW[r["name"]][1]) > 50]
+  if off:
+    return ("geometry row extents differ from this task's drawn rows "
+            f"(rows {', '.join(off)})")
+  return ""
+
+
 def _frozen_hash_gap(hashes: dict, ground_truth: dict | None) -> str:
-  """Frozen-delivery intercept (run 26): '' when the rule does not apply
-  or the delivered files match the frozen run26 trimmed hashes, else a
+  """Frozen-delivery intercept (run 27): '' when the rule does not apply
+  or the delivered files match the frozen run27 trimmed hashes, else a
   FAIL gap.
 
-  Applies only to this task (ground_truth rows are the 6 A-F rows with
-  the drawn extents). A mismatch — either file, including a missing file
-  — means the agent re-derived the routing instead of delivering the
-  frozen model: the run must not be treated as a pass.
+  Applies only to this task (geometry rows are the 6 A-F rows with
+  the drawn extents — see _frozen_applicable_rows). A mismatch — either
+  file, including a missing file — means the agent re-derived the
+  routing instead of delivering the frozen model: the run must not be
+  treated as a pass.
   """
-  if not ground_truth:
-    return ""
-  rows = ground_truth.get("rows") or []
-  if (len(rows) != 6
-          or {r.get("name") for r in rows} != _FROZEN_TASK_ROWS
-          or any(r.get("name") not in _FROZEN_TASK_DRAWN_ROW
-                 or abs(float(r.get("x_start", 0))
-                        - _FROZEN_TASK_DRAWN_ROW[r["name"]][0]) > 50
-                 or abs(float(r.get("x_end", 0))
-                        - _FROZEN_TASK_DRAWN_ROW[r["name"]][1]) > 50
-                 for r in rows)):
+  if _frozen_skip_reason(ground_truth):
     return ""
   bad = []
   for name, frozen in (("solution.py", FROZEN_SOLUTION_SHA256),
@@ -4924,10 +4971,10 @@ def _frozen_hash_gap(hashes: dict, ground_truth: dict | None) -> str:
                  f"{got[:12] or 'missing'}…)")
   if not bad:
     return ""
-  return ("HASH MISMATCH — delivered files are not the frozen run26 "
+  return ("HASH MISMATCH — delivered files are not the frozen run27 "
           "trimmed model: "
           + "; ".join(bad) + ". Deliver the frozen model verbatim "
-          "(copy tests/fixtures/run26-trimmed-model/output/solution.py and "
+          "(copy tests/fixtures/run27-trimmed-model/output/solution.py and "
           "output/model.ifc); do not re-derive the routing and do not "
           "regenerate model.ifc from solution.py (GUIDs differ every "
           "run). This run cannot pass until the hashes match.")
@@ -4945,8 +4992,10 @@ async def _measure_gates(
   files submitted — a gate result from an earlier file version is visibly
   stale (run 22: the final message quoted round-1 CONN numbers for a
   model the length round had already rewritten). When ground_truth is
-  this task's, a hash mismatch against the frozen run26 trimmed model
-  is also a FAIL gap (run 26 frozen delivery).
+  this task's, a hash mismatch against the frozen run27 trimmed model
+  is also a FAIL gap (run 27 frozen delivery). When the frozen check
+  does not apply on a routing task, the skip reason is written into the
+  verdict — a skipped check is never silent again (run 26).
   """
   gaps, verdict, scores = await _run_all_gates(worker, is_routing)
   hashes = await _file_hashes(worker)
@@ -4954,6 +5003,10 @@ async def _measure_gates(
   if frozen_gap:
     gaps = _merge_gate_gaps(gaps, frozen_gap) if gaps else frozen_gap
     verdict += "\nFrozen delivery: FAIL — see the gaps."
+  elif is_routing:
+    skip = _frozen_skip_reason(ground_truth)
+    if skip:
+      verdict += f"\nFROZEN CHECK SKIPPED — {skip}"
   return gaps, verdict + "\n" + _hash_binding_line(hashes), scores, hashes
 
 
@@ -5282,7 +5335,15 @@ async def _run_draw_tools(session: taskbridge.Session,
       f" {len(ground_truth.get('rows', []))} rows,"
       f" {len(ground_truth.get('crahs', []))} CRAHs,"
       f" entry {ground_truth.get('entry_drawn', {}).get('xy')}")
+  # Snapshot the GEOMETRY rows before the vision call: the vision merge
+  # replaces x_start/x_end with tile-schedule values (run 26: that
+  # silently disabled the frozen-delivery intercept, which compares
+  # against the drawn extents). The snapshot rides along on the merged
+  # dict under _geometry_rows for _frozen_hash_gap / _frozen_skip_reason.
+  geometry_rows = [dict(r) for r in ground_truth.get("rows", [])]
   merged = await _vision_call(session, ground_truth)
+  if geometry_rows:
+    merged["_geometry_rows"] = geometry_rows
   # Copy the merged ground truth into output/ so it ships with the
   # artifacts (the workdir copy is not uploaded). A failure here must
   # never break the run.
