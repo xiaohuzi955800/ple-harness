@@ -300,7 +300,7 @@ P1-1 长度（P0 全部通过后再做）：删掉北环线 CHW-NorthPerimeter�
 # A+B east-end table built on the fitted lengths is void on B/F, which
 # read 81.8%, not 82%, under the corrected gate.) P0 is untouched.
 
-RUN25_LENGTH_GUIDANCE_AB = """【第 28 轮指引 — 冻结 run27 修剪版模型原样交付】
+RUN25_LENGTH_GUIDANCE_AB = """【第 29 轮指引 — 冻结 run29 修剪版模型原样交付】
 覆盖按官方口径算（2026-11-27 校准：run 22/23/24/25d 共 72 格，最大误差
 0.0018）：每排每服务覆盖率 = 该服务所有线段（其 AABB y-区间与本排带
 ±2500 mm 相交）的 AABB x-区间并集（裁剪到 [排起点, 排起点+官方排长]）
@@ -308,11 +308,11 @@ RUN25_LENGTH_GUIDANCE_AB = """【第 28 轮指引 — 冻结 run27 修剪版模�
 tray 84.8% 就是 B 排 header 的跨度；CHW C/E 旧残差 +0.073/+0.039 是
 同一机制，不是保守偏差）。官方排长（机柜口径）：A 17400、B 18000、
 C 17600、D 18000、E 17400、F 18400；排起点 x=1825（D 排 1787）。
-冻结模型 run27 修剪版（离线实测：SEP 0、CONN 通过、总长 354,895 mm、
-+36.2%、在 +40% 线内余 9,948 mm；新门禁逐排 tray/busway/CHW：
-A 85.2/85.2/100、B 82.4/82.4/82.4、C 84.2/84.2/84.2、
-D 82.6/82.6/82.3、E 85.2/85.2/85.9、F 82.2/82.2/86.8）：
-solution.py sha256 0eac0985bc73…、model.ifc sha256 ce503a75b252…。
+冻结模型 run29 修剪版（离线实测：SEP 0、CONN 通过、总长 353,206 mm、
++35.5%、在 +40% 线内余 11,637 mm；新门禁逐排 tray/busway/CHW：
+A 84.1/84.1/100、B 81.2/81.2/81.8、C 83.1/83.1/83.7、
+D 81.2/81.2/82.0、E 83.8/83.8/85.6、F 81.1/81.1/86.2）：
+solution.py sha256 4f26aee1db74…、model.ifc sha256 bd98c85067b4…。
 交付铁律：交付的 solution.py 与 model.ifc 必须与冻结哈希逐字节一致，
 不一致门禁直接判 FAIL、不许提交。冻结的两个文件已经放在你的工作目录
 frozen/ 里（frozen/solution.py、frozen/model.ifc，开跑前由 harness 写入
@@ -321,33 +321,37 @@ solution.py 重新生成 model.ifc（GUID 每次不同，哈希对不上）：
 mkdir -p output && cp frozen/solution.py output/solution.py &&
 cp frozen/model.ifc output/model.ifc &&
 sha256sum output/solution.py output/model.ifc
-（须得 solution.py 0eac0985bc73…、model.ifc ce503a75b252…）。
+（须得 solution.py 4f26aee1db74…、model.ifc bd98c85067b4…）。
 不要去 tests/fixtures/ 找冻结文件：那个目录在你的工作目录之外、打不开
 （上一轮 agent 去那里找报 FileNotFoundError，只好自己重画，白白丢了分）。
-冻结模型的构造（只作记录，不要照此重建）：由第 26 次官方 0.664124 的
-交付模型修剪而来——tray/busway header 东端 A 14679、B 16650、C 14679、
-D 16650、E 14679、F 16950（A/C/E 的 header 不决定任何排的跨度，缩了
-不丢覆盖；B/D 抬到 82.4%/82.6%；F 排最弱，从 80.4% 抬到 82.2%）；
-CHW header 东端 A 15914、B 16650、C 14923、D 16600、E 15922、F 17708
-（只缩到各排最东 CRAH 分支仍能碰到 header 的位置）；其余全不动
-（西主干、南围边管、进线、drop、分支）。
-上一版冻结 run26 修剪版（solution.py bc1810f153cd…、model.ifc
-06b9b99001d8…、总长 356,081 mm）从未跑过官方分，已由 run27 修剪版
-取代，不要再交。run27 的底本——第 26 次交付模型（solution.py
+冻结模型的构造（只作记录，不要照此重建）：由第 28 次官方 0.722557 的
+交付模型（即 run27 修剪版）再修剪而来——tray/busway header 东端
+A 14679、B 16450、C 14679、D 16400、E 14679、F 16750（A/C/E 的 header
+不决定任何排的跨度，仍在最东机柜处；B/D/F 按覆盖下限 81.1% 剪到头，
+B 81.2%、D 81.2%、F 81.1%）；CHW header 东端 A 15914、B 16528、
+C 14923、D 16525、E 15922、F 17516（B/D/F 缩到各排最东 CRAH 分支仍能
+碰到 header 的位置，A/C/E 已在该位置）；其余全不动（西主干、南围边管、
+进线、drop、分支）。
+上一版冻结 run27 修剪版（solution.py 0eac0985bc73…、model.ifc
+ce503a75b252…、总长 354,895 mm、第 28 次官方 0.722557）已由 run29 修剪版取代，
+不要再交。更早的 run26 修剪版（solution.py bc1810f153cd…、model.ifc
+06b9b99001d8…、总长 356,081 mm）从未跑过官方分，也不要再交。run27 的底本——第 26 次交付模型（solution.py
 10c25ec809b7…、总长 386,120 mm、官方 0.664124、违规率 1.6%）原样
 保存在 tests/fixtures/run26-delivered-model/，也不要再交它。
 更早的 A+B（solution.py d7ae59a258eb6…、model.ifc 2599aa8173b0…、
 总长 361,197 mm）同样不要再交。
-三点目标状态：① 每排 ≥82.0% 已满足（最低 F 排 82.2%）；② 总长
-354,895 ≤ 356,569 mm 已满足（长度因子 260602/354895 = 0.7343，
-按违规率 1.6% 算可冲 0.7226，违规率 ≤1.9% 即可冲 0.72）；
+三点目标状态：① 每排 ≥81.0% 已满足（最低 F 排 81.1%）；② 总长
+353,206 ≤ 356,569 mm 已满足（长度因子 260602/353206 = 0.7378，
+按违规率 1.6% 算可冲 0.7261，违规率 ≤1.9% 即可冲 0.72）；
 ③ 违规率：底本实测 1.6%（官方，2 条 tray_stack_headroom），本次
 修剪只横向缩短了 header 东端、没动任何 z 高度和 y 位置、不产生
-新的临近线段对，预期 ≤1.6%，以官方跑分为准。**不要再为追长度
-缩 header 东端**：目标已达成，缩了会先丢覆盖、再丢分。
+新的临近线段对，预期 ≤1.6%，以官方跑分为准。**不要再缩 header
+东端**：本轮东端已按覆盖下限（离线 ≥81.1%）剪到头，再缩先丢
+覆盖、再丢分。A/C/E 的 tray/busway 东端也不要动：它们卡在最东
+机柜处，缩了机柜就没托盘了。
 万一实跑长度比超过 1.40 触发长度轮：只动非 header 部分，改完重跑门禁；
 任何一门不过就回退到冻结的修剪版模型，绝不缩 header。修剪版比值
-354895/260602 = 1.362 < 1.40，长度轮不触发。
+353206/260602 = 1.355 < 1.40，长度轮不触发。
 改完跑 /tmp/sep_gate.py 和 /tmp/conn_gate.py：每排每服务
 覆盖 ≥80%（设计目标 82–85%）、SEP 0、CHW 1 个网络，三项全过才算数。
 """
@@ -4872,18 +4876,20 @@ def _hash_binding_line(hashes: dict) -> str:
           "invalidates this measurement.")
 
 
-# Frozen delivery (run 27, 2026-11-28): the run27 trimmed model is the
+# Frozen delivery (run 29, 2026-11-28): the run29 trimmed model is the
 # verified offline baseline for this task (SEP 0, CONN PASS under the
-# corrected gate, 354,895 mm, every row every service >= 82.2%). The
+# corrected gate, 353,206 mm, every row every service >= 81.1%). The
 # agent must deliver THESE EXACT FILES. Run 26 proved the rule twice:
 # run 25d's agent re-derived the routing and shipped a worse model
 # (372,049 mm, A busway 0.7999999...), and run 26's agent did it again
 # (386,120 mm, solution.py 10c25ec8…) — that second model scored
 # 0.664124 (violation rate 1.6%) and is preserved as the baseline in
 # tests/fixtures/run26-delivered-model/ (solution.py 10c25ec8…,
-# model.ifc abcd2de3… locally regenerated). The run27 trimmed model is
-# that delivered model cut down offline (tray/busway + CHW header east
-# ends only); it is what the agent must copy verbatim — solve() copies
+# model.ifc abcd2de3… locally regenerated). The run29 trimmed model is
+# the run27 trimmed model cut down further offline (B/D/F tray/busway
+# + B/D/F CHW header east ends only — run 28 delivered the run27 model
+# verbatim and scored 0.722557); it is what the agent must copy
+# verbatim — solve() copies
 # the two files into the agent's workdir at frozen/ before the work
 # phase (_inject_frozen_model), because the workdir is a task container
 # that cannot see this repo (run 27: the agent tried
@@ -4909,9 +4915,9 @@ def _hash_binding_line(hashes: dict) -> str:
 # now also logged loudly in the verdict by _measure_gates — never again
 # silent.
 FROZEN_SOLUTION_SHA256 = (
-    "0eac0985bc73096157eaf8ea6460df08cfac843d075f45d72ab4328d00f17c50")
+    "4f26aee1db7417cd82d8ca501090d080638c6931fec0c475559be2bb6abbb1a3")
 FROZEN_MODEL_SHA256 = (
-    "ce503a75b252a4dc1ffdafb380f102b33301747c956d97a571ee61a031dd8816")
+    "bd98c85067b4a08d67c47037c2391bdefd215f1f5455084a3b8cd8a947cd3c72")
 
 # Module-level copies of the CONN gate's row tables (run 26): the gate
 # script is a standalone string executed by subprocess, so its
@@ -4997,7 +5003,7 @@ def _frozen_hash_gap(hashes: dict, ground_truth: dict | None) -> str:
 # solve() copies these two files into the workdir before the work phase.
 _FROZEN_FIXTURE_DIR = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "tests", "fixtures",
-    "run27-trimmed-model", "output")
+    "run29-trimmed-model", "output")
 _FROZEN_INJECT_DIR = "frozen"  # workdir-relative; the guidance points here
 
 

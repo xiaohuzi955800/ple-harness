@@ -4695,7 +4695,7 @@ def test_sep_gate_run24_twelve_clashes():
 
 
 def test_run25_AB_guidance_mounted():
-  print("run-28 guidance is mounted for routing workers (frozen run27 "
+  print("run-29 guidance is mounted for routing workers (frozen run29 "
         "trimmed delivery rule, corrected coverage definition, "
         "three-point status)")
   session = FakeSession(21600)
@@ -4709,16 +4709,21 @@ def test_run25_AB_guidance_mounted():
   check("reach rule in the prompt",
         "±2500 mm" in prompt and "邻排" in prompt, prompt)
   # The frozen-delivery rule: new hashes and total, and the copy order.
-  for num in ("0eac0985bc73", "ce503a75b252", "354,895"):
-    check(f"frozen run27 number {num} in the prompt", num in prompt, prompt)
+  for num in ("4f26aee1db74", "bd98c85067b4", "353,206"):
+    check(f"frozen run29 number {num} in the prompt", num in prompt, prompt)
   check("frozen delivery rule in the prompt",
         "冻结哈希" in prompt and "原样复制" in prompt, prompt)
+  # The superseded run27 trimmed model is quoted (hashes + total +
+  # official score) and marked replaced — the agent must not deliver
+  # it anymore.
+  for num in ("0eac0985bc73", "ce503a75b252", "354,895", "0.722557"):
+    check(f"superseded run27 number {num} in the prompt", num in prompt, prompt)
+  check("run27 trimmed marked superseded in the prompt",
+        "已由 run29 修剪版" in prompt, prompt)
   # The superseded run26 trimmed model is quoted (hashes + total) and
-  # marked replaced — the agent must not deliver it anymore.
+  # marked do-not-deliver — the agent must not deliver it anymore.
   for num in ("bc1810f153cd", "06b9b99001d8", "356,081"):
     check(f"superseded run26 number {num} in the prompt", num in prompt, prompt)
-  check("run26 trimmed marked superseded in the prompt",
-        "已由 run27 修剪版" in prompt, prompt)
   # The run27 base — the run-26 delivered 0.664124 model — is quoted
   # (hash + total + score) and marked do-not-deliver.
   for num in ("10c25ec809b7", "386,120", "0.664124"):
@@ -4734,14 +4739,16 @@ def test_run25_AB_guidance_mounted():
   # condition.
   check("length target line in the prompt", "356,569" in prompt, prompt)
   check("projected score at 1.6% violation rate in the prompt",
-        "0.7226" in prompt, prompt)
+        "0.7261" in prompt, prompt)
   # The trimmed east ends: tray/busway and CHW.
-  for num in ("14679", "16650", "16950"):
+  for num in ("14679", "16450", "16400", "16750"):
     check(f"trimmed tray/busway east end {num} in the prompt", num in prompt, prompt)
-  for num in ("15914", "14923", "16600", "15922", "17708"):
+  for num in ("15914", "16528", "14923", "16525", "15922", "17516"):
     check(f"trimmed CHW east end {num} in the prompt", num in prompt, prompt)
-  check("run-28 guidance section marker in the prompt",
-        "第 28 轮指引" in prompt, prompt)
+  check("run-29 guidance section marker in the prompt",
+        "第 29 轮指引" in prompt, prompt)
+  check("no run-28 guidance section in the prompt",
+        "第 28 轮指引" not in prompt, prompt)
   check("no run-27 guidance section in the prompt",
         "第 27 轮指引" not in prompt, prompt)
   check("no run-26 guidance section in the prompt",
@@ -4752,9 +4759,14 @@ def test_run25_AB_guidance_mounted():
     check(f"old east end {num} absent from the prompt",
           num not in prompt, prompt)
   # The run26-trimmed east ends must also be GONE (14679 stays: it is
-  # also a run27 end for A/C/E).
+  # also a run27/run29 end for A/C/E).
   for num in ("16603", "15061", "16555", "14324", "16931"):
     check(f"run26 east end {num} absent from the prompt",
+          num not in prompt, prompt)
+  # The run27-trimmed east ends must also be GONE (B/D/F were cut
+  # further for run 29; A/C/E ends are unchanged).
+  for num in ("16650", "16950", "16600", "17708"):
+    check(f"run27 east end {num} absent from the prompt",
           num not in prompt, prompt)
   # The void run-24 numbers must STILL be absent.
   for num in ("14332", "14850", "14526", "14844", "15205",
@@ -5114,14 +5126,14 @@ async def test_file_hashes_binding():
 
 
 async def test_frozen_delivery_intercept():
-  print("frozen delivery intercept (run 27): a model that is not the "
-        "frozen run27 trimmed model fails the gates with a HASH MISMATCH "
+  print("frozen delivery intercept (run 29): a model that is not the "
+        "frozen run29 trimmed model fails the gates with a HASH MISMATCH "
         "gap; the frozen hashes pass clean")
   import hashlib
   import json
   import os
   fixtures = os.path.join(os.path.dirname(__file__), "fixtures")
-  gt = json.load(open(os.path.join(fixtures, "run27-trimmed-model",
+  gt = json.load(open(os.path.join(fixtures, "run29-trimmed-model",
                                   "ground_truth.json")))
   frozen = {"solution.py": serve.FROZEN_SOLUTION_SHA256,
             "model.ifc": serve.FROZEN_MODEL_SHA256}
@@ -5130,7 +5142,7 @@ async def test_frozen_delivery_intercept():
   for name, const in (("solution.py", serve.FROZEN_SOLUTION_SHA256),
                       ("model.ifc", serve.FROZEN_MODEL_SHA256)):
     digest = hashlib.sha256(open(os.path.join(
-        fixtures, "run27-trimmed-model", "output", name), "rb").read()
+        fixtures, "run29-trimmed-model", "output", name), "rb").read()
     ).hexdigest()
     check(f"frozen {name} hash matches the fixture file",
           digest == const, digest)
@@ -5224,15 +5236,15 @@ async def test_frozen_delivery_intercept():
 
 
 async def test_frozen_model_injection():
-  print("frozen model injection (run 28): solve() copies the frozen "
-        "run27 trimmed files into the agent's workdir before the work "
+  print("frozen model injection (run 29): solve() copies the frozen "
+        "run29 trimmed files into the agent's workdir before the work "
         "phase, verified by read-back hash — the run-27 agent tried "
         "tests/fixtures/... in the container and got FileNotFoundError")
   import hashlib
   import json
   import os
   fixtures = os.path.join(os.path.dirname(__file__), "fixtures")
-  gt = json.load(open(os.path.join(fixtures, "run27-trimmed-model",
+  gt = json.load(open(os.path.join(fixtures, "run29-trimmed-model",
                                   "ground_truth.json")))
   session = FakeSession(21600)
   session.instruction = "Route the cable tray, busway and chilled water."
@@ -5243,7 +5255,7 @@ async def test_frozen_model_injection():
     key = "/app/frozen/" + name
     check(f"frozen/{name} lands in the workdir with the fixture bytes",
           session.files.get(key) == open(os.path.join(
-              fixtures, "run27-trimmed-model", "output", name),
+              fixtures, "run29-trimmed-model", "output", name),
               "rb").read(), key)
     check(f"injected frozen/{name} hashes to the frozen constant",
           hashlib.sha256(session.files[key]).hexdigest() == const, key)
@@ -5265,7 +5277,7 @@ async def test_frozen_model_injection():
       {"solution.py": "c" * 64, "model.ifc": "d" * 64}, gt)
   check("HASH MISMATCH gap points at the workdir frozen/ copy",
         "frozen/solution.py" in gap
-        and "tests/fixtures/run27-trimmed-model/output/solution.py"
+        and "tests/fixtures/run29-trimmed-model/output/solution.py"
         not in gap, gap)
   # Another task's ground truth: no injection, and the skip is logged.
   session2 = FakeSession(21600)
